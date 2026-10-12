@@ -28,7 +28,7 @@ import { migrateLegacyQQMessageMedia } from './raw-media-migration.js'
 import { migrateLegacyQQGroupAliasUsers } from './user-name-migration.js'
 import type {
   QQMediaLocator, QQStickerReference, WireCallSignalEvent, WireConversation, WireEvent, WireGroupFilePage, WireMedia, WireMessage,
-  WireMultiForwardLocator, WireNativeAvsdkEvent, WireReactionState, WireRequest, WireTextPart,
+  WireMultiForwardLocator, WireNativeAvsdkEvent, WireReactionState, WireRequest, WireSendSegment, WireTextPart,
 } from './protocol.js'
 
 type QQOutboundMedia = NonNullable<Parameters<QQNTClient['sendMessage']>[2]>[number]
@@ -1158,6 +1158,9 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     const text = textParts.map((part) => part.text).join('\n') || undefined
     const mediaParts = content.parts.filter((part) => part.type === 'media')
     const stickerParts = content.parts.filter((part) => part.type === 'sticker')
+    // An article interleaves text and media, which only an ordered body can
+    // express; a plain send keeps the ordinary text-then-media shape.
+    const orderedBody = orderedSendBody(content.parts, textParts, mediaParts.length, stickerParts.length)
     if (stickerParts.length > 1 || stickerParts.length && mediaParts.length) {
       throw new Error('QQNT supports either one sticker or up to nine media items per message')
     }
@@ -1192,7 +1195,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         sent = await this.sendWireMessage(
           await this.wireConversationId(session, conversation.id), text, media,
           options, originRequestId, sticker, textParts,
-          content.replyToId, content.replyToNativeSequence,
+          content.replyToId, content.replyToNativeSequence, orderedBody,
         )
       } catch (error) {
         if (error instanceof QQNTMessageSendRejectedError) {
@@ -1226,11 +1229,12 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     textParts: WireTextPart[],
     replyToId: string | undefined,
     replyToSequence: string | undefined,
+    orderedBody?: WireSendSegment[],
   ): Promise<WireMessage> {
     if (!media.some(isOrdinaryQQFile)) {
       return this.client.sendMessage(
         conversationId, text, media.length ? media : undefined, options,
-        originRequestId, sticker, textParts, replyToId, replyToSequence,
+        originRequestId, sticker, textParts, replyToId, replyToSequence, orderedBody,
       )
     }
 
@@ -2692,6 +2696,37 @@ function isOrdinaryQQFile(media: Pick<QQOutboundMedia, 'kind' | 'name' | 'mimeTy
   return media.kind === 'file'
     && !media.mimeType?.toLowerCase().startsWith('video/')
     && !fileVideoMimeType(media.name)
+}
+
+/**
+ * Element order of one send, when it interleaves text and media.
+ *
+ * An ordinary body is described by its text and media lists, which the bridge
+ * emits text first; an article needs the order its parts came in. Nothing is
+ * returned for a body the default layout already describes, or for one whose
+ * layout a sticker or a split send decides.
+ */
+function orderedSendBody(
+  parts: readonly IMMessageInput['parts'][number][],
+  textParts: readonly WireTextPart[],
+  mediaCount: number,
+  stickerCount: number,
+): WireSendSegment[] | undefined {
+  if (!mediaCount || !textParts.length || stickerCount) return undefined
+  const segments: WireSendSegment[] = []
+  let textIndex = 0
+  let mediaIndex = 0
+  for (const part of parts) {
+    if (part.type === 'text') {
+      const wire = textParts[textIndex++]
+      if (wire) segments.push(wire)
+      continue
+    }
+    if (part.type === 'media') segments.push({ type: 'media', index: mediaIndex++ })
+  }
+  const interleaved = segments.some((segment, index) => segment.type === 'media'
+    && segments.slice(index + 1).some((after) => after.type === 'text'))
+  return interleaved ? segments : undefined
 }
 
 function mapMessage(

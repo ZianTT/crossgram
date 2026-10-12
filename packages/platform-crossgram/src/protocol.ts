@@ -321,6 +321,15 @@ export interface WireTextPart {
   >
 }
 
+/** One element of an ordered send body, for callers that interleave text and media. */
+export type WireSendSegment =
+  | WireTextPart
+  | {
+      type: 'media'
+      /** Index into the send's media list. */
+      index: number
+    }
+
 export interface WireConversation {
   id: string
   kind: 'direct' | 'group'

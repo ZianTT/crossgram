@@ -71,6 +71,37 @@ describe('QQNTClient streaming transport', () => {
     })
   })
 
+  it('offers an ordered send body only to a bridge that understands it', async () => {
+    const body = [
+      { type: 'text' as const, text: 'lead' },
+      { type: 'media' as const, index: 0 },
+    ]
+    const manifests = new Map<number, Record<string, unknown>>()
+    const sendWith = async (protocolVersion: number) => {
+      const client = new QQNTClient({
+        endpoint: 'http://bridge.invalid/v1',
+        fetch: async (url: RequestInfo | URL, init?: RequestInit) => {
+          if (String(url).endsWith('/status')) return Response.json({ protocolVersion, ready: true })
+          const encoded = new Headers(init?.headers).get('x-qqnt-manifest')
+          if (encoded) manifests.set(protocolVersion, JSON.parse(Buffer.from(encoded, 'base64url').toString()))
+          return Response.json({
+            id: 'm', conversationId: 'u', senderId: 'self', timestamp: 1, outgoing: true, parts: [],
+          })
+        },
+      })
+      await client.sendMessage(
+        'u', 'lead', undefined, {}, 'origin', undefined, undefined, undefined, undefined, body,
+      )
+    }
+
+    await sendWith(35)
+    expect(manifests.get(35)?.segments).toEqual(body)
+
+    // An older bridge ignores the field and keeps its own element order.
+    await sendWith(34)
+    expect(manifests.get(34)?.segments).toBeUndefined()
+  })
+
   it('treats a bridge sticker range past EOF as an empty Telegram chunk', async () => {
     const client = new QQNTClient({
       endpoint: 'http://bridge.invalid/v1',

@@ -3731,6 +3731,61 @@ describe('QQNTPlatform mapping', () => {
     expect(progress).toEqual([1, 2])
   })
 
+  it('passes an article element order to the bridge and leaves a plain mix to the default', async () => {
+    const platform = new QQNTPlatform()
+    const image = (name: string) => ({
+      kind: 'image' as const, name, mimeType: 'image/png', size: 3, width: 1, height: 1,
+      source: { size: 3, async *stream() { yield new Uint8Array([1, 2, 3]) } },
+    })
+    const mediaPart = (id: string, name: string) => ({
+      type: 'media' as const,
+      media: { id, kind: 'image' as const, name, mimeType: 'image/png', width: 1, height: 1 },
+    })
+    const sendWire = vi.fn(async () => ({
+      id: 'm', conversationId: '1:u', senderId: 'self', timestamp: 10, outgoing: true,
+      parts: [
+        { type: 'text' as const, text: 'lead' },
+        mediaPart('a', 'a.png'),
+        { type: 'text' as const, text: 'tail' },
+        mediaPart('b', 'b.png'),
+      ],
+    }))
+    platform.client.sendMessage = sendWire as unknown as typeof platform.client.sendMessage
+
+    await platform.sendMessage(session, { id: '1:u' }, {
+      parts: [
+        { type: 'text', text: 'lead' },
+        { type: 'media', media: image('a.png') },
+        { type: 'text', text: 'tail' },
+        { type: 'media', media: image('b.png') },
+      ],
+    })
+    expect(platform.client.sendMessage).toHaveBeenLastCalledWith(
+      expect.any(String), 'lead\ntail', expect.any(Array), expect.any(Object), expect.any(String), undefined,
+      [
+        { type: 'text', text: 'lead', entities: undefined },
+        { type: 'text', text: 'tail', entities: undefined },
+      ],
+      undefined, undefined,
+      [
+        { type: 'text', text: 'lead', entities: undefined },
+        { type: 'media', index: 0 },
+        { type: 'text', text: 'tail', entities: undefined },
+        { type: 'media', index: 1 },
+      ],
+    )
+
+    // A body the default text-then-media order already describes carries none.
+    await platform.sendMessage(session, { id: '1:u' }, {
+      parts: [
+        { type: 'text', text: 'caption' },
+        { type: 'media', media: image('a.png') },
+        { type: 'media', media: image('b.png') },
+      ],
+    })
+    expect((sendWire.mock.calls.at(-1) as unknown[] | undefined)?.[9]).toBeUndefined()
+  })
+
   it('maps recorded voice media with its OGG duration and rejects mixed voice messages', async () => {
     const platform = new QQNTPlatform()
     const locator = {
@@ -3966,7 +4021,7 @@ describe('QQNTPlatform mapping', () => {
     })).resolves.toMatchObject({ id: 'sent-saved', conversationId: 'self' })
     expect(platform.client.sendMessage).toHaveBeenCalledWith(
       physicalId, 'saved', undefined, expect.any(Object), expect.any(String), undefined,
-      [{ type: 'text', text: 'saved', entities: undefined }], undefined, undefined,
+      [{ type: 'text', text: 'saved', entities: undefined }], undefined, undefined, undefined,
     )
     await expect(platform.prepareMediaUpload!(session, { id: 'self' }, {
       kind: 'image', name: 'saved.png', mimeType: 'image/png',

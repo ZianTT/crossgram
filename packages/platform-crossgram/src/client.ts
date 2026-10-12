@@ -15,7 +15,7 @@ import type {
   QQMediaLocator, QQStickerReference, WireConversation, WireEvent, WireMemberPage, WireMessage, WireMultiForwardLocator,
   WirePokeResult,
   WireReactionActorPage, WireReactionContext, WireReactionState, WireRequest, WireRequestPage, WireSticker, WireStickerPack, WireStickerPackSummary,
-  WireFlashTransferManifest, WireFlashTransferResult, WireReactionAssetMeta, WireStickerAssetMeta, WireTextPart,
+  WireFlashTransferManifest, WireFlashTransferResult, WireReactionAssetMeta, WireStickerAssetMeta, WireSendSegment, WireTextPart,
 } from './protocol.js'
 import { QQHighwayUploadWriter, uploadHighway, type QQMediaUploadPlan } from './highway.js'
 import { Sha1CompressionState } from './sha1-state.js'
@@ -617,6 +617,7 @@ export class QQNTClient {
     textParts?: WireTextPart[],
     replyToId?: string,
     replyToSequence?: string,
+    orderedBody?: WireSendSegment[],
   ): Promise<WireMessage> {
     const voice = media?.find((item) => item.voice)
     if (voice) {
@@ -723,6 +724,13 @@ export class QQNTClient {
       }
       return plan.prepared
     }))
+    // Only a bridge that knows `segments` keeps the caller's element order; an
+    // older one falls back to its own text-then-media order.
+    let segments: WireSendSegment[] | undefined
+    if (orderedBody?.length) {
+      if (this.bridgeProtocol === undefined) await this.status()
+      if (this.bridgeProtocol! >= 35) segments = orderedBody
+    }
     const manifest = {
       conversationId,
       text,
@@ -731,6 +739,7 @@ export class QQNTClient {
       replyToSequence,
       originRequestId,
       sticker,
+      segments,
       media: preparedMedia?.map(({ item, kind, hashes, thumbnail }) => ({
         kind, name: item.name, mimeType: item.mimeType, size: hashes.size,
         md5: hashes.md5, sha1: hashes.sha1, sha1Checkpoints: hashes.sha1Checkpoints,
