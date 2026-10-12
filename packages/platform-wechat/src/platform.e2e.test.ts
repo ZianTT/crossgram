@@ -102,7 +102,10 @@ describe('ComWeChatPlatform local transport e2e', () => {
   it('round-trips account, dialogs, group members, callback registration, and callback events locally', async () => {
     const fake = await startFakeComWeChat()
     const callbackPort = await unusedPort()
-    const platform = new ComWeChatPlatform({ endpoint: fake.endpoint, callbackPort, requestTimeoutMs: 500 })
+    const platform = new ComWeChatPlatform({
+      endpoint: fake.endpoint, callbackHost: '127.0.0.1', callbackAllowedAddress: '127.0.0.1',
+      callbackPort, requestTimeoutMs: 500,
+    })
     const events: IMEvent[] = []
 
     await expect(platform.getAccount()).resolves.toMatchObject({ user: { id: 'self', firstName: 'Self' } })

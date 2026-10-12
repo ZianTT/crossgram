@@ -155,10 +155,14 @@ describe('ComWeChat callback server', () => {
     const server = await startCallbackServer({ host: '127.0.0.1', port, maxBytes: 1024, maxConnections: 32, onMessage: async () => {} })
     servers.push(server)
     const socket = await open(port)
-    const disconnected = once(socket, 'close')
+    // Destroying an accepted socket may report ECONNRESET before close on macOS.
+    const disconnected = new Promise<void>(resolve => {
+      socket.on('error', () => {})
+      socket.once('close', () => resolve())
+    })
 
     await server.close()
-    await expect(disconnected).resolves.toHaveLength(1)
+    await expect(disconnected).resolves.toBeUndefined()
     servers.splice(servers.indexOf(server), 1)
   })
 
@@ -172,9 +176,30 @@ describe('ComWeChat callback server', () => {
     servers.splice(servers.indexOf(server), 1)
   })
 
-  it('refuses non-loopback callback listener hosts', async () => {
+  it('refuses wildcard callback listener hosts', async () => {
     await expect(startCallbackServer({ host: '0.0.0.0', port: 23456, maxBytes: 1024, maxConnections: 32, onMessage: async () => {} }))
-      .rejects.toThrow('callback listener must use a loopback host')
+      .rejects.toThrow('callback listener must bind a specific IP address')
+  })
+
+  it('requires an allowed peer for a LAN callback listener', async () => {
+    await expect(startCallbackServer({ host: '10.21.0.213', port: 23456, maxBytes: 1024, maxConnections: 32, onMessage: async () => {} }))
+      .rejects.toThrow('callback listener requires an allowed address outside loopback')
+  })
+
+  it('rejects callbacks from a peer outside the configured allowlist', async () => {
+    const onMessage = vi.fn(async () => {})
+    const onWarning = vi.fn()
+    const port = await unusedPort()
+    const server = await startCallbackServer({
+      host: '127.0.0.1', allowedAddress: '127.0.0.2', port,
+      maxBytes: 1024, maxConnections: 32, onMessage, onWarning,
+    })
+    servers.push(server)
+
+    const socket = await open(port)
+    await once(socket, 'close')
+    expect(onMessage).not.toHaveBeenCalled()
+    expect(onWarning).toHaveBeenCalledWith('ComWeChat callback rejected from an untrusted peer', undefined)
   })
 
   it('rejects invalid callback ports', async () => {

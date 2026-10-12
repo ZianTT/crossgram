@@ -21,6 +21,8 @@ const DEFAULT_MAX_CALLBACK_CONNECTIONS = 32
 
 export interface Config {
   endpoint?: string
+  callbackHost?: string
+  callbackAllowedAddress?: string
   callbackPort?: number
   requestTimeoutMs?: number
   maxCallbackBytes?: number
@@ -31,6 +33,8 @@ export interface Config {
 
 export const Config = z.object({
   endpoint: z.transform(z.string(), normalizeEndpoint).default(DEFAULT_ENDPOINT),
+  callbackHost: z.string().default(DEFAULT_CALLBACK_HOST),
+  callbackAllowedAddress: z.string(),
   callbackPort: z.natural().min(1).max(65_535).default(DEFAULT_CALLBACK_PORT),
   requestTimeoutMs: z.natural().min(1).max(300_000).default(DEFAULT_REQUEST_TIMEOUT_MS),
   maxCallbackBytes: z.natural().min(1).max(16 * 1024 * 1024).default(DEFAULT_MAX_CALLBACK_BYTES),
@@ -66,6 +70,8 @@ export class ComWeChatPlatform implements IMPlatform {
   }
 
   readonly client: ComWeChatClient
+  private readonly callbackHost: string
+  private readonly callbackAllowedAddress?: string
   private readonly callbackPort: number
   private readonly maxCallbackBytes: number
   private readonly maxCallbackConnections: number
@@ -82,6 +88,8 @@ export class ComWeChatPlatform implements IMPlatform {
 
   constructor(config: Config = {}, logger?: ComWeChatLogger) {
     this.logger = logger
+    this.callbackHost = config.callbackHost ?? DEFAULT_CALLBACK_HOST
+    this.callbackAllowedAddress = config.callbackAllowedAddress
     this.callbackPort = config.callbackPort ?? DEFAULT_CALLBACK_PORT
     this.maxCallbackBytes = config.maxCallbackBytes ?? DEFAULT_MAX_CALLBACK_BYTES
     this.maxCallbackConnections = config.maxCallbackConnections ?? DEFAULT_MAX_CALLBACK_CONNECTIONS
@@ -148,7 +156,8 @@ export class ComWeChatPlatform implements IMPlatform {
         throw new Error('ComWeChat callback subscription was replaced before it started')
       }
       const callback = await startCallbackServer({
-        host: DEFAULT_CALLBACK_HOST,
+        host: this.callbackHost,
+        allowedAddress: this.callbackAllowedAddress,
         port: this.callbackPort,
         maxBytes: this.maxCallbackBytes,
         maxConnections: this.maxCallbackConnections,

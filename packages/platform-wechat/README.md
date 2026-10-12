@@ -8,6 +8,7 @@ Native CrossGram adapter for the legacy Windows **ComWeChat** HTTP and TCP-callb
   disabled: true
   config:
     endpoint: http://127.0.0.1:18888/api/
+    callbackHost: 127.0.0.1
     callbackPort: 23456
     requestTimeoutMs: 30000
     maxCallbackBytes: 1048576
@@ -17,13 +18,25 @@ Native CrossGram adapter for the legacy Windows **ComWeChat** HTTP and TCP-callb
 ## Security
 
 ComWeChat is an old local-control API with **no authentication**. Do not expose its
-HTTP endpoint to the public internet. The callback listener is intentionally bound
-to `127.0.0.1`, limits payload size, and only acknowledges a callback after
-CrossGram has handled it. Loopback prevents remote callbacks, but it does not
-protect against a malicious process on the same host. Deploy CrossGram under a
-separate OS identity or namespace and use firewall rules to restrict local access.
-The protocol provides no callback token or MAC, so the adapter does not pretend to
-provide one.
+HTTP endpoint to the public internet. The callback listener defaults to `127.0.0.1`,
+limits payload size, and only acknowledges a callback after CrossGram has handled it.
+For separate hosts, set `callbackHost` to CrossGram's specific LAN IP and
+`callbackAllowedAddress` to the ComWeChat host's LAN IP. Wildcard binds are refused.
+Restrict the callback port to that peer in the host firewall as well. The protocol
+provides no callback token or MAC, so source IP filtering is the only built-in check.
+
+ComWeChat's message hook takes only a callback **port** and connects to its own
+localhost. On the Windows host, forward that local port to CrossGram's LAN listener
+before enabling the adapter, for example from an elevated PowerShell prompt:
+
+```powershell
+netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=23456 connectaddress=10.21.0.213 connectport=23456
+```
+
+Then configure CrossGram with `endpoint: http://10.21.0.51:8000/api/`,
+`callbackHost: 10.21.0.213`, and `callbackAllowedAddress: 10.21.0.51`.
+Replace these example addresses with the actual hosts. `portproxy` requires the
+Windows IP Helper service and remains configured until removed.
 
 ## Capability boundary
 

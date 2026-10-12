@@ -1,8 +1,9 @@
-import { createServer, type Server, type Socket } from 'node:net'
+import { createServer, isIP, type Server, type Socket } from 'node:net'
 import type { ComWeChatCallback } from './types.js'
 
 export interface CallbackServerOptions {
   host: string
+  allowedAddress?: string
   port: number
   maxBytes: number
   maxConnections: number
@@ -24,15 +25,21 @@ export async function startCallbackServer(options: CallbackServerOptions): Promi
   if (!Number.isInteger(options.maxConnections) || options.maxConnections < 1) {
     throw new Error(`invalid ComWeChat callback connection limit: ${options.maxConnections}`)
   }
-  if (!isLoopbackHost(options.host)) {
-    throw new Error('ComWeChat callback listener must use a loopback host because callbacks are unauthenticated')
+  if (!isIP(options.host) || options.host === '0.0.0.0' || options.host === '::') {
+    throw new Error('ComWeChat callback listener must bind a specific IP address')
+  }
+  if (options.allowedAddress && !isIP(options.allowedAddress)) {
+    throw new Error('ComWeChat callback allowed address must be an IP address')
+  }
+  if (!isLoopbackHost(options.host) && !options.allowedAddress) {
+    throw new Error('ComWeChat callback listener requires an allowed address outside loopback')
   }
 
   const sockets = new Set<Socket>()
   const handlers = new Set<Promise<void>>()
   const server = createServer((socket) => {
-    if (!isLoopbackAddress(socket.remoteAddress)) {
-      warn(options, 'ComWeChat callback rejected from a non-loopback peer')
+    if (!isAllowedAddress(socket.remoteAddress, options.allowedAddress)) {
+      warn(options, 'ComWeChat callback rejected from an untrusted peer')
       socket.destroy()
       return
     }
@@ -118,12 +125,13 @@ function warn(options: CallbackServerOptions, message: string, error?: unknown):
 }
 
 function isLoopbackHost(host: string): boolean {
-  const normalized = host.trim().toLowerCase()
-  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1'
+  return host === '127.0.0.1' || host === '::1'
 }
 
-function isLoopbackAddress(address: string | undefined): boolean {
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+function isAllowedAddress(address: string | undefined, allowedAddress?: string): boolean {
+  if (!address) return false
+  const normalized = address.startsWith('::ffff:') ? address.slice(7) : address
+  return allowedAddress ? normalized === allowedAddress : isLoopbackHost(normalized)
 }
 
 function isObject(value: unknown): value is ComWeChatCallback {

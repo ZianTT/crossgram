@@ -1,4 +1,6 @@
 endpoint: ComWeChat HTTP API endpoint. ComWeChat has no authentication; use only http:// or https:// on a local or protected network.
+callbackHost: Specific local IP address on which to listen for ComWeChat callbacks. Defaults to loopback.
+callbackAllowedAddress: Only accept callbacks from this IP address. Required when callbackHost is not loopback.
 callbackPort: TCP port on which ComWeChat delivers message callbacks.
 requestTimeoutMs: Maximum duration of one ComWeChat HTTP request in milliseconds.
 maxCallbackBytes: Maximum accepted byte size of one ComWeChat callback payload.
