@@ -16,7 +16,10 @@ import {
   type IMUser, type IMUserPage, type PlatformCapabilities, type PlatformSession, type Unsubscribe,
   type VoiceCallMediaProvider, type VoiceWorkerCall, type VoiceWorkerMediaEndpoint,
 } from '@mtproto-relay/bridge'
-import { QQNTClient, QQNTMessageSendRejectedError, qqAvatarUrl, type QQNTClientOptions } from './client.js'
+import {
+  QQNTClient, QQNTMessageSendRejectedError, qqAvatarUrl,
+  type QQNTClientOptions, type QQOutboundMedia, type QQSendPart,
+} from './client.js'
 import { defineQQNTEventCheckpointModel } from './event-checkpoint.js'
 import { QQStickerProvider } from './sticker-provider.js'
 import { QQVoiceMedia } from './voice-media.js'
@@ -28,10 +31,8 @@ import { migrateLegacyQQMessageMedia } from './raw-media-migration.js'
 import { migrateLegacyQQGroupAliasUsers } from './user-name-migration.js'
 import type {
   QQMediaLocator, QQStickerReference, WireCallSignalEvent, WireConversation, WireEvent, WireGroupFilePage, WireMedia, WireMessage,
-  WireMultiForwardLocator, WireNativeAvsdkEvent, WireReactionState, WireRequest, WireSendSegment, WireTextPart,
+  WireMultiForwardLocator, WireNativeAvsdkEvent, WireReactionState, WireRequest, WireTextPart,
 } from './protocol.js'
-
-type QQOutboundMedia = NonNullable<Parameters<QQNTClient['sendMessage']>[2]>[number]
 
 
 const MIN_PROTOCOL_VERSION = 19
@@ -1155,12 +1156,8 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       }
       textParts.push({ type: 'text', text: part.text, entities: entities.length ? entities : undefined })
     }
-    const text = textParts.map((part) => part.text).join('\n') || undefined
     const mediaParts = content.parts.filter((part) => part.type === 'media')
     const stickerParts = content.parts.filter((part) => part.type === 'sticker')
-    // An article interleaves text and media, which only an ordered body can
-    // express; a plain send keeps the ordinary text-then-media shape.
-    const orderedBody = orderedSendBody(content.parts, textParts, mediaParts.length, stickerParts.length)
     if (stickerParts.length > 1 || stickerParts.length && mediaParts.length) {
       throw new Error('QQNT supports either one sticker or up to nine media items per message')
     }
@@ -1173,6 +1170,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       sticker = stickerPart.sticker.reference as unknown as QQStickerReference
     }
     if (mediaParts.length > 9) throw new Error('QQNT supports at most nine media items per message')
+    const text = textParts.map((part) => part.text).join('\n') || undefined
     const voiceParts = mediaParts.filter((part) => part.media.voice)
     if (voiceParts.length && (voiceParts.length !== 1 || mediaParts.length !== 1 || text || sticker || content.replyToNativeSequence)) {
       throw new Error('QQNT voice messages must contain exactly one voice item')
@@ -1187,15 +1185,22 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       voice: part.media.voice,
       source: part.media.source,
     }))
+    // The send body mirrors the message: its text and media elements in the
+    // order the relayed message has them.
+    let textCursor = 0
+    let mediaCursor = 0
+    const parts: QQSendPart[] = content.parts.flatMap((part): QQSendPart[] => part.type === 'text'
+      ? [textParts[textCursor++]!]
+      : part.type === 'media' ? [{ type: 'media', media: media[mediaCursor++]! }] : [])
     const originRequestId = randomUUID()
     this.originSessions.set(originRequestId, session.platformSessionId)
     try {
       let sent: WireMessage
       try {
         sent = await this.sendWireMessage(
-          await this.wireConversationId(session, conversation.id), text, media,
-          options, originRequestId, sticker, textParts,
-          content.replyToId, content.replyToNativeSequence, orderedBody,
+          await this.wireConversationId(session, conversation.id), parts,
+          options, originRequestId, sticker,
+          content.replyToId, content.replyToNativeSequence,
         )
       } catch (error) {
         if (error instanceof QQNTMessageSendRejectedError) {
@@ -1221,21 +1226,20 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
 
   private async sendWireMessage(
     conversationId: string,
-    text: string | undefined,
-    media: QQOutboundMedia[],
+    parts: QQSendPart[],
     options: IMTransferOptions,
     originRequestId: string,
     sticker: QQStickerReference | undefined,
-    textParts: WireTextPart[],
     replyToId: string | undefined,
     replyToSequence: string | undefined,
-    orderedBody?: WireSendSegment[],
   ): Promise<WireMessage> {
+    const textParts = parts.flatMap((part) => part.type === 'text' ? [part] : [])
+    const media = parts.flatMap((part) => part.type === 'media' ? [part.media] : [])
+    const text = textParts.length ? textParts.map((part) => part.text).join('\n') : undefined
     if (!media.some(isOrdinaryQQFile)) {
-      return this.client.sendMessage(
-        conversationId, text, media.length ? media : undefined, options,
-        originRequestId, sticker, textParts, replyToId, replyToSequence, orderedBody,
-      )
+      return this.client.sendMessage(conversationId, parts, options, {
+        originRequestId, sticker, replyToId, replyToSequence,
+      })
     }
 
     type SendPlan = {
@@ -1286,17 +1290,16 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
             },
           }
         : options
-      const sent = await this.client.sendMessage(
-        conversationId,
-        plan.includeText ? text : undefined,
-        plan.media.length ? plan.media.map(({ item }) => item) : undefined,
-        planOptions,
+      // A physical message carries the plan's own elements, still in the order
+      // the relayed message had them.
+      const planParts = parts.filter((part) => part.type === 'text'
+        ? plan.includeText
+        : plan.media.some(({ item }) => item === part.media))
+      const sent = await this.client.sendMessage(conversationId, planParts, planOptions, {
         originRequestId,
-        undefined,
-        plan.includeText ? textParts : undefined,
-        plan.includeReply ? replyToId : undefined,
-        plan.includeReply ? replyToSequence : undefined,
-      )
+        replyToId: plan.includeReply ? replyToId : undefined,
+        replyToSequence: plan.includeReply ? replyToSequence : undefined,
+      })
       sentMessages.push(sent)
       const outputMedia = sent.parts.filter((part) => part.type === 'media')
       if (outputMedia.length !== plan.media.length) {
@@ -1318,15 +1321,13 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       if (!id) throw new Error('QQNT omitted a physical message ID from a split send')
       return id
     })
+    let sentMediaCursor = 0
     const logicalMessage: WireMessage = {
       ...primary,
       sourceIds: orderedSourceIds,
       originRequestId,
       replyToId: primary.replyToId ?? replyToId,
-      parts: [
-        ...textParts,
-        ...orderedMedia,
-      ],
+      parts: parts.map((part) => part.type === 'text' ? part : orderedMedia[sentMediaCursor++]!),
     }
     for (const sent of sentMessages) this.splitOutgoingMessages.set(sent.id, logicalMessage)
     while (this.splitOutgoingMessages.size > SPLIT_OUTGOING_MESSAGE_CACHE_LIMIT) {
@@ -2696,37 +2697,6 @@ function isOrdinaryQQFile(media: Pick<QQOutboundMedia, 'kind' | 'name' | 'mimeTy
   return media.kind === 'file'
     && !media.mimeType?.toLowerCase().startsWith('video/')
     && !fileVideoMimeType(media.name)
-}
-
-/**
- * Element order of one send, when it interleaves text and media.
- *
- * An ordinary body is described by its text and media lists, which the bridge
- * emits text first; an article needs the order its parts came in. Nothing is
- * returned for a body the default layout already describes, or for one whose
- * layout a sticker or a split send decides.
- */
-function orderedSendBody(
-  parts: readonly IMMessageInput['parts'][number][],
-  textParts: readonly WireTextPart[],
-  mediaCount: number,
-  stickerCount: number,
-): WireSendSegment[] | undefined {
-  if (!mediaCount || !textParts.length || stickerCount) return undefined
-  const segments: WireSendSegment[] = []
-  let textIndex = 0
-  let mediaIndex = 0
-  for (const part of parts) {
-    if (part.type === 'text') {
-      const wire = textParts[textIndex++]
-      if (wire) segments.push(wire)
-      continue
-    }
-    if (part.type === 'media') segments.push({ type: 'media', index: mediaIndex++ })
-  }
-  const interleaved = segments.some((segment, index) => segment.type === 'media'
-    && segments.slice(index + 1).some((after) => after.type === 'text'))
-  return interleaved ? segments : undefined
 }
 
 function mapMessage(
