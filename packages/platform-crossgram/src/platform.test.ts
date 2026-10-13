@@ -850,8 +850,8 @@ describe('QQNTPlatform mapping', () => {
     await expect(platform.getAccount()).rejects.toThrow('not ready')
   })
 
-  it('rejects bridge protocols outside the supported 19-34 range', async () => {
-    for (const protocolVersion of [18, 35, 19.5, Number.NaN, '19', undefined]) {
+  it('rejects a bridge older than the minimum protocol, or one that reports nothing usable', async () => {
+    for (const protocolVersion of [18, 19.5, Number.NaN, '19', undefined]) {
       const platform = new QQNTPlatform()
       const status = {
         protocolVersion, ready: true, selfUin: '10001', selfUid: 'u_self',
@@ -859,9 +859,19 @@ describe('QQNTPlatform mapping', () => {
       platform.client.status = vi.fn(async () => status)
       platform.client.getUser = vi.fn()
 
-      await expect(platform.getAccount()).rejects.toThrow('supported range is 19-34')
+      await expect(platform.getAccount()).rejects.toThrow('protocol 19 or newer is required')
       expect(platform.client.getUser).not.toHaveBeenCalled()
     }
+  })
+
+  it('accepts a bridge whose protocol is newer than this relay knows', async () => {
+    const platform = new QQNTPlatform()
+    platform.client.status = vi.fn(async () => ({
+      protocolVersion: 99, ready: true, selfUin: '10001', selfUid: 'u_self',
+    } as unknown as Awaited<ReturnType<typeof platform.client.status>>))
+    platform.client.getUser = vi.fn(async () => ({ id: 'u_self', name: 'Platform Alice' }))
+
+    await expect(platform.getAccount()).resolves.toMatchObject({ user: { id: 'u_self' } })
   })
 
   it('edits QQ messages by recalling the old message and resending the replacement', async () => {

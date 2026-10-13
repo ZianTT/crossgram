@@ -35,10 +35,15 @@ import type {
 } from './protocol.js'
 
 
+/**
+ * Oldest bridge this adapter can drive.
+ *
+ * This is the only version gate: a newer bridge is accepted as-is, because
+ * every additive capability is gated where it is used (voice, video, ordered
+ * bodies). A bridge that raises its protocol version must not need a relay
+ * change to keep working — see `PROTOCOL_VERSION` in qqnt-bridge's protocol.ts.
+ */
 const MIN_PROTOCOL_VERSION = 19
-// Keep the lower bound stable while accepting additive bridge revisions so account provisioning does
-// not fail closed before Telegram QR approval can complete.
-const MAX_PROTOCOL_VERSION = 34
 /** Poke bursts a single request may send; QQ treats longer bursts as flooding. */
 const QQ_POKE_MAX_COUNT = 10
 
@@ -305,9 +310,8 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     const userId = status.selfUid ?? status.selfUin
     if (!status.ready || !userId) throw new Error('QQNT account is not ready')
     if (!Number.isInteger(status.protocolVersion)
-      || status.protocolVersion < MIN_PROTOCOL_VERSION
-      || status.protocolVersion > MAX_PROTOCOL_VERSION) {
-      throw new Error(`QQNT bridge protocol ${status.protocolVersion} is unsupported; supported range is ${MIN_PROTOCOL_VERSION}-${MAX_PROTOCOL_VERSION}`)
+      || status.protocolVersion < MIN_PROTOCOL_VERSION) {
+      throw new Error(`QQNT bridge protocol ${status.protocolVersion} is unsupported; protocol ${MIN_PROTOCOL_VERSION} or newer is required`)
     }
     const user = await this.client.getUser(userId)
     if (!user) throw new Error(`QQNT current user is unavailable: ${userId}`)
