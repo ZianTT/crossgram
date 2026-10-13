@@ -2784,13 +2784,18 @@ function mapParts(
 ): IMMessage<QQMediaLocator>['content']['parts'] {
   const parts: IMMessage<QQMediaLocator>['content']['parts'] = []
   // QQ bot messages carry a plain-text fallback beside the markdown body for
-  // clients without markdown support; QQ itself only renders the markdown.
+  // clients without markdown support; QQ itself only renders the markdown. The
+  // fallback is that body's rendition, and whether the rendition keeps the
+  // blockquote markers is QQ's business — match the part both ways, so a quote
+  // in the body never reaches Telegram as a second copy.
   const markdownText = input.parts
     .flatMap((part) => part.type === 'markdown' ? [compactText(parseQQMarkdown(part.content).text)] : [])
     .join('')
   for (const part of input.parts) {
     if (part.type === 'text') {
-      if (markdownText && !part.entities?.length && markdownText.includes(compactText(part.text))) continue
+      if (markdownText && !part.entities?.length
+        && (markdownText.includes(compactText(part.text))
+          || markdownText.includes(compactText(part.text.replace(QQ_BLOCKQUOTE_MARKERS, ''))))) continue
       const normalized = normalizeTextPart(part, reactionCatalog)
       const previous = parts.at(-1)
       if (previous?.type === 'text') {
@@ -2851,6 +2856,45 @@ function compactText(value: string): string {
   return value.replace(/\s+/g, '')
 }
 
+/** The marker opening a QQ markdown blockquote line, with its optional space. */
+const QQ_BLOCKQUOTE_LINE = /^[ \t]{0,3}>[ \t]?/
+
+/** Every blockquote marker in a text, for matching QQ's plain-text rendition. */
+const QQ_BLOCKQUOTE_MARKERS = new RegExp(QQ_BLOCKQUOTE_LINE.source, 'gm')
+
+/** A fence line, whose body is code: a `>` inside it opens nothing. */
+const QQ_FENCE_LINE = /^[ \t]{0,3}(?:```|~~~)/
+
+/**
+ * QQ bot frameworks write QQ's reply box as a markdown blockquote, one line
+ * `> 名字：被引用的那句话`, because a native `message_reference` on a markdown
+ * message makes QQ attach the body twice. QQ's markdown renderer draws those
+ * lines as one quoted block; Telegram has the same thing as a `blockquote`
+ * entity, and nothing else carries it — the text has to lose the markers, or a
+ * client draws the markdown source (`> 名字：…`) instead of a quote.
+ *
+ * So the markdown is split into runs of quoted and unquoted lines, markers
+ * dropped, with the newlines inside a run kept. Nothing QQ markdown supports
+ * spans a quote boundary: every multi-line construct (a fenced block) is
+ * unquoted by construction, because a `>` line inside a fence is code.
+ */
+function splitQQMarkdown(content: string): Array<{ quoted: boolean, text: string }> {
+  const runs: Array<{ quoted: boolean, text: string }> = []
+  let fence = false
+  for (const line of content.split('\n')) {
+    // A fence line only toggles code state; its own text stays as it is.
+    if (QQ_FENCE_LINE.test(line)) fence = !fence
+    const marker = fence ? null : QQ_BLOCKQUOTE_LINE.exec(line)
+    const text = marker ? line.slice(marker[0].length) : line
+    const previous = runs.at(-1)
+    // The newline belongs to the line before it, so a run keeps its inner ones.
+    if (previous && previous.quoted === Boolean(marker)) previous.text += `\n${text}`
+    else runs.push({ quoted: Boolean(marker), text })
+  }
+  return runs
+}
+
+/** QQ bot markdown, rendered into the text and entities Telegram draws. */
 export function parseQQMarkdown(content: string): Extract<
   IMMessage<QQMediaLocator>['content']['parts'][number],
   { type: 'text' }
@@ -2863,47 +2907,73 @@ export function parseQQMarkdown(content: string): Extract<
     return offset
   }
   const token = /\\([\\`*_{}[\]()#+\-.!>~|])|```([^\n`]*)\n([\s\S]*?)```|`([^`\n]+)`|\[([^\]\n]*)\]\(([^)\s]*)\)|\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|_([^_\n]+)_|~~([^~\n]+)~~|^#{1,6}[ \t]+([^\n]+)$/gm
-  let cursor = 0
-  for (const match of content.matchAll(token)) {
-    const index = match.index
-    append(content.slice(cursor, index))
-    if (match[1] !== undefined) {
-      append(match[1])
-    } else if (match[3] !== undefined) {
-      const offset = append(match[3])
-      entities.push({ type: 'pre', offset, length: match[3].length, language: match[2] || undefined })
-    } else if (match[4] !== undefined) {
-      const offset = append(match[4])
-      entities.push({ type: 'code', offset, length: match[4].length })
-    } else if (match[5] !== undefined) {
-      // QQ bot frameworks prepend an empty-label link carrying template
-      // metadata such as `[](%7B%22version%22%3A2%7D)`; QQ renders nothing.
-      const label = match[5]
-      if (label) {
-        const offset = append(label)
-        if (/^https?:\/\//i.test(match[6])) {
-          entities.push({ type: 'text-link', offset, length: label.length, url: match[6] })
-        }
-      }
-    } else if (match[7] !== undefined || match[8] !== undefined) {
-      const value = match[7] ?? match[8]
-      const offset = append(value)
-      entities.push({ type: 'bold', offset, length: value.length })
-    } else if (match[9] !== undefined || match[10] !== undefined) {
-      const value = match[9] ?? match[10]
-      const offset = append(value)
-      entities.push({ type: 'italic', offset, length: value.length })
-    } else if (match[11] !== undefined) {
-      const offset = append(match[11])
-      entities.push({ type: 'strikethrough', offset, length: match[11].length })
-    } else if (match[12] !== undefined) {
-      const value = match[12].trim()
-      const offset = append(value)
-      if (value) entities.push({ type: 'bold', offset, length: value.length })
+  /**
+   * One run's inline markup, in that run's own coordinates. Each run is parsed
+   * on its own because a blockquote's span has to sit in the rendered text,
+   * where the inline markup is gone and offsets shift.
+   */
+  const parseInline = (source: string) => {
+    const chunks: string[] = []
+    const found: import('@mtproto-relay/bridge').IMTextEntity[] = []
+    const push = (value: string) => {
+      const offset = chunks.join('').length
+      chunks.push(value)
+      return offset
     }
-    cursor = index + match[0].length
+    let cursor = 0
+    for (const match of source.matchAll(token)) {
+      const index = match.index
+      push(source.slice(cursor, index))
+      if (match[1] !== undefined) {
+        push(match[1])
+      } else if (match[3] !== undefined) {
+        const offset = push(match[3])
+        found.push({ type: 'pre', offset, length: match[3].length, language: match[2] || undefined })
+      } else if (match[4] !== undefined) {
+        const offset = push(match[4])
+        found.push({ type: 'code', offset, length: match[4].length })
+      } else if (match[5] !== undefined) {
+        // QQ bot frameworks prepend an empty-label link carrying template
+        // metadata such as `[](%7B%22version%22%3A2%7D)`; QQ renders nothing.
+        const label = match[5]
+        if (label) {
+          const offset = push(label)
+          if (/^https?:\/\//i.test(match[6])) {
+            found.push({ type: 'text-link', offset, length: label.length, url: match[6] })
+          }
+        }
+      } else if (match[7] !== undefined || match[8] !== undefined) {
+        const value = match[7] ?? match[8]
+        const offset = push(value)
+        found.push({ type: 'bold', offset, length: value.length })
+      } else if (match[9] !== undefined || match[10] !== undefined) {
+        const value = match[9] ?? match[10]
+        const offset = push(value)
+        found.push({ type: 'italic', offset, length: value.length })
+      } else if (match[11] !== undefined) {
+        const offset = push(match[11])
+        found.push({ type: 'strikethrough', offset, length: match[11].length })
+      } else if (match[12] !== undefined) {
+        const value = match[12].trim()
+        const offset = push(value)
+        if (value) found.push({ type: 'bold', offset, length: value.length })
+      }
+      cursor = index + match[0].length
+    }
+    push(source.slice(cursor))
+    return { text: chunks.join(''), entities: found }
   }
-  append(content.slice(cursor))
+  for (const [index, run] of splitQQMarkdown(content).entries()) {
+    if (index) append('\n')
+    const inline = parseInline(run.text)
+    const start = append(inline.text)
+    // Consecutive quoted lines are one block, so one entity: a client draws
+    // each blockquote entity as its own quote.
+    if (run.quoted) {
+      entities.push({ type: 'blockquote', offset: start, length: inline.text.length })
+    }
+    for (const entity of inline.entities) entities.push({ ...entity, offset: entity.offset + start })
+  }
   const joined = text.join('')
   const rendered = joined.trim()
   const lead = joined.length - joined.trimStart().length

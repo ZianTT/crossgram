@@ -289,6 +289,92 @@ describe('QQNTPlatform mapping', () => {
     ])
   })
 
+  it('renders QQ bot blockquotes as one quote entity instead of the markdown source', async () => {
+    // A QQ bot reply carries QQ's reply box as a markdown blockquote line
+    // (`> 名字：被引用的那句话`), which QQ itself draws as a quoted block.
+    // Telegram has `blockquote` for that: leaving the markers in the text made
+    // clients show the markdown source, and one entity per line drew one quote
+    // per line.
+    expect(parseQQMarkdown(
+      '> 小明：今天上午的航班在哪里看\n\n'
+      + '顺手修了两处 [PR #7](https://github.com/std-microblock/crossgram/pull/7) 已提 **加粗**\n',
+    )).toEqual({
+      type: 'text',
+      text: '小明：今天上午的航班在哪里看\n\n'
+        + '顺手修了两处 PR #7 已提 加粗',
+      entities: [
+        { type: 'blockquote', offset: 0, length: 14 },
+        {
+          type: 'text-link', offset: 23, length: 5,
+          url: 'https://github.com/std-microblock/crossgram/pull/7',
+        },
+        { type: 'bold', offset: 32, length: 2 },
+      ],
+    })
+    expect(parseQQMarkdown('> 第一行\n> 第二行\n\n正文')).toEqual({
+      type: 'text',
+      text: '第一行\n第二行\n\n正文',
+      entities: [{ type: 'blockquote', offset: 0, length: 7 }],
+    })
+    // Inline markup inside the quote is a quote too, and a blank line ends it.
+    expect(parseQQMarkdown('> **粗**引\n\n> 另一段\n> 接着')).toEqual({
+      type: 'text',
+      text: '粗引\n\n另一段\n接着',
+      entities: [
+        { type: 'blockquote', offset: 0, length: 2 },
+        { type: 'bold', offset: 0, length: 1 },
+        { type: 'blockquote', offset: 4, length: 6 },
+      ],
+    })
+    // Only a line's first `>` quotes: an escaped or inline one is body text.
+    expect(parseQQMarkdown('\\> 不是引用\n\na > b')).toEqual({
+      type: 'text', text: '> 不是引用\n\na > b', entities: undefined,
+    })
+    // A quoted line inside a fence is code, not a quote.
+    expect(parseQQMarkdown('```\n> 代码里的\n```\n> 引用')).toEqual({
+      type: 'text',
+      text: '> 代码里的\n\n引用',
+      entities: [
+        { type: 'pre', offset: 0, length: 7, language: undefined },
+        { type: 'blockquote', offset: 8, length: 2 },
+      ],
+    })
+  })
+
+  it('keeps a QQ bot reply quoted once, whichever rendition the fallback uses', async () => {
+    const markdown = '> 名字：被引用的那句话\n\n正文 [文档](https://example.com/docs)'
+    const body = '名字：被引用的那句话\n\n正文 文档'
+    const fallbacks = [
+      // QQ's plain-text rendition of the body, with and without the markers.
+      body,
+      '> 名字：被引用的那句话\n\n正文 文档',
+    ]
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: fallbacks.map((fallback, index) => ({
+        id: `bot-quote-${index}`, conversationId: 'group', senderId: 'bot', timestamp: index + 1,
+        outgoing: false, msgSeq: `90${index}`,
+        // Production order: markdown body, then QQ's plain-text fallback.
+        parts: [
+          { type: 'markdown' as const, content: markdown },
+          { type: 'text' as const, text: fallback },
+        ],
+      })),
+    }))
+    const messages = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(messages).toHaveLength(2)
+    for (const message of messages) {
+      expect(message.content.parts).toEqual([{
+        type: 'text',
+        text: body,
+        entities: [
+          { type: 'blockquote', offset: 0, length: 10 },
+          { type: 'text-link', offset: 15, length: 2, url: 'https://example.com/docs' },
+        ],
+      }])
+    }
+  })
+
   it('uses the service environment token unless configuration overrides it', async () => {
     vi.stubEnv('QQNT_BRIDGE_TOKEN', 'service-token')
     const authorizations: Array<string | null> = []
