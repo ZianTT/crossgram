@@ -2762,8 +2762,7 @@ const QQ_TEMPLATE_LINK = /\[\]\([^)\s]*\)/gu
  * Telegram rich message.
  *
  * Only a `markdown` part is markdown; a plain-text message has none, so it is
- * neither parsed nor upgraded. The text parts stay the message text and are
- * what a client that does not know rich messages receives.
+ * neither parsed nor upgraded. The text parts stay the message text.
  */
 function qqRichMarkdown(input: WireMessage): string | undefined {
   const markdown = input.parts

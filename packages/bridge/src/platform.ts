@@ -437,10 +437,7 @@ export interface IMMessageContent<TMediaLocator = unknown> {
    *
    * Telegram draws tables, headings and real lists only in a rich message, so
    * the relay renders this into page blocks and sends the message as one. The
-   * text parts stay the message text, which is what a client older than the
-   * layer that knows rich messages receives instead — the relay writes objects
-   * per client layer (`packages/mtproto/src/rpc/api-layer.ts`), so nothing
-   * depends on this field being understood.
+   * text parts stay the message text.
    */
   richMarkdown?: string
 }

@@ -609,10 +609,20 @@ function markdownTable(
   }
 }
 
-/** Markdown body as the blocks of a Telegram rich message (article). */
+/**
+ * Markdown body as the blocks of a Telegram rich message (article).
+ *
+ * Never throws: a body this converter cannot read is sent as the styled text
+ * the message already carries, so no client ever fails to receive a message
+ * because its body was markdown the relay could not render.
+ */
 export function markdownRichMessage(markdown: string): tl.RawRichMessage | undefined {
-  const blocks = markdownBlocks(markdown)
-  return blocks.length ? { _: 'richMessage', blocks, photos: [], documents: [] } : undefined
+  try {
+    const blocks = markdownBlocks(markdown)
+    return blocks.length ? { _: 'richMessage', blocks, photos: [], documents: [] } : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**

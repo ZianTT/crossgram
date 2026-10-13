@@ -505,8 +505,7 @@ describe('QQNTPlatform mapping', () => {
 
   it('hands a QQ bot markdown body over as a rich message source beside its text', async () => {
     // Telegram draws a table only in a rich message, so the markdown body is
-    // handed over as markdown as well; the text parts stay the message text and
-    // are what a client that does not know rich messages receives.
+    // handed over as markdown as well; the text parts stay the message text.
     const platform = new QQNTPlatform()
     platform.client.getHistory = vi.fn(async () => ({
       messages: [{

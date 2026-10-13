@@ -306,6 +306,17 @@ describe('markdown and HTML articles', () => {
       .toEqual({ _: 'textBold', text: { _: 'textPlain', text: '粗' } })
   })
 
+  it('never throws on a body it cannot render, so the message still goes out', () => {
+    // The guard is what is left of "do not fail a send": a body the converter
+    // cannot read simply does not become a rich message, and the message goes
+    // out as its styled text. Nothing here is a client-version check.
+    for (const body of ['\uD800', '\u0000\uFFFF', '\[\](\(', '| | |\n| --- |', '~~~', '![](', '**']) {
+      expect(() => markdownRichMessage(body)).not.toThrow()
+    }
+    expect(markdownRichMessage('')).toBeUndefined()
+    expect(markdownRichMessage('   \n\n')).toBeUndefined()
+  })
+
   it('builds a rich message from a markdown body', () => {
     const rich = markdownRichMessage([
       '> 引用一行',

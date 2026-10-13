@@ -6684,10 +6684,11 @@ export interface TlArticleProjectionOptions {
  * renderer draw quotes, lists, headings and inline markup together, which is
  * what a platform whose body arrived as markdown already had.
  *
- * The message's text parts stay the message text. The relay serializes objects
- * per client layer (`packages/mtproto/src/rpc/api-layer.ts`), so a client older
- * than the layer that knows rich messages never receives this field and draws
- * that text instead: the fallback is the same message, not a second one.
+ * This is the only projection for such a body: clients are expected to know
+ * rich messages (layer 227 and later, TDLib 1.8.64 and later), and the relay
+ * does not probe versions. `markdownRichMessage` swallowing a conversion
+ * failure is the one fallback left — the message then goes out as its styled
+ * text rather than not at all.
  */
 export function makeTlMarkdownArticle(source: IMProjectableMessage): tl.RawRichMessage | undefined {
   const markdown = source.content.richMarkdown

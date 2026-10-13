@@ -183,9 +183,9 @@ sendMessage(session, conversation, {
 平台正文本身就是 markdown 时（QQ 官方 bot 的 `markdown` part 就是这样），adapter 除了给出
 渲染好的 `parts`，还应在 `content.richMarkdown` 里交出这份 markdown 原文：bridge 把它转成
 Telegram rich message（article）的 page block，客户端因此能画出表格、真实列表和标题——这些
-Telegram 的 message entity 表达不了。`parts` 始终是消息正文，所以不支持 rich message 的
-客户端（客户端 layer 低于 227，见 `packages/mtproto/src/rpc/api-layer.ts`）拿到的就是这份
-文本，退回路径不依赖新字段。反过来，平台没有 markdown 概念时不要设置该字段。
+Telegram 的 message entity 表达不了。按最新版客户端实现（rich message 从 layer 227 起，
+TDLib 1.8.64 起），bridge 不做客户端版本探测；markdown 转不成 block 时只是不发 rich message，
+消息仍按 `parts` 发出。平台没有 markdown 概念时不要设置该字段。
 
 平台能点名成员的入群提示应改用结构化表达，让 Telegram 客户端渲染原生入群服务消息
 （成员名字可点击、可打开资料）：

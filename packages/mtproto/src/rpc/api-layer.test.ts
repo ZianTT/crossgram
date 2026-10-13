@@ -81,43 +81,6 @@ describe('API layer response writers', () => {
     })
   })
 
-  it('drops a rich message for a client that predates it, leaving the text', () => {
-    // Rich messages arrived in layer 227 (TDLib MTPROTO_LAYER 227, commit
-    // 5aec5b1), so a client on 225 must receive the message without the field —
-    // which is why the relay keeps the rendered text on every projected message
-    // it also sends a rich message for.
-    const article = {
-      ...message,
-      richMessage: {
-        _: 'richMessage',
-        blocks: [{
-          _: 'pageBlockTable',
-          bordered: true,
-          title: { _: 'textEmpty' },
-          rows: [{ _: 'pageTableRow', cells: [{ _: 'pageTableCell', text: { _: 'textPlain', text: 'a' } }] }],
-        }],
-        photos: [],
-        documents: [],
-      },
-    } as unknown as tl.RawMessage
-
-    const modernReader = getApiLayerReaderMap(227)
-    expect(modernReader).not.toBeNull()
-    const modern = new TlBinaryReader(modernReader!, TlBinaryWriter.serializeObject(
-      getApiLayerWriterMap(__tlWriterMap, 227), article,
-    )).object() as tl.RawMessage
-    expect(modern.richMessage?.blocks.map((block) => block._)).toEqual(['pageBlockTable'])
-    expect(modern.message).toBe('legacy wire message')
-
-    const legacyReader = getApiLayerReaderMap(225)
-    expect(legacyReader).not.toBeNull()
-    const legacy = new TlBinaryReader(legacyReader!, TlBinaryWriter.serializeObject(
-      getApiLayerWriterMap(__tlWriterMap, 225), article,
-    )).object() as tl.RawMessage
-    expect(legacy.richMessage).toBeUndefined()
-    expect(legacy.message).toBe('legacy wire message')
-  })
-
   it('keeps the base writer map for layers older than the local mirror', () => {
     expect(getApiLayerWriterMap(__tlWriterMap, 1)).toBe(__tlWriterMap)
     expect(getApiLayerWriterMap(__tlWriterMap, null)).toBe(__tlWriterMap)

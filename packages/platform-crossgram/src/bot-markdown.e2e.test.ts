@@ -372,8 +372,7 @@ describe('QQNT bot markdown E2E', () => {
       'const a = 1',
     ].join('\n'))
     // The same body reaches the client as a rich message too, tables included:
-    // entities cannot carry one. The text asserted above is what a client older
-    // than the layer that knows rich messages keeps.
+    // entities cannot carry one.
     expect(projected.richMessage?.blocks.map((block) => block._)).toEqual([
       'pageBlockBlockquote',
       'pageBlockParagraph',
