@@ -2,7 +2,7 @@ import Long from 'long'
 import { describe, expect, it, vi } from 'vitest'
 import type { tl } from '@mtcute/core'
 import {
-  convertRichMessage, htmlBlocks, markdownBlocks, parseInlineMarkdown, richTextContent,
+  convertRichMessage, htmlBlocks, markdownBlocks, markdownRichMessage, parseInlineMarkdown, richTextContent,
   type RichMediaReference, type ResolvedRichMedia,
 } from './rich-message.js'
 
@@ -264,6 +264,91 @@ describe('markdown and HTML articles', () => {
     expect((blocks.at(-1) as tl.RawPageBlockParagraph).text)
       .toMatchObject({ _: 'textUrl', url: 'https://example.com' })
     expect((blocks[5] as tl.RawPageBlockPreformatted)).toMatchObject({ language: 'ts' })
+  })
+
+  it('renders a markdown table as a page block, the only place Telegram draws one', () => {
+    const blocks = markdownBlocks([
+      '| 名字 | 数量 | 备注 |',
+      '| --- | :---: | ---: |',
+      '| 橘子 | 3 | 甜 |',
+      '| tea | 16 | ok |',
+    ].join('\n'))
+
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]).toEqual({
+      _: 'pageBlockTable',
+      bordered: true,
+      striped: true,
+      title: { _: 'textEmpty' },
+      rows: [
+        { _: 'pageTableRow', cells: [
+          { _: 'pageTableCell', header: true, text: { _: 'textPlain', text: '名字' } },
+          { _: 'pageTableCell', header: true, alignCenter: true, text: { _: 'textPlain', text: '数量' } },
+          { _: 'pageTableCell', header: true, alignRight: true, text: { _: 'textPlain', text: '备注' } },
+        ] },
+        { _: 'pageTableRow', cells: [
+          { _: 'pageTableCell', text: { _: 'textPlain', text: '橘子' } },
+          { _: 'pageTableCell', alignCenter: true, text: { _: 'textPlain', text: '3' } },
+          { _: 'pageTableCell', alignRight: true, text: { _: 'textPlain', text: '甜' } },
+        ] },
+        { _: 'pageTableRow', cells: [
+          { _: 'pageTableCell', text: { _: 'textPlain', text: 'tea' } },
+          { _: 'pageTableCell', alignCenter: true, text: { _: 'textPlain', text: '16' } },
+          { _: 'pageTableCell', alignRight: true, text: { _: 'textPlain', text: 'ok' } },
+        ] },
+      ],
+    })
+    // A pipe does not make a table: the delimiter row decides.
+    expect(markdownBlocks('价格 | 数量\n橘子 3 元').map((block) => block._)).toEqual(['pageBlockParagraph'])
+    // Inline markup inside a cell is rendered, not kept as source.
+    const markup = markdownBlocks('| a | b |\n| --- | --- |\n| **粗** | [x](https://e.com) |')
+    expect((markup[0] as tl.RawPageBlockTable).rows[1]!.cells[0]!.text)
+      .toEqual({ _: 'textBold', text: { _: 'textPlain', text: '粗' } })
+  })
+
+  it('builds a rich message from a markdown body', () => {
+    const rich = markdownRichMessage([
+      '> 引用一行',
+      '',
+      '正文 **加粗**',
+      '',
+      '| 名字 | 数量 |',
+      '| --- | --- |',
+      '| 橘子 | 3 |',
+    ].join('\n'))
+    expect(rich?.blocks.map((block) => block._)).toEqual([
+      'pageBlockBlockquote', 'pageBlockParagraph', 'pageBlockTable',
+    ])
+    expect(rich?.photos).toEqual([])
+    expect(rich?.documents).toEqual([])
+    // Nothing to draw is nothing to send.
+    expect(markdownRichMessage('\n\n')).toBeUndefined()
+  })
+
+  it('sends a table block to a platform as the text a person reads', async () => {
+    const conversion = await convertRichMessage({
+      _: 'inputRichMessage',
+      blocks: [{
+        _: 'pageBlockTable',
+        bordered: true,
+        title: { _: 'textEmpty' },
+        rows: [
+          { _: 'pageTableRow', cells: [
+            { _: 'pageTableCell', header: true, text: { _: 'textPlain', text: '名字' } },
+            { _: 'pageTableCell', header: true, text: { _: 'textPlain', text: '数量' } },
+          ] },
+          { _: 'pageTableRow', cells: [
+            { _: 'pageTableCell', text: { _: 'textPlain', text: '橘子' } },
+            { _: 'pageTableCell', text: { _: 'textPlain', text: '3' } },
+          ] },
+        ],
+      }],
+      photos: [],
+    }, async () => undefined)
+
+    expect(conversion?.parts).toEqual([
+      { type: 'text', text: '名字 | 数量\n橘子 | 3', entities: [] },
+    ])
   })
 
   it('places a referenced file in the body and appends the rest', async () => {

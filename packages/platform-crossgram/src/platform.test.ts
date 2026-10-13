@@ -503,6 +503,40 @@ describe('QQNTPlatform mapping', () => {
     ])
   })
 
+  it('hands a QQ bot markdown body over as a rich message source beside its text', async () => {
+    // Telegram draws a table only in a rich message, so the markdown body is
+    // handed over as markdown as well; the text parts stay the message text and
+    // are what a client that does not know rich messages receives.
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: [{
+        id: 'bot-table', conversationId: 'group', senderId: 'bot', timestamp: 1, outgoing: false,
+        parts: [
+          {
+            type: 'markdown' as const,
+            // Production: the body opens with QQ's empty-label template link.
+            content: '[](%7B%22version%22%3A2%7D)\n\n| 名字 | 数量 |\n| --- | --- |\n| 橘子 | 3 |\n',
+          },
+          { type: 'text' as const, text: '名字 | 数量\n橘子 | 3' },
+        ],
+      }, {
+        id: 'plain', conversationId: 'group', senderId: 'alice', timestamp: 2, outgoing: false,
+        parts: [{ type: 'text' as const, text: '- 不是列表\n| a | b |\n| --- | --- |' }],
+      }],
+    }))
+    const [rich, plain] = (await platform.getHistory(session, { id: 'group' })).messages
+    // The template link is dropped and the body is otherwise untouched.
+    expect(rich!.content.richMarkdown).toBe('| 名字 | 数量 |\n| --- | --- |\n| 橘子 | 3 |')
+    expect(entitySlices(rich!.content.parts[0] as never)).toEqual([
+      'pre:名字 | 数量\n橘子 | 3',
+    ])
+    // Only a markdown part is markdown.
+    expect(plain!.content.richMarkdown).toBeUndefined()
+    expect(plain!.content.parts).toEqual([
+      { type: 'text', text: '- 不是列表\n| a | b |\n| --- | --- |' },
+    ])
+  })
+
   it('keeps a plain QQ message exactly as it arrived', async () => {
     // Only a `markdown` part is markdown. A text part is what QQ sent, so its
     // `>` lines, dashes and pipes are not converted into anything.

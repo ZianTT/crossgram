@@ -300,6 +300,12 @@ function blockText(block: tl.TypePageBlock): RichTextContent | undefined {
     }
     case 'pageBlockPreformatted':
       return richTextContent(block.text)
+    case 'pageBlockTable':
+      // Platforms have no table either, so the rows are sent as the text a
+      // person reads: one line per row, cells separated by a pipe.
+      return { text: block.rows.map((row) => row.cells
+        .map((cell) => cell.text ? richTextContent(cell.text)?.text ?? '' : '')
+        .join(' | ')).join('\n'), entities: [] }
     case 'pageBlockMath':
       return { text: block.source, entities: [] }
     case 'pageBlockBlockquote':
@@ -547,6 +553,68 @@ function wrapRichText(text: tl.TypeRichText, entity: tl.TypeMessageEntity): tl.T
 /** Inline image reference, whose target may name a file of the article. */
 const MARKDOWN_IMAGE = /!\[([^\]]*)\]\(([^)\s]+)\)/gu
 
+/** One row of a markdown table, or nothing when the line is not one. */
+function markdownTableRow(line: string): string[] | undefined {
+  const trimmed = line.trim()
+  if (!trimmed.includes('|')) return undefined
+  const cells = trimmed.replace(/^\|/u, '').replace(/\|$/u, '').split('|').map((cell) => cell.trim())
+  return cells.length > 1 ? cells : undefined
+}
+
+/**
+ * A markdown table at `start`: a header row, a `--- | ---` delimiter row that
+ * also carries the alignment, then body rows. Markdown expresses no colspan or
+ * rowspan, so every cell is a cell of its own.
+ */
+function markdownTable(
+  lines: readonly string[],
+  start: number,
+): { block: tl.RawPageBlockTable, end: number } | undefined {
+  const header = markdownTableRow(lines[start] ?? '')
+  const delimiter = markdownTableRow(lines[start + 1] ?? '')
+  if (!header || !delimiter || header.length !== delimiter.length) return undefined
+  if (!delimiter.every((cell) => /^:?-+:?$/.test(cell))) return undefined
+  const rows: string[][] = [header]
+  let end = start + 2
+  while (end < lines.length) {
+    const row = markdownTableRow(lines[end] ?? '')
+    if (!row) break
+    rows.push(row)
+    end += 1
+  }
+  return {
+    block: {
+      _: 'pageBlockTable',
+      bordered: true,
+      striped: true,
+      // Telegram's own clients draw the title above the border; a markdown
+      // table has none.
+      title: { _: 'textEmpty' },
+      rows: rows.map((row, rowIndex) => ({
+        _: 'pageTableRow' as const,
+        cells: Array.from({ length: delimiter.length }, (_cell, column) => {
+          const alignment = delimiter[column]!
+          return {
+            _: 'pageTableCell' as const,
+            // The first row is the table's header, as markdown declares it.
+            header: rowIndex === 0 || undefined,
+            alignCenter: alignment.startsWith(':') && alignment.endsWith(':') || undefined,
+            alignRight: !alignment.startsWith(':') && alignment.endsWith(':') || undefined,
+            text: markdownRichText(row[column] ?? ''),
+          }
+        }),
+      })),
+    },
+    end,
+  }
+}
+
+/** Markdown body as the blocks of a Telegram rich message (article). */
+export function markdownRichMessage(markdown: string): tl.RawRichMessage | undefined {
+  const blocks = markdownBlocks(markdown)
+  return blocks.length ? { _: 'richMessage', blocks, photos: [], documents: [] } : undefined
+}
+
 /**
  * Markdown article body, rendered into the block form of an article.
  *
@@ -590,7 +658,9 @@ export function markdownBlocks(
     }
   }
 
-  for (const line of markdown.split(/\r?\n/u)) {
+  const lines = markdown.split(/\r?\n/u)
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!
     if (code) {
       if (line.trimStart().startsWith('```')) {
         blocks.push({
@@ -613,6 +683,14 @@ export function markdownBlocks(
     if (!line.trim()) {
       flushParagraph()
       flushQuote()
+      continue
+    }
+    const table = markdownTable(lines, index)
+    if (table) {
+      flushParagraph()
+      flushQuote()
+      blocks.push(table.block)
+      index = table.end - 1
       continue
     }
     const heading = /^(#{1,6})\s+(.*)$/u.exec(line)

@@ -5,7 +5,7 @@ import type { ServerConnection, ServerRpcContext } from '@mtproto-relay/mtproto'
 import Long from 'long'
 import { RpcError } from '@mtproto-relay/mtproto'
 import {
-  makeAdminRights, makeDefaultBannedRights, makeTlArticleMedia, makeTlCardPreview,
+  makeAdminRights, makeDefaultBannedRights, makeTlArticleMedia, makeTlCardPreview, makeTlMarkdownArticle,
   makeTlMessageMedia, peerTlSeed, projectTlMessage, stableId,
 } from './dialogs.js'
 import { toUser, type MessageStore } from './message-store.js'
@@ -812,7 +812,7 @@ export class UpdateManager {
               session, projectedSource.conversationId, definition,
             ),
           },
-        )
+        ) ?? makeTlMarkdownArticle(projectedSource)
         return {
           message: projectTlMessage({
             platformSessionId: session.platformSessionId,

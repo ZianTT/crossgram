@@ -2744,10 +2744,35 @@ function mapMessage(
       serviceAction: input.serviceAction,
       parts: mapParts(input, stickerProviderId, reactionCatalog, projectMedia),
       inlineKeyboard: mapInlineKeyboard(input),
+      richMarkdown: qqRichMarkdown(input),
     },
   }
 }
 
+
+/**
+ * QQ bot frameworks open a markdown body with an empty-label link carrying
+ * template metadata such as `[](%7B%22version%22%3A2%7D)`; QQ draws nothing for
+ * it, and neither may the rich message the body becomes.
+ */
+const QQ_TEMPLATE_LINK = /\[\]\([^)\s]*\)/gu
+
+/**
+ * The markdown body of a QQ bot message, which the relay renders into a
+ * Telegram rich message.
+ *
+ * Only a `markdown` part is markdown; a plain-text message has none, so it is
+ * neither parsed nor upgraded. The text parts stay the message text and are
+ * what a client that does not know rich messages receives.
+ */
+function qqRichMarkdown(input: WireMessage): string | undefined {
+  const markdown = input.parts
+    .flatMap((part) => part.type === 'markdown' ? [part.content] : [])
+    .join('\n')
+    .replace(QQ_TEMPLATE_LINK, '')
+    .trim()
+  return markdown || undefined
+}
 
 function mapInlineKeyboard(
   input: WireMessage,

@@ -371,6 +371,22 @@ describe('QQNT bot markdown E2E', () => {
       '',
       'const a = 1',
     ].join('\n'))
+    // The same body reaches the client as a rich message too, tables included:
+    // entities cannot carry one. The text asserted above is what a client older
+    // than the layer that knows rich messages keeps.
+    expect(projected.richMessage?.blocks.map((block) => block._)).toEqual([
+      'pageBlockBlockquote',
+      'pageBlockParagraph',
+      'pageBlockList',
+      'pageBlockTable',
+      'pageBlockPreformatted',
+    ])
+    const table = projected.richMessage?.blocks[3] as tl.RawPageBlockTable
+    expect(table.rows.map((row) => row.cells.map((cell) => (cell.text as tl.RawTextPlain).text))).toEqual([
+      ['名字', '数量'],
+      ['橘子', '3'],
+    ])
+    expect(table.rows[0]!.cells.map((cell) => cell.header)).toEqual([true, true])
     expect(entitySlices(projected)).toEqual([
       'messageEntityBlockquote:小明：今天上午的航班在哪里看',
       'messageEntityTextUrl:PR #7',
