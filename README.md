@@ -136,6 +136,15 @@ curl -fsSL https://raw.githubusercontent.com/std-microblock/crossgram/main/deplo
 
 完整步骤（PostgreSQL 初始化、环境变量与更新脚本）见 [deploy/README.md](deploy/README.md)。
 
+也可以用容器部署同一套生产配置，部署机不需要源码或构建：
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/std-microblock/crossgram/main/deploy/docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/std-microblock/crossgram/main/deploy/.env.example -o .env
+# 填 CROSSGRAM_PUBLIC_HOST、CROSSGRAM_POSTGRES_PASSWORD、TELEGRAM_BOT_TOKEN_VERIFIER_SECRET
+docker compose up -d
+```
+
 ## 客户端与登录
 
 ### 客户端列表

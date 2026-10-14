@@ -55,3 +55,36 @@ sudo crossgram-update
 sudo crossgram-client-config --host 203.0.113.10 --port 4430 \
   --name 'CrossGram Server' --output /tmp/crossgram-server.json
 ```
+
+## 5. Docker Compose 部署
+
+`deploy/docker-compose.yml` 用容器部署同一套生产配置：PostgreSQL、Crossgram（WebUI 仅绑定本机）以及 `qqnt` profile 下的 QQNT bridge。状态保存在 `crossgram-state`、`crossgram-postgres`、`crossgram-qqnt` 三个卷中。
+
+从检出的仓库部署：
+
+```sh
+cp deploy/.env.example deploy/.env
+$EDITOR deploy/.env   # CROSSGRAM_PUBLIC_HOST、数据库密码、Bot Token 校验密钥
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+不检出仓库也可以部署，只要这一份编排文件（镜像从 GHCR 拉取）：
+
+```sh
+mkdir crossgram && cd crossgram
+curl -fsSLO https://raw.githubusercontent.com/std-microblock/crossgram/main/deploy/docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/std-microblock/crossgram/main/deploy/.env.example -o .env
+# 填 CROSSGRAM_PUBLIC_HOST、CROSSGRAM_POSTGRES_PASSWORD、TELEGRAM_BOT_TOKEN_VERIFIER_SECRET
+docker compose up -d
+```
+
+- 钉住版本就把 URL 里的 `main` 换成 tag（如 `v1.2.3`）。
+- 该文件只使用 `image:` 与命名卷，不读检出目录里的任何东西，也不需要 `build:`；拉取失败时不会退化成构建。
+- 要改代码/本地构建时叠加 `deploy/docker-compose.build.yml`：`docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.build.yml up -d --build`（本地开发与 CI e2e 走这条）。
+- 只对外发布 MTProto（`CROSSGRAM_BIND:CROSSGRAM_PORT`，默认 `0.0.0.0:4430`），WebUI 仅发布到 `127.0.0.1:3140`；PostgreSQL 与 bridge 不发布端口，服务间通过 compose 默认网络用服务名互访。
+- 镜像各由自己的仓库发布：本仓 `.github/workflows/docker.yml` 推 `ghcr.io/std-microblock/crossgram`，bridge 镜像由 [xuuuuan/crossgram-qqnt](https://github.com/xuuuuan/crossgram-qqnt) 按 release tag 推送。GHCR 新包默认私有，需先设为 public 或 `docker login ghcr.io`；fork 可用 `CROSSGRAM_IMAGE`、`CROSSGRAM_QQNT_IMAGE` 覆盖镜像地址。
+- Crossgram 镜像基于 `node:24-bookworm-slim`，安装 yarn 缓存与删除放在同一层（1.92 GB → 645 MB），无需编译器（原生依赖都装预编译二进制）；构建机下载不到这些二进制时改用 `CROSSGRAM_NODE_IMAGE=node:24-bookworm`。
+- 容器每次启动都会渲染运行时配置：`deploy/docker/app.docker.yml` 加 compose 环境 → `/opt/crossgram/.runtime/app.yml`，并执行与 `crossgram-update` 相同的 `migrate-runtime-config.mjs`；想完全接管可把 `CROSSGRAM_RUNTIME_CONFIG` 指向手写 YAML。
+- bridge 容器自带健康检查（`qqntctl status`，启动后 3 分钟内为 `starting`），compose 因此不再重复声明；`docker ps` 可见，`up --wait` 会等它。`CROSSGRAM_QQNT_QQ_FLAGS` 可给 QQ 追加 Chromium 参数（实测 `--no-zygote --js-flags=--max-old-space-size=512` 让 bridge 空闲内存从 171 MB 降到 137 MB）。
+- 内存默认不限制：compose 里每个服务的 `deploy:` 上限块都是注释，取消注释即生效（参考值 PostgreSQL `768m`、Crossgram `2g`、bridge `2g`）。实测空闲占用合计约 600 MB（PostgreSQL ~105 MB、Crossgram ~355 MB、bridge ~170 MB）；设了上限时 Node 会据此收缩 V8 堆（`2g` 对应约 1.1 GB）。
+- `deploy/docker-deploy-files.test.ts` 覆盖 compose 与镜像定义；`CROSSGRAM_DOCKER_E2E=1 yarn vitest run deploy/docker-compose.e2e.test.ts` 会真实构建并启动 PostgreSQL 与 Crossgram 并检查两个发布端口，加 `CROSSGRAM_DOCKER_E2E_QQNT=1` 会带上 bridge profile。

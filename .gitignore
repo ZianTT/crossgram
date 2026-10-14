@@ -6,6 +6,9 @@ dist
 external
 
 .env.local
+deploy/.env
+
+.worktrees/
 
 .pnp.*
 .yarn/*

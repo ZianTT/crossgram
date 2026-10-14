@@ -1,0 +1,10 @@
+# 从检出构建应用镜像时叠加本文件：
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.build.yml up -d --build
+# 部署只拉取镜像，单独使用 deploy/docker-compose.yml 即可。
+services:
+  crossgram:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        NODE_IMAGE: "${CROSSGRAM_NODE_IMAGE:-node:24-bookworm-slim}"
