@@ -591,6 +591,63 @@ describe('media send streaming', () => {
     } }])
   })
 
+  it('relays an animated image document as an image instead of a file', async () => {
+    const { rpc, uploads, inputs, peerId } = await createHarness()
+    await uploads.savePart(session.platformSessionId, '92', 0, Uint8Array.of(71, 73, 70))
+    await rpc.sendMedia({
+      _: 'messages.sendMedia', peer: peer(peerId), randomId: Long.fromNumber(92), message: '',
+      media: {
+        _: 'inputMediaUploadedDocument', file: inputFile(92, 1, '8230e1c2.gif'),
+        mimeType: 'image/gif',
+        attributes: [
+          { _: 'documentAttributeFilename', fileName: '8230e1c2.gif' },
+          { _: 'documentAttributeAnimated' },
+          { _: 'documentAttributeImageSize', w: 704, h: 1103 },
+        ],
+      },
+    })
+    expect(inputs).toHaveLength(1)
+    expect(inputs[0]!.parts).toMatchObject([{ type: 'media', media: {
+      kind: 'image', name: '8230e1c2.gif', mimeType: 'image/gif',
+    } }])
+  })
+
+  it('keeps a document the client did not mark as animated on the file path', async () => {
+    const { rpc, uploads, inputs, peerId } = await createHarness()
+    await uploads.savePart(session.platformSessionId, '93', 0, Uint8Array.of(1, 2, 3))
+    await rpc.sendMedia({
+      _: 'messages.sendMedia', peer: peer(peerId), randomId: Long.fromNumber(93), message: '',
+      media: {
+        _: 'inputMediaUploadedDocument', file: inputFile(93, 1, 'kept.gif'), mimeType: 'image/gif',
+        attributes: [{ _: 'documentAttributeFilename', fileName: 'kept.gif' }],
+      },
+    })
+    expect(inputs).toHaveLength(1)
+    expect(inputs[0]!.parts).toMatchObject([{ type: 'media', media: {
+      kind: 'file', name: 'kept.gif', mimeType: 'image/gif',
+    } }])
+  })
+
+  it('keeps an animated video document on the file path', async () => {
+    const { rpc, uploads, inputs, peerId } = await createHarness()
+    await uploads.savePart(session.platformSessionId, '94', 0, Uint8Array.of(4, 5, 6))
+    await rpc.sendMedia({
+      _: 'messages.sendMedia', peer: peer(peerId), randomId: Long.fromNumber(94), message: '',
+      media: {
+        _: 'inputMediaUploadedDocument', file: inputFile(94, 1, 'clip.mp4'), mimeType: 'video/mp4',
+        attributes: [
+          { _: 'documentAttributeFilename', fileName: 'clip.mp4' },
+          { _: 'documentAttributeAnimated' },
+          { _: 'documentAttributeVideo', w: 320, h: 240, duration: 2, supportsStreaming: true },
+        ],
+      },
+    })
+    expect(inputs).toHaveLength(1)
+    expect(inputs[0]!.parts).toMatchObject([{ type: 'media', media: {
+      kind: 'file', name: 'clip.mp4', mimeType: 'video/mp4',
+    } }])
+  })
+
   it('sends mixed image and file content through one platform call with independent streams', async () => {
     const { rpc, uploads, inputs, consumed, progress, peerId } = await createHarness()
     await uploads.savePart(session.platformSessionId, '1', 0, new Uint8Array([1, 2]))

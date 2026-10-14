@@ -3490,7 +3490,17 @@ export class DialogRpc {
     }
     const file = media.file
     if (file._ !== 'inputFile' && file._ !== 'inputFileBig') throw new RpcError(400, 'FILE_ID_INVALID')
-    const kind = media._ === 'inputMediaUploadedPhoto' ? 'image' : 'file'
+    // A GIF or APNG that the client sends as an animation reaches the relay as
+    // an uploaded document, never as a photo, and Telegram models it as an
+    // image: the relay itself projects an animated image document back as
+    // `kind: 'image'` with the image mime. Sending it to the platform as a file
+    // produces a plain attachment whose name the user never chose. Only a
+    // document that the client marked as animated counts, so an explicit
+    // "send as file" and a video never take the image path.
+    const animatedImage = media._ === 'inputMediaUploadedDocument'
+      && isAnimatedImageMime(media.mimeType)
+      && media.attributes.some((item) => item._ === 'documentAttributeAnimated')
+    const kind = media._ === 'inputMediaUploadedPhoto' || animatedImage ? 'image' : 'file'
     const attribute = media._ === 'inputMediaUploadedDocument'
       ? media.attributes.find((item) => item._ === 'documentAttributeFilename')
       : undefined
