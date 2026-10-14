@@ -55,6 +55,15 @@ const otherMessage = {
   parts: [{ type: 'text', text: '我还没试过' }],
 }
 
+/**
+ * An entity list as `_:slice` pairs, so a case states what Telegram draws
+ * instead of only the offsets it draws it at.
+ */
+function entitySlices(message: tl.RawMessage): string[] {
+  return (message.entities ?? []).map((entity) =>
+    `${entity._}:${(message.message ?? '').slice(entity.offset, entity.offset + entity.length)}`)
+}
+
 async function readJson(request: IncomingMessage): Promise<any> {
   const chunks: Buffer[] = []
   for await (const chunk of request) chunks.push(chunk as Buffer)
@@ -168,5 +177,224 @@ describe('QQNT bot markdown E2E', () => {
       conversationId: 'menu-group', messageId: 'qq-bot-menu', messageSequence: '1884646',
       buttonId: 'ac.status', callbackData: 'BOT1.0_status', botAppid: '102106848',
     }])
+  })
+
+  it('relays a quoted QQ bot reply as a Telegram quote, not as markdown source', async () => {
+    // A QQ bot reply as recorded from production: QQ's reply box travels as a
+    // markdown blockquote line, then the body, then QQ's plain-text fallback for
+    // clients without markdown support.
+    const replyMessage = {
+      id: 'qq-bot-reply', conversationId: 'reply-group', senderId: 'bot', timestamp: 1_800_000_200,
+      outgoing: false, msgSeq: '1884647', telegramMessageId: 1884647,
+      sender: { id: 'bot', name: '橘波特', numericId: '3889020080', bot: true },
+      parts: [
+        {
+          type: 'markdown', content: '> 小明：今天上午的航班在哪里看\n\n'
+            + '顺手修了两处 [PR #7](https://github.com/std-microblock/crossgram/pull/7) 已提 **加粗**\n',
+        },
+        {
+          type: 'text', text: '小明：今天上午的航班在哪里看\n\n'
+            + '顺手修了两处 PR #7 已提 加粗',
+        },
+      ],
+    }
+    const server: Server = createServer(async (request, response) => {
+      response.setHeader('content-type', 'application/json')
+      const url = request.url ?? ''
+      if (url.startsWith('/v1/conversations/reply-group/history')) {
+        response.end(JSON.stringify({ messages: [replyMessage] }))
+        return
+      }
+      if (url.startsWith('/v1/dialogs')) {
+        response.end(JSON.stringify({ conversations: [{
+          id: 'reply-group', kind: 'group', title: 'reply-group',
+          peerUid: 'reply-group', peerUin: 'reply-group', chatType: 2, unreadCount: 0,
+        }] }))
+        return
+      }
+      if (url === '/v1/reactions/catalog') {
+        response.end(JSON.stringify({ available: [], reactions: [], maxSelected: 20 }))
+        return
+      }
+      response.statusCode = 404
+      response.end(JSON.stringify({ error: 'not found' }))
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('missing test server address')
+    disposals.push(async () => {
+      const closed = new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      server.closeAllConnections()
+      await closed
+    })
+
+    const ctx = new Context()
+    const fibers = [ctx.plugin(Database), ctx.plugin(SQLiteDriver, { path: ':memory:' })]
+    await Promise.all(fibers)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    defineModels(ctx)
+    await ctx.database.prepared()
+    disposals.push(async () => {
+      for (const fiber of fibers.reverse()) await Promise.resolve((fiber as any).dispose?.())
+    })
+
+    const platform = new QQNTPlatform({ endpoint: `http://127.0.0.1:${address.port}/v1` })
+    const store = new MessageStore(ctx.database)
+    const conversation = { id: 'reply-group', kind: 'group' as const, title: 'reply-group' }
+    const [reply] = (await platform.getHistory(session, conversation)).messages
+    await store.ingest(session, conversation, reply!, { allocation: 'history' })
+
+    const rpc = new DialogRpc(platform, session, store)
+    const peer = { _: 'inputPeerChannel' as const, channelId: rpc.peerTlId('reply-group'), accessHash: Long.ZERO }
+    const result = await rpc.getHistory({
+      _: 'messages.getHistory', peer: peer as tl.TypeInputPeer, offsetId: 0, offsetDate: 0,
+      addOffset: 0, limit: 20, maxId: 0, minId: 0, hash: Long.ZERO,
+    }) as tl.messages.RawChannelMessages
+    const projected = result.messages.find((message): message is tl.RawMessage => message._ === 'message')
+    // The blockquote line reaches the client as its own entity, so the text is
+    // the body without the `>` markers and QQ's fallback copy is not doubled.
+    expect(projected?.message).toBe(
+      '小明：今天上午的航班在哪里看\n\n顺手修了两处 PR #7 已提 加粗',
+    )
+    expect(projected?.entities).toEqual([
+      { _: 'messageEntityBlockquote', offset: 0, length: 14 },
+      {
+        _: 'messageEntityTextUrl', offset: 23, length: 5,
+        url: 'https://github.com/std-microblock/crossgram/pull/7',
+      },
+      { _: 'messageEntityBold', offset: 32, length: 2 },
+    ])
+  })
+
+  it('relays a whole QQ bot markdown body, every construct at once', async () => {
+    // The whole body of a QQ markdown message is markdown, so a client gets one
+    // Telegram message whose text is the rendered body and whose entities carry
+    // the quote, the list bullets, the table as monospace and the inline markup.
+    const document = [
+      '> 小明：今天上午的航班在哪里看',
+      '',
+      '顺手修了两处 [PR #7](https://github.com/std-microblock/crossgram/pull/7) 已提 **加粗** 和 `码`',
+      '',
+      '- 第一项',
+      '- 第二项',
+      '',
+      '| 名字 | 数量 |',
+      '| --- | --- |',
+      '| 橘子 | 3 |',
+      '',
+      '```ts',
+      'const a = 1',
+      '```',
+    ].join('\n')
+    const markdownMessage = {
+      id: 'qq-bot-document', conversationId: 'doc-group', senderId: 'bot', timestamp: 1_800_000_300,
+      outgoing: false, msgSeq: '1884648', telegramMessageId: 1884648,
+      sender: { id: 'bot', name: '橘波特', numericId: '3889020080', bot: true },
+      parts: [
+        { type: 'markdown', content: `${document}\n` },
+        // QQ's plain-text rendition of the same body, which is dropped: QQ
+        // renders the body (its template links disappear from recorded
+        // renditions) and only the layout markers differ from what we draw.
+        {
+          type: 'text',
+          text: '小明：今天上午的航班在哪里看\n\n'
+            + '顺手修了两处 PR #7 已提 加粗 和 码\n\n'
+            + '• 第一项\n• 第二项\n\n名字 数量\n橘子 3\n\nconst a = 1',
+        },
+      ],
+    }
+    const server: Server = createServer(async (request, response) => {
+      response.setHeader('content-type', 'application/json')
+      const url = request.url ?? ''
+      if (url.startsWith('/v1/conversations/doc-group/history')) {
+        response.end(JSON.stringify({ messages: [markdownMessage] }))
+        return
+      }
+      if (url.startsWith('/v1/dialogs')) {
+        response.end(JSON.stringify({ conversations: [{
+          id: 'doc-group', kind: 'group', title: 'doc-group',
+          peerUid: 'doc-group', peerUin: 'doc-group', chatType: 2, unreadCount: 0,
+        }] }))
+        return
+      }
+      if (url === '/v1/reactions/catalog') {
+        response.end(JSON.stringify({ available: [], reactions: [], maxSelected: 20 }))
+        return
+      }
+      response.statusCode = 404
+      response.end(JSON.stringify({ error: 'not found' }))
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('missing test server address')
+    disposals.push(async () => {
+      const closed = new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      server.closeAllConnections()
+      await closed
+    })
+
+    const ctx = new Context()
+    const fibers = [ctx.plugin(Database), ctx.plugin(SQLiteDriver, { path: ':memory:' })]
+    await Promise.all(fibers)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    defineModels(ctx)
+    await ctx.database.prepared()
+    disposals.push(async () => {
+      for (const fiber of fibers.reverse()) await Promise.resolve((fiber as any).dispose?.())
+    })
+
+    const platform = new QQNTPlatform({ endpoint: `http://127.0.0.1:${address.port}/v1` })
+    const store = new MessageStore(ctx.database)
+    const conversation = { id: 'doc-group', kind: 'group' as const, title: 'doc-group' }
+    const [message] = (await platform.getHistory(session, conversation)).messages
+    await store.ingest(session, conversation, message!, { allocation: 'history' })
+
+    const rpc = new DialogRpc(platform, session, store)
+    const peer = { _: 'inputPeerChannel' as const, channelId: rpc.peerTlId('doc-group'), accessHash: Long.ZERO }
+    const result = await rpc.getHistory({
+      _: 'messages.getHistory', peer: peer as tl.TypeInputPeer, offsetId: 0, offsetDate: 0,
+      addOffset: 0, limit: 20, maxId: 0, minId: 0, hash: Long.ZERO,
+    }) as tl.messages.RawChannelMessages
+    const projected = result.messages.find((message): message is tl.RawMessage => message._ === 'message')!
+    expect(projected.message).toBe([
+      '小明：今天上午的航班在哪里看',
+      '',
+      '顺手修了两处 PR #7 已提 加粗 和 码',
+      '',
+      '• 第一项',
+      '• 第二项',
+      '',
+      '名字 | 数量',
+      '橘子 | 3',
+      '',
+      'const a = 1',
+    ].join('\n'))
+    // The same body reaches the client as a rich message too, tables included:
+    // entities cannot carry one.
+    expect(projected.richMessage?.blocks.map((block) => block._)).toEqual([
+      'pageBlockBlockquote',
+      'pageBlockParagraph',
+      'pageBlockList',
+      'pageBlockTable',
+      'pageBlockPreformatted',
+    ])
+    const table = projected.richMessage?.blocks[3] as tl.RawPageBlockTable
+    expect(table.rows.map((row) => row.cells.map((cell) => (cell.text as tl.RawTextPlain).text))).toEqual([
+      ['名字', '数量'],
+      ['橘子', '3'],
+    ])
+    expect(table.rows[0]!.cells.map((cell) => cell.header)).toEqual([true, true])
+    expect(entitySlices(projected)).toEqual([
+      'messageEntityBlockquote:小明：今天上午的航班在哪里看',
+      'messageEntityTextUrl:PR #7',
+      'messageEntityBold:加粗',
+      'messageEntityCode:码',
+      'messageEntityPre:名字 | 数量\n橘子 | 3',
+      // The fenced body keeps its trailing newline in the entity source, which
+      // the message's trailing-trim then clips: the reader sees the code line.
+      'messageEntityPre:const a = 1',
+    ])
   })
 })

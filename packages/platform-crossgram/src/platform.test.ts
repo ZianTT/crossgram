@@ -26,6 +26,18 @@ async function collect(source: AsyncIterable<Uint8Array>): Promise<Uint8Array[]>
   return chunks
 }
 
+/**
+ * An entity list as `type:slice` pairs, so a test states what a client draws
+ * instead of only the offsets it draws it at.
+ */
+function entitySlices(part: {
+  text: string
+  entities?: ReadonlyArray<{ type: string, offset: number, length: number }>
+}): string[] {
+  return (part.entities ?? [])
+    .map((entity) => `${entity.type}:${part.text.slice(entity.offset, entity.offset + entity.length)}`)
+}
+
 afterEach(async () => {
   vi.useRealTimers()
   vi.unstubAllEnvs()
@@ -287,6 +299,314 @@ describe('QQNTPlatform mapping', () => {
     expect(extra.content.parts).toEqual([
       { type: 'text', text: '菜单额外说明', entities: [{ type: 'bold', offset: 0, length: 2 }] },
     ])
+  })
+
+  it('renders QQ bot blockquotes as one quote entity instead of the markdown source', async () => {
+    // A QQ bot reply carries QQ's reply box as a markdown blockquote line
+    // (`> 名字：被引用的那句话`), which QQ itself draws as a quoted block.
+    // Telegram has `blockquote` for that: leaving the markers in the text made
+    // clients show the markdown source, and one entity per line drew one quote
+    // per line.
+    expect(parseQQMarkdown(
+      '> 小明：今天上午的航班在哪里看\n\n'
+      + '顺手修了两处 [PR #7](https://github.com/std-microblock/crossgram/pull/7) 已提 **加粗**\n',
+    )).toEqual({
+      type: 'text',
+      text: '小明：今天上午的航班在哪里看\n\n'
+        + '顺手修了两处 PR #7 已提 加粗',
+      entities: [
+        { type: 'blockquote', offset: 0, length: 14 },
+        {
+          type: 'text-link', offset: 23, length: 5,
+          url: 'https://github.com/std-microblock/crossgram/pull/7',
+        },
+        { type: 'bold', offset: 32, length: 2 },
+      ],
+    })
+    expect(parseQQMarkdown('> 第一行\n> 第二行\n\n正文')).toEqual({
+      type: 'text',
+      text: '第一行\n第二行\n\n正文',
+      entities: [{ type: 'blockquote', offset: 0, length: 7 }],
+    })
+    // Inline markup inside the quote is a quote too, and a blank line ends it.
+    expect(parseQQMarkdown('> **粗**引\n\n> 另一段\n> 接着')).toEqual({
+      type: 'text',
+      text: '粗引\n\n另一段\n接着',
+      entities: [
+        { type: 'blockquote', offset: 0, length: 2 },
+        { type: 'bold', offset: 0, length: 1 },
+        { type: 'blockquote', offset: 4, length: 6 },
+      ],
+    })
+    // Only a line's first `>` quotes: an escaped or inline one is body text.
+    expect(parseQQMarkdown('\\> 不是引用\n\na > b')).toEqual({
+      type: 'text', text: '> 不是引用\n\na > b', entities: undefined,
+    })
+    // A quoted line inside a fence is code, not a quote.
+    expect(parseQQMarkdown('```\n> 代码里的\n```\n> 引用')).toEqual({
+      type: 'text',
+      text: '> 代码里的\n\n引用',
+      entities: [
+        { type: 'pre', offset: 0, length: 7, language: undefined },
+        { type: 'blockquote', offset: 8, length: 2 },
+      ],
+    })
+  })
+
+  it('keeps a QQ bot reply quoted once, whichever rendition the fallback uses', async () => {
+    const markdown = '> 名字：被引用的那句话\n\n正文 [文档](https://example.com/docs)'
+    const body = '名字：被引用的那句话\n\n正文 文档'
+    const fallbacks = [
+      // QQ's plain-text rendition of the body, with and without the markers.
+      body,
+      '> 名字：被引用的那句话\n\n正文 文档',
+    ]
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: fallbacks.map((fallback, index) => ({
+        id: `bot-quote-${index}`, conversationId: 'group', senderId: 'bot', timestamp: index + 1,
+        outgoing: false, msgSeq: `90${index}`,
+        // Production order: markdown body, then QQ's plain-text fallback.
+        parts: [
+          { type: 'markdown' as const, content: markdown },
+          { type: 'text' as const, text: fallback },
+        ],
+      })),
+    }))
+    const messages = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(messages).toHaveLength(2)
+    for (const message of messages) {
+      expect(message.content.parts).toEqual([{
+        type: 'text',
+        text: body,
+        entities: [
+          { type: 'blockquote', offset: 0, length: 10 },
+          { type: 'text-link', offset: 15, length: 2, url: 'https://example.com/docs' },
+        ],
+      }])
+    }
+  })
+
+  it('renders a whole QQ bot markdown body, construct by construct', async () => {
+    // QQ sends the entire body as markdown (the bridge reports it as one
+    // `markdown` part), so every construct the platform documents has to come
+    // out rendered rather than as source: heading, bold, underlined bold,
+    // italic, bold italic, strikethrough, code, links, autolink, image, both
+    // list kinds, quote and table.
+    const part = parseQQMarkdown([
+      '# 标题',
+      '**加粗** __粗下划线__ _斜体_ *星号斜体* ***加粗斜体*** ~~删除~~ `码`',
+      '[文档](https://example.com/docs) 和 <https://doc.qq.com>',
+      '![示意图 #208px #320px](https://example.com/a.png)',
+      '- 无序一',
+      '- 无序二',
+      '1. 有序一',
+      '    - 缩进子项',
+      '> 引用一行',
+      '> 引用二行',
+      '| 名字 | 数量 |',
+      '| --- | --- |',
+      '| 橘子 | 3 |',
+      '| 奶茶 | 16 |',
+      '```ts',
+      'const a = 1',
+      '```',
+    ].join('\n'))
+    expect(part.text).toEqual([
+      // A heading has no Telegram entity; QQ's headings read as bold.
+      '标题',
+      '加粗 粗下划线 斜体 星号斜体 加粗斜体 删除 码',
+      // `<https://…>` is an autolink: the target is what it reads as.
+      '文档 和 https://doc.qq.com',
+      // An image cannot ride a message body; its alt text links to the target,
+      // with QQ's `#208px #320px` size hints dropped.
+      '示意图',
+      // Telegram has no list entity: unordered items get a bullet, ordered
+      // items keep the number QQ wrote, and nesting keeps its indent.
+      '• 无序一',
+      '• 无序二',
+      '1. 有序一',
+      '    • 缩进子项',
+      // The quote is one block, without its `>` markers.
+      '引用一行',
+      '引用二行',
+      // The table loses its `--- | ---` delimiter and is padded for monospace.
+      '名字 | 数量',
+      '橘子 | 3',
+      '奶茶 | 16',
+      'const a = 1',
+    ].join('\n'))
+    expect(entitySlices(part)).toEqual([
+      'bold:标题',
+      'bold:加粗',
+      'bold:粗下划线',
+      // QQ documents `__x__` as underlined bold and draws it as both.
+      'underline:粗下划线',
+      'italic:斜体',
+      'italic:星号斜体',
+      'bold:加粗斜体',
+      'italic:加粗斜体',
+      'strikethrough:删除',
+      'code:码',
+      'text-link:文档',
+      'text-link:https://doc.qq.com',
+      'text-link:示意图',
+      'blockquote:引用一行\n引用二行',
+      'pre:名字 | 数量\n橘子 | 3\n奶茶 | 16',
+      'pre:const a = 1',
+    ])
+  })
+
+  it('degrades a markdown table to the monospace block Telegram has', async () => {
+    // Telegram message entities have no table, and a table left as text keeps
+    // its pipes and its delimiter row — markdown source in the bubble. One `pre`
+    // entity with aligned columns is what a client can draw, and inline markup
+    // inside a cell is rendered away rather than kept (inside code the reader
+    // must not see `**` either).
+    expect(entitySlices(parseQQMarkdown([
+      '| 名字 | 数量 | 备注 |',
+      '| --- | :---: | --- |',
+      '| 橘子 | 3 | **很甜** |',
+      '| tea | 16 | ok |',
+    ].join('\n')))).toEqual([
+      // Column one is as wide as `名字`/`橘子` (four monospace columns), so `tea`
+      // is padded to it; the last column needs no padding.
+      'pre:名字 | 数量 | 备注\n橘子 | 3    | 很甜\ntea  | 16   | ok',
+    ])
+    // A quoted table keeps its quote on top of the monospace block.
+    expect(entitySlices(parseQQMarkdown([
+      '> | 名字 | 数量 |',
+      '> | --- | --- |',
+      '> | 橘子 | 3 |',
+    ].join('\n')))).toEqual([
+      'blockquote:名字 | 数量\n橘子 | 3',
+      'pre:名字 | 数量\n橘子 | 3',
+    ])
+    // A pipe does not make a table: the delimiter row decides, so ordinary
+    // punctuation stays text.
+    expect(parseQQMarkdown('价格 | 数量\n橘子 3 元\n|---|---|')).toEqual({
+      type: 'text', text: '价格 | 数量\n橘子 3 元\n|---|---|', entities: undefined,
+    })
+  })
+
+  it('passes QQ punctuation through untouched, so a rich-text parse cannot reject a send', async () => {
+    // Telegram's MarkdownV2 would demand escaping every one of these characters,
+    // and one missed escape fails the whole send. The relay carries entities
+    // instead, so the text is handed over verbatim whatever it holds.
+    const punctuation = '特价 3.5 元/份 (含税) 100% 完 \\ 备选 _ 未闭合 * 星号 [见说明 `未闭合 + 粗 | 表 # 号 ! 冒号:'
+    expect(parseQQMarkdown(punctuation)).toEqual({ type: 'text', text: punctuation, entities: undefined })
+    // The same characters inside real markup stay intact.
+    expect(entitySlices(parseQQMarkdown('**a_b** [x](https://e.com/p?q=1&r=2) `c|d` +e=f'))).toEqual([
+      'bold:a_b',
+      'text-link:x',
+      'code:c|d',
+    ])
+  })
+
+  it('hands a QQ bot markdown body over as a rich message source beside its text', async () => {
+    // Telegram draws a table only in a rich message, so the markdown body is
+    // handed over as markdown as well; the text parts stay the message text.
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: [{
+        id: 'bot-table', conversationId: 'group', senderId: 'bot', timestamp: 1, outgoing: false,
+        parts: [
+          {
+            type: 'markdown' as const,
+            // Production: the body opens with QQ's empty-label template link.
+            content: '[](%7B%22version%22%3A2%7D)\n\n| 名字 | 数量 |\n| --- | --- |\n| 橘子 | 3 |\n',
+          },
+          { type: 'text' as const, text: '名字 | 数量\n橘子 | 3' },
+        ],
+      }, {
+        id: 'plain', conversationId: 'group', senderId: 'alice', timestamp: 2, outgoing: false,
+        parts: [{ type: 'text' as const, text: '- 不是列表\n| a | b |\n| --- | --- |' }],
+      }],
+    }))
+    const [rich, plain] = (await platform.getHistory(session, { id: 'group' })).messages
+    // The template link is dropped and the body is otherwise untouched.
+    expect(rich!.content.richMarkdown).toBe('| 名字 | 数量 |\n| --- | --- |\n| 橘子 | 3 |')
+    expect(entitySlices(rich!.content.parts[0] as never)).toEqual([
+      'pre:名字 | 数量\n橘子 | 3',
+    ])
+    // Only a markdown part is markdown.
+    expect(plain!.content.richMarkdown).toBeUndefined()
+    expect(plain!.content.parts).toEqual([
+      { type: 'text', text: '- 不是列表\n| a | b |\n| --- | --- |' },
+    ])
+  })
+
+  it('keeps a plain QQ message exactly as it arrived', async () => {
+    // Only a `markdown` part is markdown. A text part is what QQ sent, so its
+    // `>` lines, dashes and pipes are not converted into anything.
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: [{
+        id: 'plain', conversationId: 'group', senderId: 'alice', timestamp: 1, outgoing: false,
+        parts: [{ type: 'text' as const, text: '- 不是列表\n> 不是引用\n| a | b |\n| --- | --- |' }],
+      }],
+    }))
+    const [message] = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(message.content.parts).toEqual([
+      { type: 'text', text: '- 不是列表\n> 不是引用\n| a | b |\n| --- | --- |' },
+    ])
+  })
+
+  it('shows a quoted body once even when QQ also sends a reply reference', async () => {
+    // The bot writes QQ's reply box into the markdown body, because a native
+    // `message_reference` on a markdown message makes QQ attach the body twice.
+    // The relay therefore shows the quote once and keeps the reference as the
+    // Telegram reply on top of it — nothing is rendered twice.
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: [{
+        id: 'bot-reply', conversationId: 'group', senderId: 'bot', timestamp: 1, outgoing: false,
+        replyToId: 'quoted', replyToSequence: '9001',
+        parts: [
+          { type: 'markdown' as const, content: '> 小明：今天上午的航班在哪里看\n\n正文' },
+          { type: 'text' as const, text: '小明：今天上午的航班在哪里看\n\n正文' },
+        ],
+      }],
+    }))
+    const [message] = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(message.replyToId).toBe('quoted')
+    expect(message.content.parts).toEqual([{
+      type: 'text',
+      text: '小明：今天上午的航班在哪里看\n\n正文',
+      entities: [{ type: 'blockquote', offset: 0, length: 14 }],
+    }])
+  })
+
+  it('drops the rendition of a list and table body whichever markers it keeps', async () => {
+    // QQ's plain-text rendition is written by QQ: it may keep the list markers
+    // and the table pipes or replace them. Either spelling is the same body.
+    const markdown = '- 第一项\n- 第二项\n\n| 名字 | 数量 |\n| --- | --- |\n| 橘子 | 3 |'
+    const fallbacks = [
+      '• 第一项\n• 第二项\n\n名字 数量\n橘子 3',
+      '- 第一项\n- 第二项\n\n名字 数量\n橘子 3',
+      '• 第一项\n• 第二项\n\n名字 | 数量\n橘子 | 3',
+    ]
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: fallbacks.map((fallback, index) => ({
+        id: `bot-list-${index}`, conversationId: 'group', senderId: 'bot', timestamp: index + 1,
+        outgoing: false, msgSeq: `91${index}`,
+        // Production order: markdown body, then QQ's plain-text fallback.
+        parts: [
+          { type: 'markdown' as const, content: markdown },
+          { type: 'text' as const, text: fallback },
+        ],
+      })),
+    }))
+    const messages = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(messages).toHaveLength(3)
+    for (const message of messages) {
+      expect(message.content.parts).toEqual([{
+        type: 'text',
+        text: '• 第一项\n• 第二项\n\n名字 | 数量\n橘子 | 3',
+        entities: [{ type: 'pre', offset: 13, length: 14 }],
+      }])
+    }
   })
 
   it('uses the service environment token unless configuration overrides it', async () => {

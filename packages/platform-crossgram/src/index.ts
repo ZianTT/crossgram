@@ -12,7 +12,7 @@ import {
   type IMDirectDownload, type IMDownloadOptions, type IMEvent, type IMHistoryPage, type IMHistoryQuery, type IMMedia, type IMMessage, type IMMessageInput, type IMMessageTarget,
   type IMMediaInput, type IMMediaUploadPreparation, type IMMediaUploadProbe,
   type IMMessageBundle, type IMMessageSnapshot, type JsonObject, type JsonValue,
-  type IMMessageSearchPage, type IMMessageSearchQuery, type IMPageQuery, type IMPlatform, type IMReactionActorPage, type IMReactionActorPageRequest, type IMReactionContext, type IMReactionResource, type IMReactionTarget, type IMReadTarget, type IMRequest, type IMRequestAction, type IMRequestPage, type IMRequestQuery, type IMSticker, type IMTransferOptions,
+  type IMMessageSearchPage, type IMMessageSearchQuery, type IMPageQuery, type IMPlatform, type IMReactionActorPage, type IMReactionActorPageRequest, type IMReactionContext, type IMReactionResource, type IMReactionTarget, type IMReadTarget, type IMRequest, type IMRequestAction, type IMRequestPage, type IMRequestQuery, type IMSticker, type IMTextEntity, type IMTransferOptions,
   type IMUser, type IMUserPage, type PlatformCapabilities, type PlatformSession, type Unsubscribe,
   type VoiceCallMediaProvider, type VoiceWorkerCall, type VoiceWorkerMediaEndpoint,
 } from '@mtproto-relay/bridge'
@@ -2744,10 +2744,34 @@ function mapMessage(
       serviceAction: input.serviceAction,
       parts: mapParts(input, stickerProviderId, reactionCatalog, projectMedia),
       inlineKeyboard: mapInlineKeyboard(input),
+      richMarkdown: qqRichMarkdown(input),
     },
   }
 }
 
+
+/**
+ * QQ bot frameworks open a markdown body with an empty-label link carrying
+ * template metadata such as `[](%7B%22version%22%3A2%7D)`; QQ draws nothing for
+ * it, and neither may the rich message the body becomes.
+ */
+const QQ_TEMPLATE_LINK = /\[\]\([^)\s]*\)/gu
+
+/**
+ * The markdown body of a QQ bot message, which the relay renders into a
+ * Telegram rich message.
+ *
+ * Only a `markdown` part is markdown; a plain-text message has none, so it is
+ * neither parsed nor upgraded. The text parts stay the message text.
+ */
+function qqRichMarkdown(input: WireMessage): string | undefined {
+  const markdown = input.parts
+    .flatMap((part) => part.type === 'markdown' ? [part.content] : [])
+    .join('\n')
+    .replace(QQ_TEMPLATE_LINK, '')
+    .trim()
+  return markdown || undefined
+}
 
 function mapInlineKeyboard(
   input: WireMessage,
@@ -2784,13 +2808,16 @@ function mapParts(
 ): IMMessage<QQMediaLocator>['content']['parts'] {
   const parts: IMMessage<QQMediaLocator>['content']['parts'] = []
   // QQ bot messages carry a plain-text fallback beside the markdown body for
-  // clients without markdown support; QQ itself only renders the markdown.
-  const markdownText = input.parts
-    .flatMap((part) => part.type === 'markdown' ? [compactText(parseQQMarkdown(part.content).text)] : [])
+  // clients without markdown support; QQ itself only renders the markdown. The
+  // fallback is that body's rendition, so the two are compared as rendition
+  // keys: `renditionKey` drops the layout markers QQ may or may not keep, and a
+  // relayed message therefore never carries the body twice.
+  const markdownKey = input.parts
+    .flatMap((part) => part.type === 'markdown' ? [renditionKey(parseQQMarkdown(part.content).text)] : [])
     .join('')
   for (const part of input.parts) {
     if (part.type === 'text') {
-      if (markdownText && !part.entities?.length && markdownText.includes(compactText(part.text))) continue
+      if (markdownKey && !part.entities?.length && markdownKey.includes(renditionKey(part.text))) continue
       const normalized = normalizeTextPart(part, reactionCatalog)
       const previous = parts.at(-1)
       if (previous?.type === 'text') {
@@ -2847,63 +2874,309 @@ function mapParts(
   return parts
 }
 
-function compactText(value: string): string {
-  return value.replace(/\s+/g, '')
+/** The marker opening a QQ markdown blockquote line, with its optional space. */
+const QQ_BLOCKQUOTE_LINE = /^[ \t]{0,3}>[ \t]?/
+
+/** The marker of an unordered list item, which Telegram has no entity for. */
+const QQ_BULLET_LINE = /^([ \t]*)[-*+][ \t]+/
+
+/** A fence line: no quote, list item or table opens inside code. */
+const QQ_FENCE_LINE = /^[ \t]{0,3}(?:```|~~~)/
+
+/** The bullet an unordered list item gets, since Telegram has no list entity. */
+const QQ_BULLET = '•'
+
+/**
+ * Everything QQ's markdown writes as layout: `> ` quote markers, `- ` / `1. `
+ * list markers (the bullet above included) and table pipes.
+ *
+ * QQ attaches the body's plain-text rendition beside the markdown body for
+ * clients without markdown support, and which of these its rendition keeps is
+ * its business. Comparing the two with all of them dropped recognizes that
+ * duplicate either way, so a relayed message never carries the body twice.
+ */
+const QQ_RENDITION_MARKERS = /^[ \t]*(?:>[ \t]*)?(?:[-*+]|\d{1,3}[.)]|•)[ \t]+|^[ \t]{0,3}>[ \t]?|\|/gm
+
+/**
+ * A body reduced to what the parsed markdown and QQ's rendition have in common:
+ * the text with the layout markers and all whitespace gone. Only ever used to
+ * compare the two, never as message text.
+ *
+ * QQ's rendition is a rendering, not a copy — the template link of a recorded
+ * production menu message is gone from its fallback (`bot-markdown.e2e.test.ts`)
+ * — so the inline markup needs no handling here; only the layout markers differ.
+ */
+function renditionKey(value: string): string {
+  return value.replace(QQ_RENDITION_MARKERS, '').replace(/\s+/g, '')
 }
 
+/**
+ * QQ bot markdown inline markup, one alternative per construct the platform
+ * documents (`bot.q.qq.com` → Markdown 消息): escapes, fenced and inline code,
+ * images, links, autolinks, bold italic, bold, italic, strikethrough and
+ * headings. Order matters: `***x***` before `**x**`, a fence before a backtick.
+ */
+const QQ_INLINE_TOKEN = /\\([\\`*_{}[\]()#+\-.!>~|])|```([^\n`]*)\n([\s\S]*?)```|`([^`\n]+)`|!\[([^\]\n]*)\]\(([^)\s]*)\)|\[([^\]\n]*)\]\(([^)\s]*)\)|<(https?:\/\/[^\s>]+)>|\*\*\*([^*\n]+)\*\*\*|\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|_([^_\n]+)_|~~([^~\n]+)~~|^#{1,6}[ \t]+([^\n]+)$/gm
+
+/** QQ markdown inline markup, rendered into text and the entities Telegram draws. */
+function parseQQInline(source: string): { text: string, entities: IMTextEntity[] } {
+  const chunks: string[] = []
+  const entities: IMTextEntity[] = []
+  const push = (value: string) => {
+    const offset = chunks.join('').length
+    chunks.push(value)
+    return offset
+  }
+  /**
+   * A label with its target. An empty label renders nothing unless `fallback`
+   * says what to show instead: QQ's own template links carry their metadata in
+   * the target and draw nothing at all, while an image without alt text still
+   * points somewhere worth reaching.
+   */
+  const pushLink = (label: string, target: string, fallback?: string) => {
+    const text = label || fallback || ''
+    if (!text) return
+    const offset = push(text)
+    if (/^https?:\/\//i.test(target)) {
+      entities.push({ type: 'text-link', offset, length: text.length, url: target })
+    }
+  }
+  let cursor = 0
+  for (const match of source.matchAll(QQ_INLINE_TOKEN)) {
+    const index = match.index
+    push(source.slice(cursor, index))
+    if (match[1] !== undefined) {
+      push(match[1])
+    } else if (match[3] !== undefined) {
+      const offset = push(match[3])
+      entities.push({ type: 'pre', offset, length: match[3].length, language: match[2] || undefined })
+    } else if (match[4] !== undefined) {
+      const offset = push(match[4])
+      entities.push({ type: 'code', offset, length: match[4].length })
+    } else if (match[5] !== undefined) {
+      // An image cannot ride a Telegram message body, so its target becomes a
+      // link on the alt text, with QQ's `#618px #249px` size hints stripped.
+      const target = match[6]!
+      pushLink(
+        match[5].replace(/(?:\s*#\d+px)+\s*$/u, ''),
+        target,
+        /^https?:\/\//i.test(target) ? target : undefined,
+      )
+    } else if (match[7] !== undefined) {
+      // QQ bot frameworks prepend an empty-label link carrying template
+      // metadata such as `[](%7B%22version%22%3A2%7D)`; QQ renders nothing.
+      pushLink(match[7], match[8]!)
+    } else if (match[9] !== undefined) {
+      // `<https://…>` is QQ's autolink: the target is also what it reads as.
+      pushLink(match[9], match[9])
+    } else if (match[10] !== undefined) {
+      // `***x***` is bold italic: Telegram represents it as both entities.
+      const offset = push(match[10])
+      entities.push({ type: 'bold', offset, length: match[10].length })
+      entities.push({ type: 'italic', offset, length: match[10].length })
+    } else if (match[11] !== undefined || match[12] !== undefined) {
+      const value = match[11] ?? match[12]
+      const offset = push(value)
+      entities.push({ type: 'bold', offset, length: value.length })
+      // QQ documents `__x__` as underlined bold and draws it that way.
+      if (match[12] !== undefined) entities.push({ type: 'underline', offset, length: value.length })
+    } else if (match[13] !== undefined || match[14] !== undefined) {
+      const value = match[13] ?? match[14]
+      const offset = push(value)
+      entities.push({ type: 'italic', offset, length: value.length })
+    } else if (match[15] !== undefined) {
+      const offset = push(match[15])
+      entities.push({ type: 'strikethrough', offset, length: match[15].length })
+    } else if (match[16] !== undefined) {
+      // Telegram messages have no heading entity; QQ's headings read as bold.
+      const value = match[16].trim()
+      const offset = push(value)
+      if (value) entities.push({ type: 'bold', offset, length: value.length })
+    }
+    cursor = index + match[0].length
+  }
+  push(source.slice(cursor))
+  return { text: chunks.join(''), entities }
+}
+
+/** One line of a body, with QQ's quote marker taken off when it has one. */
+function qqBodyLine(line: string): { quoted: boolean, text: string } {
+  const marker = QQ_BLOCKQUOTE_LINE.exec(line)
+  return { quoted: Boolean(marker), text: marker ? line.slice(marker[0].length) : line }
+}
+
+/** One row of a QQ markdown table, or nothing when the line is not one. */
+function qqTableRow(line: string): string[] | undefined {
+  const trimmed = line.trim()
+  if (!trimmed.includes('|')) return undefined
+  const cells = trimmed.replace(/^\|/u, '').replace(/\|$/u, '').split('|').map((cell) => cell.trim())
+  return cells.length > 1 ? cells : undefined
+}
+
+/**
+ * A table: a header row, a `--- | ---` delimiter row, then body rows — all of
+ * them quoted or all of them bare, since a `>` line and a plain one are not the
+ * same block.
+ */
+function matchQQTable(
+  lines: readonly string[],
+  start: number,
+  quoted: boolean,
+): { rows: string[][], end: number } | undefined {
+  const row = (index: number) => {
+    const line = qqBodyLine(lines[index] ?? '')
+    return line.quoted === quoted ? qqTableRow(line.text) : undefined
+  }
+  const header = row(start)
+  const delimiter = row(start + 1)
+  if (!header || !delimiter || header.length !== delimiter.length) return undefined
+  if (!delimiter.every((cell) => /^:?-+:?$/.test(cell))) return undefined
+  const rows = [header]
+  let end = start + 2
+  while (end < lines.length) {
+    const next = row(end)
+    if (!next) break
+    rows.push(next)
+    end += 1
+  }
+  return { rows, end }
+}
+
+/** How many columns a person counts in a monospace line: wide glyphs take two. */
+function qqDisplayWidth(value: string): number {
+  let width = 0
+  for (const char of value) {
+    const code = char.codePointAt(0)!
+    width += code >= 0x1100 && (
+      code <= 0x115f
+      || (code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f)
+      || (code >= 0xac00 && code <= 0xd7a3)
+      || (code >= 0xf900 && code <= 0xfaff)
+      || (code >= 0xfe30 && code <= 0xfe6f)
+      || (code >= 0xff00 && code <= 0xff60)
+      || (code >= 0xffe0 && code <= 0xffe6)
+      || (code >= 0x1f300 && code <= 0x1faff)
+    ) ? 2 : 1
+  }
+  return width
+}
+
+/**
+ * A table as the monospace block Telegram can show.
+ *
+ * Telegram message entities have no table, and a table left as text keeps its
+ * pipes and its `--- | ---` delimiter row, which reads as markdown source. The
+ * rows therefore lose the delimiter, keep ` | ` between cells and are padded to
+ * equal column widths for a monospace client, inside one `pre` entity. Inline
+ * markup in a cell is rendered away rather than kept: inside code the reader
+ * must not see `**` either.
+ */
+function renderQQTable(rows: readonly string[][]): string {
+  const columns = Math.max(...rows.map((row) => row.length))
+  const cells = rows.map((row) => Array.from(
+    { length: columns },
+    (_cell, column) => parseQQInline(row[column] ?? '').text,
+  ))
+  const widths = cells[0]!.map((_cell, column) => Math.max(...cells.map((row) => qqDisplayWidth(row[column]!))))
+  return cells.map((row) => row
+    // The last cell needs no padding: nothing follows it on the line.
+    .map((cell, column) => column + 1 === columns
+      ? cell
+      : cell + ' '.repeat(Math.max(0, widths[column]! - qqDisplayWidth(cell))))
+    .join(' | ')).join('\n')
+}
+
+/** One run of a QQ markdown body: quoted lines, other lines, or a table. */
+type QQMarkdownBlock =
+  | { kind: 'text', quoted: boolean, text: string }
+  | { kind: 'table', quoted: boolean, rows: string[][] }
+
+/**
+ * QQ bot frameworks write QQ's reply box as a markdown blockquote, one line
+ * `> 名字：被引用的那句话`, because a native `message_reference` on a markdown
+ * message makes QQ attach the body twice. QQ's markdown renderer draws those
+ * lines as one quoted block, and Telegram carries the same thing as a
+ * `blockquote` entity — a client handed the markers instead draws the markdown
+ * source (`> 名字：…`), which is what the group reported.
+ *
+ * The body is therefore split into runs: quoted lines (markers dropped, inner
+ * newlines kept) and everything else, tables kept apart because Telegram can
+ * only show them as monospace. Unordered list items lose their marker for the
+ * same reason — Telegram has no list entity, QQ draws a bullet. A `>` or a
+ * marker inside a fence is code and stays as it is.
+ */
+function splitQQMarkdown(content: string): QQMarkdownBlock[] {
+  const blocks: QQMarkdownBlock[] = []
+  const lines = content.split('\n')
+  const push = (quoted: boolean, text: string) => {
+    const previous = blocks.at(-1)
+    // The newline belongs to the line before it, so a run keeps its inner ones.
+    if (previous?.kind === 'text' && previous.quoted === quoted) previous.text += `\n${text}`
+    else blocks.push({ kind: 'text', quoted, text })
+  }
+  const pushLine = (quoted: boolean, line: string) => {
+    const bullet = QQ_BULLET_LINE.exec(line)
+    push(quoted, bullet ? `${bullet[1]}${QQ_BULLET} ${line.slice(bullet[0].length)}` : line)
+  }
+  let fence = false
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!
+    // A fence line only toggles code state; its own text stays as it is.
+    if (QQ_FENCE_LINE.test(line)) fence = !fence
+    const body = fence ? { quoted: false, text: line } : qqBodyLine(line)
+    if (!fence) {
+      const table = matchQQTable(lines, index, body.quoted)
+      if (table) {
+        blocks.push({ kind: 'table', quoted: body.quoted, rows: table.rows })
+        index = table.end - 1
+        continue
+      }
+    }
+    pushLine(body.quoted, body.text)
+  }
+  return blocks
+}
+
+/**
+ * QQ bot markdown, rendered into the text and entities Telegram draws.
+ *
+ * Everything a markdown part carries is converted here in one pass: the whole
+ * body is markdown, so every construct in it — quote, lists, table, headings,
+ * inline markup — is rendered, rather than the parts the relay happens to know.
+ */
 export function parseQQMarkdown(content: string): Extract<
   IMMessage<QQMediaLocator>['content']['parts'][number],
   { type: 'text' }
 > {
   const text: string[] = []
-  const entities: import('@mtproto-relay/bridge').IMTextEntity[] = []
+  const entities: IMTextEntity[] = []
   const append = (value: string) => {
     const offset = text.join('').length
     text.push(value)
     return offset
   }
-  const token = /\\([\\`*_{}[\]()#+\-.!>~|])|```([^\n`]*)\n([\s\S]*?)```|`([^`\n]+)`|\[([^\]\n]*)\]\(([^)\s]*)\)|\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|_([^_\n]+)_|~~([^~\n]+)~~|^#{1,6}[ \t]+([^\n]+)$/gm
-  let cursor = 0
-  for (const match of content.matchAll(token)) {
-    const index = match.index
-    append(content.slice(cursor, index))
-    if (match[1] !== undefined) {
-      append(match[1])
-    } else if (match[3] !== undefined) {
-      const offset = append(match[3])
-      entities.push({ type: 'pre', offset, length: match[3].length, language: match[2] || undefined })
-    } else if (match[4] !== undefined) {
-      const offset = append(match[4])
-      entities.push({ type: 'code', offset, length: match[4].length })
-    } else if (match[5] !== undefined) {
-      // QQ bot frameworks prepend an empty-label link carrying template
-      // metadata such as `[](%7B%22version%22%3A2%7D)`; QQ renders nothing.
-      const label = match[5]
-      if (label) {
-        const offset = append(label)
-        if (/^https?:\/\//i.test(match[6])) {
-          entities.push({ type: 'text-link', offset, length: label.length, url: match[6] })
-        }
+  for (const [index, block] of splitQQMarkdown(content).entries()) {
+    if (index) append('\n')
+    if (block.kind === 'table') {
+      const rendered = renderQQTable(block.rows)
+      const start = append(rendered)
+      if (!rendered) continue
+      // A quoted table keeps its quote on top of the monospace block.
+      if (block.quoted) {
+        entities.push({ type: 'blockquote', offset: start, length: rendered.length })
       }
-    } else if (match[7] !== undefined || match[8] !== undefined) {
-      const value = match[7] ?? match[8]
-      const offset = append(value)
-      entities.push({ type: 'bold', offset, length: value.length })
-    } else if (match[9] !== undefined || match[10] !== undefined) {
-      const value = match[9] ?? match[10]
-      const offset = append(value)
-      entities.push({ type: 'italic', offset, length: value.length })
-    } else if (match[11] !== undefined) {
-      const offset = append(match[11])
-      entities.push({ type: 'strikethrough', offset, length: match[11].length })
-    } else if (match[12] !== undefined) {
-      const value = match[12].trim()
-      const offset = append(value)
-      if (value) entities.push({ type: 'bold', offset, length: value.length })
+      entities.push({ type: 'pre', offset: start, length: rendered.length })
+      continue
     }
-    cursor = index + match[0].length
+    const inline = parseQQInline(block.text)
+    const start = append(inline.text)
+    // Consecutive quoted lines are one block, so one entity: a client draws
+    // each blockquote entity as its own quote.
+    if (block.quoted) {
+      entities.push({ type: 'blockquote', offset: start, length: inline.text.length })
+    }
+    for (const entity of inline.entities) entities.push({ ...entity, offset: entity.offset + start })
   }
-  append(content.slice(cursor))
   const joined = text.join('')
   const rendered = joined.trim()
   const lead = joined.length - joined.trimStart().length

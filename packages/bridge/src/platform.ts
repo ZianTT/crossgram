@@ -431,6 +431,15 @@ export interface IMMessageContent<TMediaLocator = unknown> {
   inlineKeyboard?: IMInlineKeyboard
   /** Platform service/system message rendered by Telegram as a MessageService. */
   serviceAction?: IMMessageServiceAction
+  /**
+   * Markdown the body was written in, when the platform knows it (QQ official
+   * bots send their whole body as markdown).
+   *
+   * Telegram draws tables, headings and real lists only in a rich message, so
+   * the relay renders this into page blocks and sends the message as one. The
+   * text parts stay the message text.
+   */
+  richMarkdown?: string
 }
 
 export interface IMInlineKeyboard {

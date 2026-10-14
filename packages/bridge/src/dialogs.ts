@@ -42,7 +42,7 @@ import {
 } from './dialog-folders.js'
 import type { MessageProjectionPipeline } from './message-projection.js'
 import type { SpeechPipeline } from './speech.js'
-import { convertRichMessage, type RichMediaReference, type ResolvedRichMedia } from './rich-message.js'
+import { convertRichMessage, markdownRichMessage, type RichMediaReference, type ResolvedRichMedia } from './rich-message.js'
 
 type GetDialogsRequest = tl.messages.RawGetDialogsRequest
 type GetPeerDialogsRequest = tl.messages.RawGetPeerDialogsRequest
@@ -4623,7 +4623,7 @@ export class DialogRpc {
             return reaction._ === 'reactionCustomEmoji' ? reaction.documentId.toNumber() : undefined
           } : undefined,
         },
-      )
+      ) ?? makeTlMarkdownArticle(projectedSource)
       return {
         message: projectTlMessage({
           platformSessionId: this._session.platformSessionId,
@@ -6674,6 +6674,25 @@ export interface TlArticleProjectionOptions {
   userId?: (platformUserId: string) => number
   customEmojiId?: (definition: IMReactionDefinition) => number | undefined
   conversationLink?: (conversation: IMConversation) => string | undefined
+}
+
+/**
+ * A platform message whose body is markdown as a Telegram rich message.
+ *
+ * Telegram draws a table only as a page block, so a body that contains one has
+ * no styled-text form. Sending the whole body as a rich message also lets one
+ * renderer draw quotes, lists, headings and inline markup together, which is
+ * what a platform whose body arrived as markdown already had.
+ *
+ * This is the only projection for such a body: clients are expected to know
+ * rich messages (layer 227 and later, TDLib 1.8.64 and later), and the relay
+ * does not probe versions. `markdownRichMessage` swallowing a conversion
+ * failure is the one fallback left — the message then goes out as its styled
+ * text rather than not at all.
+ */
+export function makeTlMarkdownArticle(source: IMProjectableMessage): tl.RawRichMessage | undefined {
+  const markdown = source.content.richMarkdown
+  return markdown ? markdownRichMessage(markdown) : undefined
 }
 
 export function makeTlArticleMedia(
