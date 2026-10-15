@@ -280,7 +280,7 @@ export interface DialogFolderPeerRow {
   platformSessionId: string
   platformConversationId: string
   folderId: number
-  /** Position among pinned dialogs (ascending); null when the dialog is not pinned. */
+  /** 置顶顺序（升序），未置顶时为 null */
   pinnedOrder: number | null
   updatedAt: Date
 }

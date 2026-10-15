@@ -107,14 +107,14 @@ export class DialogFolderStore {
       for (const [peerId, folderId] of unique) {
         if ((existing.get(peerId)?.folderId === 1 ? 1 : 0) === folderId) continue
         changed.add(peerId)
-        // Telegram pins are per folder: moving a dialog drops its pin.
+        // Telegram 的置顶按文件夹区分，移动会话即取消其置顶
         await writePeerRow(database, platformSessionId, peerId, folderId, null)
       }
     })
     return changed
   }
 
-  /** Pinned peers of every folder, in pinned order. */
+  /** 所有文件夹的置顶会话，按置顶顺序排列 */
   async pinnedPeerIds(platformSessionId: string): Promise<string[]> {
     const rows = (await this._database.get('mtproto_dialog_folder_peer', { platformSessionId }))
       .filter((row) => row.pinnedOrder != null)
@@ -123,7 +123,7 @@ export class DialogFolderStore {
       .map((row) => row.platformConversationId)
   }
 
-  /** Pins a peer above every other pinned dialog, or unpins it. Returns whether anything changed. */
+  /** 将会话置顶到所有置顶会话之上，或取消置顶；返回是否有变化 */
   async setPeerPinned(platformSessionId: string, peerId: string, pinned: boolean): Promise<boolean> {
     return this._database.withTransaction(async (database) => {
       const rows = await database.get('mtproto_dialog_folder_peer', { platformSessionId })
@@ -137,9 +137,8 @@ export class DialogFolderStore {
   }
 
   /**
-   * Replaces the order of one folder's pinned peers. `previous` is that
-   * folder's current pinned list; with `force`, peers missing from `order` are
-   * unpinned, otherwise they keep their relative order after it.
+   * 替换某个文件夹的置顶顺序。`previous` 为该文件夹当前的置顶列表；
+   * `force` 时未出现在 `order` 中的会话被取消置顶，否则保持相对顺序排在其后
    */
   async reorderPinnedPeers(
     platformSessionId: string,
@@ -169,7 +168,7 @@ export class DialogFolderStore {
   }
 }
 
-/** A row only exists while it carries state: an archived folder or a pin. */
+/** 仅在有状态（已归档或已置顶）时保留该行 */
 async function writePeerRow(
   database: Database,
   platformSessionId: string,

@@ -927,6 +927,86 @@ describe('dialog folders RPC e2e', () => {
     expect(cleared.dialogs.filter((dialog: tl.TypeDialog) => dialog._ === 'dialog')).toEqual([])
   })
 
+  it('keeps every dialog page full when pinned dialogs are pulled out of the stream', async () => {
+    const ctx = new Context()
+    const fibers = [ctx.plugin(Database), ctx.plugin(SQLiteDriver, { path: ':memory:' })]
+    await Promise.all(fibers)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    defineModels(ctx)
+    await ctx.database.prepared()
+    disposals.push(async () => {
+      for (const fiber of fibers.reverse()) await Promise.resolve((fiber as any).dispose?.())
+    })
+    const source: IMDialog[] = Array.from({ length: 25 }, (_, index) => {
+      const id = 'full-' + String(index).padStart(2, '0')
+      return {
+        conversation: { id, kind: 'group', title: id },
+        unreadCount: 0,
+        lastMessage: { id: 'preview-' + index, conversationId: id, senderId: 'self',
+          timestamp: 1_700_000_000 - index, content: { parts: [{ type: 'text', text: id }] } },
+      }
+    })
+    const target: IMPlatform = {
+      ...platform,
+      async getDialogs(_session, query) {
+        const start = query?.afterId ? source.findIndex(item => item.conversation.id === query.afterId) + 1 : 0
+        return { dialogs: source.slice(start, start + (query?.limit ?? 100)), total: source.length }
+      },
+      async getUser(_session, id) { return { id, firstName: 'Self' } },
+    }
+    const harness = rpcHarnessFor(
+      createDialog(new DialogFolderStore(ctx.database), target, new MessageStore(ctx.database)),
+    )
+    const peer = (id: string) => ({
+      _: 'inputPeerChannel' as const, channelId: peerChannelId(id), accessHash: Long.ONE,
+    })
+    const channelIds = (dialogs: tl.TypeDialog[]) =>
+      dialogs.map((dialog) => ((dialog as tl.RawDialog).peer as tl.RawPeerChannel).channelId)
+    await roundTripRpc(harness, getDialogs(undefined, { limit: 100 }))
+    // Every pin sits inside the first upstream page of 5.
+    for (const id of ['full-04', 'full-02', 'full-01', 'full-00']) {
+      await roundTripRpc(harness, {
+        _: 'messages.toggleDialogPin', pinned: true, peer: { _: 'inputDialogPeer', peer: peer(id) },
+      })
+    }
+
+    // Pages until the client sees a short page or a messages.dialogs result, the
+    // way Desktop (exclude_pinned) and Android stop loading.
+    const pageThrough = async (request: Partial<tl.messages.RawGetDialogsRequest>) => {
+      const seen: number[] = []
+      let offset: Partial<tl.messages.RawGetDialogsRequest> = {}
+      for (let pageIndex = 0; pageIndex < 20; pageIndex++) {
+        const page = await roundTripRpc(harness, getDialogs(request.folderId, { ...request, ...offset, limit: 5 }))
+        seen.push(...channelIds(page.dialogs))
+        if (page._ === 'messages.dialogs' || page.dialogs.length < 5) return { seen, count: page.count }
+        const last = page.dialogs.at(-1) as tl.RawDialog
+        const top = page.messages.find((message: tl.RawMessage) => message.id === last.topMessage)
+        offset = {
+          offsetId: last.topMessage, offsetDate: top.date,
+          offsetPeer: { _: 'inputPeerChannel', channelId: (last.peer as tl.RawPeerChannel).channelId, accessHash: Long.ONE },
+        }
+      }
+      throw new Error('dialog paging did not terminate')
+    }
+
+    const desktop = await pageThrough({ folderId: 0, excludePinned: true })
+    expect(desktop.seen).toHaveLength(21)
+    expect(new Set(desktop.seen).size).toBe(21)
+    const first = await roundTripRpc(harness, getDialogs(0, { excludePinned: true, limit: 5 }))
+    expect(first).toMatchObject({ _: 'messages.dialogsSlice', count: 21 })
+    expect(first.dialogs).toHaveLength(5)
+
+    const android = await pageThrough({})
+    expect(android.seen).toHaveLength(25)
+    expect(new Set(android.seen).size).toBe(25)
+    expect(android.seen.slice(0, 4)).toEqual(['full-00', 'full-01', 'full-02', 'full-04'].map(peerChannelId))
+    const androidFirst = await roundTripRpc(harness, getDialogs(undefined, { limit: 5 }))
+    expect(androidFirst).toMatchObject({ _: 'messages.dialogsSlice', count: 25 })
+    expect(androidFirst.dialogs).toHaveLength(5)
+    expect(androidFirst.dialogs.map((dialog: tl.RawDialog) => dialog.pinned))
+      .toEqual([true, true, true, true, false])
+  })
+
   it('serializes pin updates for the account\'s other devices', async () => {
     const ctx = new Context()
     const fibers = [ctx.plugin(Database), ctx.plugin(SQLiteDriver, { path: ':memory:' })]

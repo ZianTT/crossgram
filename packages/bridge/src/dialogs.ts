@@ -325,9 +325,14 @@ export class DialogRpc {
     const archivedPeerIds = await this._dialogFolders?.archivedPeerIds(
       this._session.platformSessionId,
     ) ?? new Set<string>()
+    // 置顶会话不混入分页流（首屏前置返回或由 getPinnedDialogs 单独拉取）；按置顶数多拉一些，
+    // 剔除后仍凑满一页，否则 Android 把短页当作到底、Desktop 遇到全是置顶的空页会停止翻页
+    const pinnedPeerIds = new Set(await this._dialogFolders?.pinnedPeerIds(
+      this._session.platformSessionId,
+    ) ?? [])
     const loadAt = performance.now()
     const query = {
-      limit: clampLimit(req.limit) + 1,
+      limit: clampLimit(req.limit) + pinnedPeerIds.size + 1,
       afterId: requestedOffsetPeer,
     }
     // Android 拉取全局对话列表时不传 `folder_id`，并期望归档会话带 `dialog.folder_id=1` 一并返回；
@@ -345,14 +350,12 @@ export class DialogRpc {
       ? initialMain
       : await this._loadDialogFolderPage(query, folderId as 0 | 1, archivedPeerIds))
     const loadMs = performance.now() - loadAt
-    // 保持上游顺序以免末尾 offsetPeer 错位；置顶会话不混入分页流（在首屏前置返回或由 getPinnedDialogs 单独拉取）
-    const pinnedPeerIds = new Set(await this._dialogFolders?.pinnedPeerIds(
-      this._session.platformSessionId,
-    ) ?? [])
-    const firstPage = req.offsetPeer._ === 'inputPeerEmpty' && !req.offsetId && !req.offsetDate
-    const leadingPinned = pinnedPeerIds.size && firstPage && !req.excludePinned
+    // 保持上游顺序以免末尾 offsetPeer 错位
+    const folderPinned = pinnedPeerIds.size
       ? await this._pinnedDialogs(folderId, archivedPeerIds, loaded.dialogs)
       : []
+    const firstPage = req.offsetPeer._ === 'inputPeerEmpty' && !req.offsetId && !req.offsetDate
+    const leadingPinned = firstPage && !req.excludePinned ? folderPinned : []
     const all = [
       ...leadingPinned,
       ...loaded.dialogs.filter((dialog) => !pinnedPeerIds.has(dialog.conversation.id)),
@@ -432,9 +435,17 @@ export class DialogRpc {
       if (index >= 0) start = index + 1
     }
 
-    const limit = clampLimit(req.limit) + leadingPinned.length
+    // 前置的置顶会话计入 limit，页长仍能表示是否还有下一页；其后至少保留一条普通会话，
+    // 因为客户端以末条会话为 offset 翻页，若末条是置顶会话会跳过上游排在它前面的会话
+    const requestedLimit = clampLimit(req.limit)
+    const limit = leadingPinned.length
+      ? leadingPinned.length + Math.max(1, requestedLimit - leadingPinned.length)
+      : requestedLimit
     const page = materialized.slice(start, start + limit)
-    const total = loaded.total ?? (loaded.nextCursor ? all.length + 1 : all.length)
+    // 上游 total 含本文件夹的置顶会话，仅非 exclude_pinned 的首屏才返回它们
+    const total = loaded.total !== undefined
+      ? loaded.total - folderPinned.length + leadingPinned.length
+      : loaded.nextCursor ? all.length + 1 : all.length
     const sliced = start > 0 || page.length < total
     const result = {
       _: sliced ? 'messages.dialogsSlice' : 'messages.dialogs',
@@ -1212,10 +1223,7 @@ export class DialogRpc {
     })
   }
 
-  /**
-   * Pins or unpins one dialog. Returns the update for the account's other
-   * devices, or undefined when the dialog already had the requested state.
-   */
+  /** 置顶或取消置顶一个会话，返回推送给其他设备的 update；状态未变时返回 undefined */
   async toggleDialogPin(
     req: tl.messages.RawToggleDialogPinRequest,
   ): Promise<tl.RawUpdateDialogPinned | undefined> {
@@ -1228,7 +1236,7 @@ export class DialogRpc {
     req: tl.messages.RawToggleDialogPinRequest,
   ): Promise<tl.RawUpdateDialogPinned | undefined> {
     if (!this._dialogFolders) throw new RpcError(500, 'FOLDER_STORE_UNAVAILABLE')
-    // The archive folder is always pinned at the top of the main list.
+    // 归档文件夹始终置顶于主列表
     if (req.peer._ === 'inputDialogPeerFolder') return undefined
     if (req.peer._ !== 'inputDialogPeer') throw new RpcError(400, 'PEER_ID_INVALID')
     await this._hydratePeers()
@@ -1244,7 +1252,7 @@ export class DialogRpc {
     }
   }
 
-  /** Replaces one folder's pinned order and returns the update for the account's other devices. */
+  /** 替换指定文件夹的置顶顺序，返回推送给其他设备的 update */
   async reorderPinnedDialogs(
     req: tl.messages.RawReorderPinnedDialogsRequest,
   ): Promise<tl.RawUpdatePinnedDialogs> {
@@ -1258,12 +1266,11 @@ export class DialogRpc {
   ): Promise<tl.RawUpdatePinnedDialogs> {
     if (req.folderId !== 0 && req.folderId !== 1) throw new RpcError(400, 'FOLDER_ID_INVALID')
     const folderId = req.folderId as 0 | 1
-    // Clients send this during dialog synchronization. Without a store there
-    // are no pins to reorder, and an error makes Android retry forever.
+    // 客户端同步对话时会发送此请求；无存储时没有可排序的置顶，返回错误会让 Android 无限重试
     if (!this._dialogFolders) return { _: 'updatePinnedDialogs', folderId: folderId || undefined, order: [] }
     await this._hydratePeers()
     const order = req.order.flatMap((entry) => {
-      // The archive folder is implicitly pinned; it never occupies a stored slot.
+      // 归档文件夹隐式置顶，不占用存储的位置
       if (entry._ === 'inputDialogPeerFolder') return []
       if (entry._ !== 'inputDialogPeer') throw new RpcError(400, 'PEER_ID_INVALID')
       return [this._resolvePeer(entry.peer)]
