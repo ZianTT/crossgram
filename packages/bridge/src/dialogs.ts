@@ -4009,6 +4009,11 @@ export class DialogRpc {
           await this._data!.syncHistory(peerId, {
             limit: fetchLimit,
             before: anchor ? { id: anchor.source.id, timestamp: anchor.source.timestamp } : undefined,
+            // 客户端第一次打开会话（没有锚点）要的是最新一页。不带 `latest` 时 platform-qqnt 会把
+            // 「首条未读」当成隐式锚点，把未读区灌进库里；库里还没有更新的消息时客户端首屏就会停在
+            // 未读区（中间隔着几千条），而不是最新消息。未读区的预热由客户端跳到未读位置那次
+            // `isAroundUnread()` 请求负责。
+            ...(anchor ? {} : { latest: true }),
           })
         }
       }
