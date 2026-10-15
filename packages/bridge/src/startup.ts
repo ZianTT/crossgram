@@ -4,12 +4,7 @@ import { bareVector } from '@mtproto-relay/mtproto'
 
 type StartupHandler = (request?: unknown) => tl.TlObject
 
-/**
- * Telegram Desktop loads these optional resources as one post-login batch and
- * retries failures with exponential backoff. Bridge accounts do not expose
- * stickers, premium, stories, or cosmetic palettes, so return valid empty TL
- * objects instead of METHOD_NOT_IMPLEMENTED errors.
- */
+/** 客户端登录后批量拉取的可选资源；返回合法空 TL 对象，避免客户端对 `METHOD_NOT_IMPLEMENTED` 指数退避重试。 */
 export const startupRpcHandlers: Readonly<Record<string, StartupHandler>> = {
   'help.getPeerColors': () => ({
     _: 'help.peerColors', hash: 0, colors: [],
@@ -61,12 +56,7 @@ export const startupRpcHandlers: Readonly<Record<string, StartupHandler>> = {
   'stories.getStoriesArchive': () => ({
     _: 'stories.stories', count: 0, stories: [], chats: [], users: [],
   } as unknown as tl.TlObject),
-  // Telegram Web loads its language pack and optional monetization /
-  // community resources at startup. The `langpack.*` methods are deliberately
-  // NOT answered: an empty-but-successful pack is cached and overrides the
-  // strings bundled in the client, while a failure makes the client use those
-  // bundled strings. `auth.initPasskeyLogin` stays unregistered for the same
-  // reason — the error makes Web clients fall back to QR login.
+  // 不注册 `langpack.*`（返回空语言包会覆盖客户端内置文案）和 `auth.initPasskeyLogin`（报错才能让 Web 端回退到扫码登录）。
   'help.getCountriesList': () => ({
     _: 'help.countriesList', hash: 0, countries: COUNTRIES,
   } as unknown as tl.TlObject),
@@ -99,11 +89,7 @@ function futureDate(): number {
   return Math.floor(Date.now() / 1000) + 86400
 }
 
-/**
- * The only dialing code this relay issues: virtual `+888 …` numbers
- * (`allocateVirtualPhone` in platform-account.ts). The country picker shows
- * nothing else because no other number can ever sign in.
- */
+/** 仅下发本服务分配的 `+888` 虚拟号段（见 `platform-account.ts` 的 `allocateVirtualPhone`）。 */
 const COUNTRIES: readonly tl.TlObject[] = [{
   _: 'help.country',
   iso2: 'XD',

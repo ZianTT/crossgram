@@ -18,17 +18,11 @@ interface ResolvedSticker {
   sticker: IMSticker
 }
 
-// v8 replaced the old 31-bit projection IDs with wide deterministic IDs.
-// v9 invalidates documents whose dimensions were cached before QQ favorites
-// started exposing their intrinsic aspect ratio.
-// v10 invalidates documents and sets whose path thumbnail used quadratic
-// curves only Telegram Desktop's reduced parser rejects, leaving the cached
-// sticker without any loading frame.
+// 贴纸投影版本号（变更后使客户端缓存的贴纸包与 document 失效）：
+// v8 改为宽位确定性 ID；v9 补齐 QQ 收藏表情真实宽高比；v10 剔除 Telegram Desktop 精简 SVG 解析器不支持的二次贝塞尔曲线轮廓。
 const STICKER_PROJECTION_VERSION = 10
 const STICKER_PROVIDER_CACHE_TTL_MS = 5 * 60_000
-// Telegram Desktop ignores every document field when date is zero, leaving a
-// zero-byte generic file. Keep synthetic sticker documents on a stable,
-// non-zero epoch so they are parsed as stickers and remain cacheable.
+// Telegram Desktop 遇到 date=0 的 document 会忽略所有属性并当成 0 字节普通文件处理，需固定为非零时间戳。
 const STICKER_DOCUMENT_DATE = 1_700_000_000
 
 export class StickerRpc {
@@ -97,10 +91,8 @@ export class StickerRpc {
       || req.stickerset._ === 'inputStickerSetDice'
       || req.stickerset._ === 'inputStickerSetEmojiDefaultStatuses'
       || req.stickerset._ === 'inputStickerSetEmojiDefaultTopicIcons') {
-      // NotModified is only valid when the request hash matched a previously
-      // loaded full set. Android represents this constructor as a subclass of
-      // TL_messages_stickerSet, so returning it for an initial hash=0 request
-      // makes MediaDataController dereference its absent `set` field and crash.
+      // Android 客户端将 stickerSetNotModified 作为 TL_messages_stickerSet 的子类处理；
+      // 对首次请求（hash=0）返回 NotModified 会导致 MediaDataController 访问空 set 字段崩溃。
       throw new RpcError(400, 'STICKERSET_INVALID')
     }
     const ref = await this._resolveSet(req.stickerset)
@@ -185,9 +177,7 @@ export class StickerRpc {
 
   async getFavedStickers(req: tl.messages.RawGetFavedStickersRequest): Promise<tl.messages.TypeFavedStickers> {
     if (this._platform.platformKind === 'qq') {
-      // QQ favorites are one account-owned QQ sticker set. Do not mirror them
-      // into Telegram's separate, capped favorite feed: that creates two
-      // folders for one QQ collection and makes their contents diverge.
+      // QQ 收藏表情已作为独立贴纸包（qq-favorites）暴露，不再重复塞入 Telegram 自身的收藏栏。
       const hash = Long.fromNumber(catalogHash([]))
       if (hashMatches(req.hash, hash)) return { _: 'messages.favedStickersNotModified' }
       return { _: 'messages.favedStickers', hash, packs: [], stickers: [] }
@@ -218,9 +208,7 @@ export class StickerRpc {
       if (!this._providerBelongsToCurrentAccount(resolved.provider) || !resolved.provider.setSavedSticker) {
         throw new RpcError(400, 'STICKER_FAVORITES_UNSUPPORTED')
       }
-      // Adding/removing a favorite from a QQ-backed Telegram client is always
-      // the native QQ operation. The resulting QQ collection is exposed only
-      // through its account-owned qq-favorites sticker set.
+      // QQ 账号下收藏/取消收藏直接操作 QQ 原生收藏，结果通过 qq-favorites 贴纸包呈现。
       await resolved.provider.setSavedSticker(this._context(), resolved.sticker, !req.unfave)
       this._providerCache.clear()
       return { _: 'boolTrue' } as unknown as tl.TlObject
@@ -228,8 +216,6 @@ export class StickerRpc {
     if (this._providerBelongsToCurrentAccount(resolved.provider)) {
       await resolved.provider.setSavedSticker?.(this._context(), resolved.sticker, !req.unfave)
     }
-    // A provider may also expose its native saved collection as a synthetic
-    // sticker set, so both the saved list and pack catalog must refresh now.
     this._providerCache.clear()
     const query = {
       platformSessionId: this._session.platformSessionId,
@@ -463,10 +449,7 @@ export class StickerRpc {
         if (row.uninstalled || listed.has(key)) continue
         const provider = this._registry.get(row.providerId)
         if (!provider) continue
-        // A provider's lightweight catalog can be temporarily incomplete
-        // after restart even though its detail endpoint can still reopen an
-        // installed pack. Persisted Telegram installs are therefore another
-        // catalog source, but a deleted/stale pack must not break every set.
+        // provider 的列表接口在重启初期可能尚未完整返回，按本地已安装记录用 getPack 补齐。
         const pack = await this._getPack(row.providerId, provider, row.providerPackId)
           .catch(() => null)
         if (!pack) continue
@@ -660,16 +643,12 @@ export class StickerRpc {
         size: Math.min(coverMetadata.size ?? 0, 0x7fffffff),
       }] : undefined,
       thumbDcId: cover ? this._dcId : undefined,
-      // Telegram Desktop keys sticker-set thumbnail files by dc_id and
-      // thumb_version, not by set ID. A shared constant therefore aliases
-      // every pack to whichever cover was downloaded first.
+      // Telegram Desktop 按 dc_id + thumb_version 缓存贴纸包缩略图，不同贴纸包不能共用固定常量。
       thumbVersion: cover ? packThumbVersion(pack, cover) : undefined,
       thumbDocumentId: cover
         ? Long.fromNumber(this._documentId(pack.providerId, cover.stickerId))
         : undefined,
-      // The hash describes the projected set, not only the upstream version:
-      // clients compare it with their cached copy, so a projection change has
-      // to make them refetch the set and its documents.
+      // hash 需包含 STICKER_PROJECTION_VERSION，以便投影结构升级时触发客户端重新拉取。
       hash: stickers.length
         ? catalogHash(stickers.map((sticker) =>
             `v${STICKER_PROJECTION_VERSION}:${sticker.stickerId}:${sticker.version ?? 0}`))
@@ -710,15 +689,9 @@ export class StickerRpc {
       _: 'document', id: Long.fromNumber(id), accessHash: Long.fromNumber(id),
       fileReference: new TextEncoder().encode(`bridge-sticker:${item.providerId}:${sticker.stickerId}:${sticker.version ?? 0}`),
       date: STICKER_DOCUMENT_DATE, mimeType: sticker.mimeType, size: sticker.size ?? 0,
-      // photoPathSize is Telegram's inline sticker silhouette. Desktop paints
-      // a moving gradient through it before either thumbnail or asset arrives.
       thumbs: [{
         _: 'photoPathSize', type: 'j',
-        // Empty or undecodable outlines are produced by legacy providers and
-        // persisted messages. Clients drop the entire path when it carries a
-        // command their reduced SVG parser does not implement, so only paths
-        // that survive a client decode are forwarded; everything else gets a
-        // drawable placeholder frame instead of staying blank while loading.
+        // 客户端精简 SVG 解析器遇到未知指令会直接丢弃整个轮廓；仅透传可正常解码的轮廓，否则回退为圆角矩形占位框。
         bytes: sticker.outline?.byteLength && decodeTelegramStickerPath(sticker.outline)
           ? sticker.outline
           : telegramStickerPlaceholder(sticker.width ?? 512, sticker.height ?? 512),

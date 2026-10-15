@@ -30,13 +30,10 @@ const CALLBACK_PREFIX = 'cgadmin:'
 const PAGE_SIZE_MAX = 12
 
 export interface Config {
-  /** Empty means every active platform identity can manage its own data. */
+  /** 允许使用管理机器人的平台会话 ID；留空表示允许每个活跃身份管理自身数据。 */
   allowedPlatformSessionIds?: string[]
-  /** Allow approved operators to inspect and operate on every platform identity. */
   crossAccountAccess?: boolean
-  /** Include the rotating login code in account and identity output. */
   showLoginCodes?: boolean
-  /** Optional externally reachable WebUI URL shown as a menu button. */
   webuiUrl?: string
   pageSize?: number
 }
@@ -76,7 +73,6 @@ interface CallbackMetadata extends JsonObject {
   platformSessionId?: string
 }
 
-/** A local Telegram-style system peer that exposes safe bridge management operations. */
 export class PlatformAdminBotProvider implements SystemPeerProvider {
   private readonly _allowed: Set<string>
   private readonly _crossAccountAccess: boolean

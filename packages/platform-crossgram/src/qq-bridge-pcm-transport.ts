@@ -18,20 +18,16 @@ const TOKEN_BYTES = 32
 const AUTH_BYTES = 1 + LEASE_ID_BYTES + TOKEN_BYTES
 const PCM_FRAME_BYTES = QQ_VOICE_PCM_FORMAT.bytesPerFrame
 const MAX_RETAINED_FRAMES = 4
-// A Unix stream may coalesce the gateway's real-time writes into a pipe-sized
-// burst. Frames are parsed and dropped immediately when no reader is waiting,
-// so this bounds one transient read rather than retained audio.
+// Unix 流可能将网关的实时写入合并为单次突发读取，此处限制单次读取上限。
 const MAX_WIRE_BURST_FRAMES = 64
 const MAX_WIRE_BURST_BYTES = (5 + PCM_FRAME_BYTES) * MAX_WIRE_BURST_FRAMES
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000
 
 export interface QQBridgePcmTransportOptions {
   connectTimeoutMs?: number
-  /** Provides a socket for connection setup; primarily useful for deterministic transport tests. */
   socketFactory?: (socketPath: string) => Socket
 }
 
-/** A local QQ Bridge PCM socket failed without exposing gateway capabilities. */
 export class QQBridgePcmTransportError extends Error {
   constructor() {
     super('QQ Bridge PCM transport failed')
@@ -39,10 +35,7 @@ export class QQBridgePcmTransportError extends Error {
   }
 }
 
-/**
- * QQ Bridge media gateway adapter. The gateway protocol is five-byte framed:
- * one type byte, a big-endian u32 payload size, then the payload.
- */
+/** QQ Bridge 媒体网关传输适配器；协议帧头为 5 字节（1 字节类型 + 大端 u32 负载长度）。 */
 export class QQBridgePcmTransport implements QQVoiceMediaTransport {
   private readonly connectTimeoutMs: number
   private readonly socketFactory: (socketPath: string) => Socket

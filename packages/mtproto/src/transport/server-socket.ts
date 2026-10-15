@@ -1,13 +1,8 @@
 import type { Duplex } from 'node:stream'
 
 /**
- * The socket surface `ServerConnection` and the Mtproto service need from a
- * transport. `net.Socket` satisfies it structurally; the WebSocket bridge
- * implements it on top of a `Duplex` so browser clients (which cannot open TCP
- * sockets) speak the same MTProto byte stream over `ws://`/`wss://`.
- *
- * The TCP tuning methods are optional: the WebSocket bridge leaves them as
- * no-ops because WS framing has no Nagle/keepalive/idle-timeout equivalent.
+ * MTProto 服务端传输层所需的底层流接口。
+ * `net.Socket` 原生满足该结构；WebSocket 桥接层基于 `Duplex` 实现它，使浏览器客户端能通过 WS 承载同样的 MTProto 字节流。
  */
 export interface ServerTransportSocket extends Duplex {
   remoteAddress?: string

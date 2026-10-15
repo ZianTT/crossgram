@@ -7,7 +7,6 @@ export interface Endpoint {
   port: number
 }
 
-/** Parse an endpoint in `host:port` or `[IPv6]:port` form. */
 export function parseEndpoint(endpoint: string): Endpoint {
   const match = /^(?:\[([^\]]+)\]|([^:\[\]\s]+)):(\d+)$/u.exec(endpoint)
   if (!match) throw new Error('expected host:port or [IPv6]:port')
@@ -19,22 +18,10 @@ export function parseEndpoint(endpoint: string): Endpoint {
   return { host, port }
 }
 
-/**
- * `me_url_prefix`: the domain clients build "copy link", share, and public
- * link URLs from.
- *
- * This value only decides how a client *writes* a link: whether the client
- * keeps the resulting URL inside itself is decided by the internal-link grammar
- * each client hard-codes (`t.me`, `telegram.me` and `telegram.dog` in
- * Telegram Desktop's `Core::TryConvertUrlToLocal` and Telegram Android's
- * `Browser.isInternalUri`; Telegram Desktop also requires the trailing slash).
- * For any other domain — `https://my.telegram.org/`, as this bridge used to
- * advertise — every "copy link" URL opens in a browser instead of resolving to
- * the linked message through this relay.
- */
+// 必须使用客户端硬编码识别的内部链接域名（t.me 等，Telegram Desktop 还要求末尾带斜杠），
+// 否则复制的链接会被当成外部网页打开，无法通过本服务解析跳转。
 export const meUrlPrefix = 'https://t.me/'
 
-/** Synthesized `config` advertising this bridge's configured DC endpoints. */
 export function makeConfig(
   dcId: number,
   host = '127.0.0.1',
@@ -66,10 +53,7 @@ export function makeAppConfig(): tl.TlObject {
   return { _: 'help.appConfig', hash: 0, config: { _: 'jsonObject', value: [] } } as unknown as tl.TlObject
 }
 
-/**
- * Build a `user`. Optional string fields MUST be `undefined` (omitted) — mtcute's
- * TL writer treats `null` as present and tries to serialize it as a string.
- */
+/** 可选字符串字段缺省时必须传 `undefined`，mtcute 会把 `null` 当作有效字段按字符串序列化。 */
 export function makeUser(opts: {
   id: number
   self?: boolean
@@ -89,11 +73,8 @@ export function makeUser(opts: {
     flags: 0,
     self: opts.self,
     bot: opts.bot,
-    // `bot` and `bot_info_version` share bit 14 of `user.flags`: the bit always
-    // carries an int on the wire, and clients only allocate their bot info (and
-    // therefore show bot UI and stop treating the peer as a plain user) when
-    // that value is non-negative. Report version 0 like Telegram does for a bot
-    // whose info the client has not cached yet.
+    // `bot` 与 `bot_info_version` 共用 `user.flags` 的 bit 14，线上始终带一个 int；
+    // 客户端仅在该值非负时初始化 bot 信息并展示 bot UI。
     botInfoVersion: opts.bot ? (opts.botInfoVersion ?? 0) : undefined,
     premium: opts.premium,
     contact: opts.contact,
@@ -104,9 +85,7 @@ export function makeUser(opts: {
     lastName: opts.lastName ?? undefined,
     username: opts.username ?? undefined,
     phone: opts.phone ?? undefined,
-    // Telegram always reports this slot: a missing `photo` flag leaves the
-    // client's userpic state unknown, and desktop clients then re-request the
-    // full user in a loop while any userpic button is on screen.
+    // 缺少 `photo` 会导致客户端将头像状态视为未知，桌面端只要界面上有头像按钮就会死循环拉取完整用户信息。
     photo: opts.photo ?? { _: 'userProfilePhotoEmpty' },
     status: { _: 'userStatusRecently' },
   } as unknown as tl.RawUser

@@ -1,9 +1,4 @@
-//! Feature-gated safe adaptation of the versioned native tgcalls session ABI.
-//!
-//! The concrete FFI owner implements [`TgcallsFfiSession`]. Its declarations
-//! are isolated so the worker is not activated or linked in production before
-//! the approved tgcalls archive is packaged. It limits foreign data and clears
-//! temporary copies on return.
+//! 原生 tgcalls 会话 C ABI 的安全封装。
 
 use std::cell::Cell;
 use std::ffi::{c_char, c_void};
@@ -70,7 +65,6 @@ pub struct TgcallsAudioProcessing {
     pub enable_agc: bool,
 }
 
-/// Typed values copied once into the native session during its creation.
 pub struct TgcallsSessionConfig {
     pub initialization_timeout_ms: u32,
     pub receive_timeout_ms: u32,
@@ -159,8 +153,7 @@ impl Drop for TgcallsSessionConfig {
     }
 }
 
-/// Safe owner of one opaque C ABI session. Implementations must synchronously
-/// copy every input and must not retain pointers passed to these methods.
+/// 单个 C ABI 会话的安全持有者；实现方必须同步拷贝所有输入，不得保留借用指针。
 pub trait TgcallsFfiSession {
     fn start(&mut self) -> Result<(), MediaError>;
     fn events(&self) -> Option<NativeTgcallsEvents> {
@@ -298,8 +291,7 @@ pub struct NativeSessionCallbacks {
     pub error: NativeErrorCallback,
 }
 
-/// One copied outbound native signaling payload. The bytes are wiped when the
-/// event is dropped, including when a future bridge rejects it.
+/// 单条拷贝出的原生出站信令负载，drop 时自动清零。
 pub struct NativeOutboundSignal {
     payload: Vec<u8>,
 }
@@ -362,8 +354,6 @@ impl NativeCallbackContext {
     }
 }
 
-/// Safe access to copied native callback events. `TgcallsMediaBackend` drains
-/// this seam into the worker's bounded poll/ack IPC event queue.
 #[derive(Clone)]
 pub struct NativeTgcallsEvents {
     context: Arc<NativeCallbackContext>,
@@ -391,8 +381,7 @@ impl NativeTgcallsEvents {
     }
 }
 
-/// Borrowed native creation data. Its pointers remain valid only for the
-/// synchronous [`NativeTgcallsApi::create`] call that received this value.
+/// 传给 [`NativeTgcallsApi::create`] 的建连参数；内部裸指针仅在该同步调用期间有效。
 pub struct NativeSessionCreateInput {
     config: NativeSessionConfig,
     auth_key: [u8; AUTH_KEY_BYTES],
@@ -494,7 +483,6 @@ impl NativeSessionCreateInput {
         }
     }
 
-    /// Safe adapters can copy the key without retaining the borrowed input.
     #[must_use]
     pub fn auth_key(&self) -> &[u8; AUTH_KEY_BYTES] {
         &self.auth_key
@@ -562,8 +550,7 @@ impl Drop for NativeSessionCreateInput {
     }
 }
 
-// The only unsafe boundary in this crate. The functions below map the versioned
-// declarations in `crossgram/tgcalls_shim.h`; all callers use safe wrappers.
+// 本 crate 唯一的 `unsafe` 边界，映射 `crossgram/tgcalls_shim.h` 的 C ABI 符号。
 #[allow(unsafe_code, clippy::wildcard_imports)]
 mod ffi {
     use super::*;
@@ -573,7 +560,7 @@ mod ffi {
         _private: [u8; 0],
     }
 
-    // Raw opaque C handles are transferable to their serialized !Sync owner.
+    // 裸 C 会话句柄可跨线程转移给串行化访问的 `!Sync` 持有者。
     unsafe impl Send for super::ShimSessionHandle {}
 
     unsafe extern "C" {
@@ -609,7 +596,7 @@ mod ffi {
     }
 
     pub(super) fn abi_version() -> u32 {
-        // SAFETY: this ABI function has no arguments and cannot alias Rust data.
+        // SAFETY: 无参数纯查询函数，不会别名访问任何 Rust 内存。
         unsafe { crossgram_tgcalls_shim_abi_version() }
     }
 
@@ -636,9 +623,7 @@ mod ffi {
         } else {
             rtc_servers.as_ptr()
         };
-        // SAFETY: every referenced input lives for this synchronous C call and
-        // the shim copies each typed input before it returns. The null pointer
-        // is the ABI's required representation of an empty direct-P2P route.
+        // SAFETY: 所有借用输入在本次同步 C 调用期间有效，shim 在返回前完成深拷贝；空列表按 ABI 约定传空指针。
         unsafe {
             crossgram_tgcalls_session_create(
                 abi_version,
@@ -655,13 +640,13 @@ mod ffi {
     }
 
     pub(super) fn start(session: *mut Session) -> NativeTgcallsStatus {
-        // SAFETY: `ShimSessionHandle` owns this non-null shim session pointer.
+        // SAFETY: `ShimSessionHandle` 独占持有该非空会话指针。
         unsafe { crossgram_tgcalls_session_start(session) }
     }
 
     pub(super) fn receive_signaling(session: *mut Session, signal: &[u8]) -> NativeTgcallsStatus {
         let length = u32::try_from(signal.len()).expect("worker signal bound fits u32");
-        // SAFETY: the shim copies the bounded signaling bytes before returning.
+        // SAFETY: shim 在返回前同步拷贝信令字节。
         unsafe { crossgram_tgcalls_session_receive_signaling(session, signal.as_ptr(), length) }
     }
 
@@ -669,7 +654,7 @@ mod ffi {
         session: *mut Session,
         samples: &[i16; PCM_SAMPLES],
     ) -> NativeTgcallsStatus {
-        // SAFETY: the shim synchronously copies this fixed-size PCM frame.
+        // SAFETY: shim 在返回前同步拷贝定长 PCM 帧。
         unsafe { crossgram_tgcalls_session_push_capture_20ms(session, samples.as_ptr()) }
     }
 
@@ -677,22 +662,22 @@ mod ffi {
         session: *mut Session,
         samples: &mut [i16; PCM_SAMPLES],
     ) -> NativeTgcallsStatus {
-        // SAFETY: `samples` provides writable fixed-size caller-owned storage.
+        // SAFETY: `samples` 为调用方独占的定长可写缓冲区。
         unsafe { crossgram_tgcalls_session_pop_playout_20ms(session, samples.as_mut_ptr()) }
     }
 
     pub(super) fn stop(session: *mut Session) -> NativeTgcallsStatus {
-        // SAFETY: `ShimSessionHandle` retains exclusive serialized ownership.
+        // SAFETY: `ShimSessionHandle` 独占且串行化访问该会话。
         unsafe { crossgram_tgcalls_session_stop(session) }
     }
 
     pub(super) fn join(session: *mut Session) -> NativeTgcallsStatus {
-        // SAFETY: `ShimSessionHandle` retains exclusive serialized ownership.
+        // SAFETY: `ShimSessionHandle` 独占且串行化访问该会话。
         unsafe { crossgram_tgcalls_session_join(session) }
     }
 
     pub(super) fn destroy(session: *mut *mut Session) -> NativeTgcallsStatus {
-        // SAFETY: this is an explicit C owning slot, not a Rust `Option` layout.
+        // SAFETY: 传入显式 C 指针槽，不依赖 Rust `Option` 内存布局。
         unsafe { crossgram_tgcalls_session_destroy(session) }
     }
 
@@ -709,13 +694,11 @@ mod ffi {
             if length > crate::ipc::MAX_SIGNAL_BYTES {
                 return;
             }
-            // SAFETY: C owns `data` for this synchronous callback. The session
-            // owns `context` through Join's callback-quiescence boundary.
+            // SAFETY: `data` 在本次同步回调内有效；`context` 在 `Join` 返回前始终存活。
             let context = unsafe { &*context.cast::<NativeCallbackContext>() };
             if !context.accepting.load(Ordering::Acquire) {
                 return;
             }
-            // This is the sole copy from foreign memory; queue ownership transfers it.
             let payload = unsafe { std::slice::from_raw_parts(data, length) }.to_vec();
             match context.sender.try_send(NativeOutboundSignal { payload }) {
                 Ok(()) => {}
@@ -734,7 +717,7 @@ mod ffi {
             {
                 return;
             }
-            // SAFETY: the native session cannot call this context after Join returns.
+            // SAFETY: 原生会话保证在 `Join` 返回后不再调用该回调上下文。
             let context = unsafe { &*context.cast::<NativeCallbackContext>() };
             let _ = context.first_error.compare_exchange(
                 NO_CALLBACK_ERROR,
@@ -746,8 +729,6 @@ mod ffi {
     }
 }
 
-/// Concrete, feature-gated symbol adapter. Instantiating it is deliberately not
-/// wired into `main.rs`; artifact linkage and production selection are separate.
 pub struct ShimTgcallsApi;
 
 impl ShimTgcallsApi {
@@ -852,10 +833,7 @@ fn native_string_view(value: &[u8]) -> NativeStringView {
     }
 }
 
-/// Safe adapter for the native C symbols. `create` must synchronously copy all
-/// fields from `input` and may retain `callbacks` only until Join returns. Its
-/// opaque handle is owned by `NativeTgcallsSession`; `destroy` receives an
-/// explicit owning slot rather than relying on Rust's `Option` layout.
+/// 原生 C 符号的安全适配层；`create` 必须同步拷贝 `input`，`callbacks` 仅可保留到 `Join` 返回为止。
 pub trait NativeTgcallsApi: Send {
     type Handle: Send;
 
@@ -887,9 +865,7 @@ pub trait NativeTgcallsApi: Send {
     fn destroy(&mut self, handle: &mut Option<Self::Handle>) -> NativeTgcallsStatus;
 }
 
-/// An opaque native session owner. It is `Send` when its adapter and handle are
-/// `Send`, but intentionally not `Sync`; all methods require exclusive access,
-/// matching the native session's serialized control-owner requirement.
+/// 原生会话持有者；满足 `Send` 但非 `Sync`，通过独占可变引用保证控制操作串行化。
 pub struct NativeTgcallsSession<A: NativeTgcallsApi> {
     api: A,
     handle: Option<A::Handle>,
@@ -898,10 +874,7 @@ pub struct NativeTgcallsSession<A: NativeTgcallsApi> {
 }
 
 impl<A: NativeTgcallsApi> NativeTgcallsSession<A> {
-    /// Creates the native opaque session during construction and zeroizes the
-    /// supplied configuration regardless of validation or native-create status.
-    /// A failed create intentionally retains a bounded callback context: without
-    /// a successful Join, freeing C-visible userdata would risk a use-after-free.
+    /// 创建原生会话并清零入参配置；若创建失败但未经过 `Join`，则泄漏有界回调上下文以防 C 侧悬垂指针。
     pub fn create(mut api: A, config: &mut TgcallsSessionConfig) -> Result<Self, MediaError> {
         if config.validate().is_err() {
             config.zeroize();
@@ -940,8 +913,6 @@ impl<A: NativeTgcallsApi> NativeTgcallsSession<A> {
         })
     }
 
-    /// Returns a safe drain handle for native callback data. No worker-to-bridge
-    /// delivery is attached here.
     #[must_use]
     pub fn events(&self) -> Option<NativeTgcallsEvents> {
         self.callbacks.as_ref().map(|context| NativeTgcallsEvents {
@@ -949,15 +920,13 @@ impl<A: NativeTgcallsApi> NativeTgcallsSession<A> {
         })
     }
 
-    /// Stops, joins, and destroys the session. A failed destroy retains its
-    /// explicit handle slot for a later idempotent retry.
+    /// 依次执行 `stop`、`join` 与 `destroy`；若 `destroy` 失败则保留句柄槽以便幂等重试。
     pub fn shutdown(&mut self) -> Result<(), MediaError> {
         let stop_result = catch_unwind(AssertUnwindSafe(|| {
             self.with_handle(NativeTgcallsApi::stop)
         }))
         .unwrap_or(Err(MediaError));
-        // Join is the callback-quiescence boundary, so it must be attempted even
-        // when stop failed or panicked. Preserve the stop failure when both fail.
+        // `join` 是回调静默边界，即使 `stop` 失败或 panic 也必须继续调用。
         let join_result =
             catch_unwind(AssertUnwindSafe(|| self.join_terminal())).unwrap_or(Err(MediaError));
         stop_result.and(join_result)
@@ -1006,8 +975,7 @@ impl<A: NativeTgcallsApi> Drop for NativeTgcallsSession<A> {
                 .as_ref()
                 .is_some_and(|callbacks| callbacks.accepting.load(Ordering::Acquire))
         {
-            // Without Join's quiescence guarantee, native code may still hold
-            // this pointer, so preserving the bounded context is safer than UAF.
+            // `Join` 未成功返回时原生侧仍可能持有回调指针，宁可泄漏该上下文也不触发 UAF。
             self.leak_callbacks();
         }
     }
@@ -1029,9 +997,7 @@ impl<A: NativeTgcallsApi> TgcallsFfiSession for NativeTgcallsSession<A> {
     fn push_capture_20ms(&mut self, samples: &[i16; PCM_SAMPLES]) -> Result<(), MediaError> {
         let handle = self.handle.as_mut().ok_or(MediaError)?;
         match NativeStatusCode::try_from(self.api.push_capture_20ms(handle, samples))? {
-            // Capture is a real-time stream. A full four-frame native ring means
-            // this one frame is stale before it can be consumed; dropping it is
-            // bounded backpressure, not a terminal media failure.
+            // 采集为实时流：原生 4 帧环形缓冲满时直接丢弃当前帧，不视为会话故障。
             NativeStatusCode::Ok | NativeStatusCode::InputFull => Ok(()),
             NativeStatusCode::InvalidArgument
             | NativeStatusCode::Stopped
@@ -1069,8 +1035,6 @@ impl<A: NativeTgcallsApi> TgcallsFfiSession for NativeTgcallsSession<A> {
     }
 }
 
-/// Production fallback adapter. It creates no handle and therefore cannot make
-/// media active before an approved native symbol adapter is linked.
 pub struct UnavailableNativeTgcallsApi;
 
 impl NativeTgcallsApi for UnavailableNativeTgcallsApi {
@@ -1128,16 +1092,12 @@ impl NativeTgcallsApi for UnavailableNativeTgcallsApi {
     }
 }
 
-/// Creates the native session only after worker-side DH has supplied the
-/// exact private auth key and validated public relay configuration.
 pub trait TgcallsSessionFactory {
     type Session: TgcallsFfiSession;
 
     fn create(&mut self, config: &mut TgcallsSessionConfig) -> Result<Self::Session, MediaError>;
 }
 
-/// Rebuilds an API owner for every call, so teardown does not consume the
-/// factory and sequential calls cannot inherit a prior session's key or routes.
 pub struct NativeTgcallsSessionFactory<MakeApi> {
     make_api: MakeApi,
 }
@@ -1161,8 +1121,6 @@ where
     }
 }
 
-/// A `MediaBackend` which exposes PCM only after a session created from the
-/// post-DH worker configuration has started.
 pub struct TgcallsMediaBackend<F: TgcallsSessionFactory> {
     factory: F,
     session: Option<F::Session>,
@@ -1201,10 +1159,8 @@ impl<F: TgcallsSessionFactory> Drop for TgcallsMediaBackend<F> {
     }
 }
 
-/// Production session factory whose API owner is newly constructed for each call.
 pub type ShimTgcallsSessionFactory = NativeTgcallsSessionFactory<fn() -> ShimTgcallsApi>;
 
-/// Production `MediaBackend` linked only by the `native-tgcalls-shim` feature.
 pub type ShimTgcallsMediaBackend = TgcallsMediaBackend<ShimTgcallsSessionFactory>;
 
 #[must_use]
@@ -1996,7 +1952,6 @@ mod tests {
     fn native_session_owner_is_send_and_callbacks_contain_panics() {
         fn assert_send<T: Send>() {}
         assert_send::<NativeTgcallsSession<FakeNativeApi>>();
-        // The `Cell` marker on NativeTgcallsSession deliberately makes it !Sync.
         let state = Arc::new(Mutex::new(NativeCallState::default()));
         let mut native_config = config();
         let session = NativeTgcallsSession::create(

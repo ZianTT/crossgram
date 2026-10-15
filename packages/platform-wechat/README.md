@@ -1,6 +1,8 @@
-# @mtproto-relay/platform-wechat
+# `@mtproto-relay/platform-wechat`
 
-Native CrossGram adapter for the legacy Windows **ComWeChat** HTTP and TCP-callback API.
+对接 Windows 端 **ComWeChat** HTTP 与本地 TCP 回调接口的微信适配器。
+
+## 配置
 
 ```yaml
 - id: wechat
@@ -14,24 +16,7 @@ Native CrossGram adapter for the legacy Windows **ComWeChat** HTTP and TCP-callb
     maxCallbackConnections: 32
 ```
 
-## Security
+## 能力与安全边界
 
-ComWeChat is an old local-control API with **no authentication**. Do not expose its
-HTTP endpoint to the public internet. The callback listener is intentionally bound
-to `127.0.0.1`, limits payload size, and only acknowledges a callback after
-CrossGram has handled it. Loopback prevents remote callbacks, but it does not
-protect against a malicious process on the same host. Deploy CrossGram under a
-separate OS identity or namespace and use firewall rules to restrict local access.
-The protocol provides no callback token or MAC, so the adapter does not pretend to
-provide one.
-
-## Capability boundary
-
-The adapter supports login/account discovery, contacts as direct/group dialogs,
-group-member listing, and real-time callback messages. It has no history or
-read-state API. Sending, edits, deletes, forwarding, stickers, and media sending
-are not supported.
-
-ComWeChat callback attachment paths are deliberately not read. A callback could
-otherwise make CrossGram read arbitrary local files. Images, files, voice messages,
-videos, and animated stickers are therefore presented as text descriptions.
+- **只读接收**：仅支持账号信息、联系人与群会话同步、群成员列表和实时文本消息接收；媒体消息（图片、文件、语音、视频、动画表情）统一渲染为文本说明，不支持发送消息或拉取历史。
+- **安全隔离**：ComWeChat 自身无鉴权机制，切勿将其端口暴露到公网。本适配器的回调监听仅绑定 `127.0.0.1`，且拒绝读取回调中携带的本地磁盘文件路径，防止任意文件读取风险。

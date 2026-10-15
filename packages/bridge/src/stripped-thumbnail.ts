@@ -17,12 +17,8 @@ const TELEGRAM_JPEG_HEADER = hexBytes([
 const JPEG_END = new Uint8Array([0xff, 0xd9])
 
 /**
- * Removes the fixed Telegram JPEG envelope from a small baseline JPEG.
- *
- * The input must use the standard quality-20 quantization and Huffman tables,
- * 4:2:0 chroma subsampling, and dimensions no larger than 255 pixels. Sharp's
- * `jpeg({ quality: 20, chromaSubsampling: '4:2:0', progressive: false,
- * optimizeCoding: false })` produces this representation.
+ * 剥离小尺寸基线 JPEG 的固定头部，生成 Telegram `photoStrippedSize` 字节。
+ * 输入需使用标准 quality-20 量化/哈夫曼表、4:2:0 采样且宽高不超过 255 像素。
  */
 export function stripTelegramJpegThumbnail(jpeg: Uint8Array): Uint8Array {
   if (jpeg.length < 4 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8) {
@@ -62,14 +58,13 @@ export function stripTelegramJpegThumbnail(jpeg: Uint8Array): Uint8Array {
     throw new Error('Telegram stripped thumbnail source has no JPEG end marker')
   }
   const output = new Uint8Array(3 + jpeg.length - 2 - scanOffset)
-  // Telegram stores the one-byte JPEG frame dimensions in SOF order:
-  // height first, then width.
+  // 按 SOF 顺序存放单字节尺寸：先高后宽。
   output.set([1, height, width])
   output.set(jpeg.subarray(scanOffset, jpeg.length - 2), 3)
   return output
 }
 
-/** Reconstructs a displayable JPEG from Telegram's inline stripped bytes. */
+/** 将 Telegram `photoStrippedSize` 字节还原为完整 JPEG。 */
 export function expandTelegramStrippedThumbnail(stripped: Uint8Array): Uint8Array {
   if (stripped.length < 3 || stripped[0] !== 1) return stripped.slice()
   const output = new Uint8Array(TELEGRAM_JPEG_HEADER.length + stripped.length - 3 + JPEG_END.length)

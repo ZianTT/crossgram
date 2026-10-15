@@ -1,12 +1,8 @@
 export const AUTH_KEY_DATA_IDLE_TTL_MS = 5 * 60_000
 
 /**
- * Process-local bridge state shared by every connection using the same
- * permanent auth key. The bridge persists durable account bindings separately;
- * this store keeps hydrated state (ID maps, subscriptions, counters) consistent
- * across Telegram Desktop's parallel main/upload/download connections.
- * Reconstructible state expires after the last live connection/RPC goes idle;
- * durable authentication and account bindings are never evicted here.
+ * 同一永久 auth key 下各连接共享的进程内桥接状态（如 ID 映射、订阅、计数器），
+ * 使 Telegram Desktop 并行的主连接与上传/下载连接保持一致；空闲超时后自动回收。
  */
 export class AuthKeyDataStore {
   private readonly _data = new Map<string, unknown>()
@@ -33,7 +29,6 @@ export class AuthKeyDataStore {
     return this._data.delete(key)
   }
 
-  /** Keep live devices and short reconnects warm, not every device ever seen. */
   prune(activeAuthKeys: ReadonlySet<string>, now = Date.now()): string[] {
     const removed: string[] = []
     for (const [key, lastUsed] of this._lastUsed) {
@@ -54,7 +49,6 @@ export class AuthKeyDataStore {
   }
 }
 
-/** Stable, content-based key for an 8-byte MTProto auth key ID. */
 export function authKeyIdHex(authKeyId: Uint8Array): string {
   let result = ''
   for (const byte of authKeyId) result += byte.toString(16).padStart(2, '0')

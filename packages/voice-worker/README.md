@@ -1,99 +1,74 @@
-# Crossgram voice worker foundation
+# Crossgram Voice Worker
 
-This standalone Rust crate is intentionally not part of the JavaScript workspace. It provides local-worker foundations and an optional native-session backend seam:
+独立的 Rust 本地语音通话进程，负责 Telegram 1v1 语音通话的 DH 密钥交换、信令转发与 48 kHz 单声道 PCM 帧收发：
 
-- versioned, length-prefixed local IPC with strict frame and opaque-signal bounds; private DH exponents are generated only inside the worker and never have an IPC field;
-- a single-call state machine with deterministic teardown and committed recipient flow (`PrepareRecipient(ga_hash)` followed by `CompleteRecipient(ga, expected_fingerprint)`);
-- Telegram's fixed 2048-bit safe-prime DH group, fixed-width 256-byte big-endian public values, public-value margin checks, call key confirmation, shared-key derivation, and signed little-endian TL fingerprints;
-- Telegram call AES key/IV KDF material derivation (it does not encrypt media);
-- an in-memory fake media backend for protocol tests and worker integration;
-- a `tgcalls-backend` feature that defines fixed-width `repr(C)` session layouts plus a synchronous opaque-session factory; a safe native-symbol adapter must copy all construction inputs before returning, and the owner is `Send` but intentionally not `Sync`;
-- an unavailable native adapter as the production fallback, so enabling the feature alone cannot make media active or replace `UnavailableMediaBackend`.
+- 长度前缀的本地二进制 IPC，DH 私钥指数仅在 Worker 进程内部生成，不通过 IPC 暴露；
+- 单路通话状态机，支持主叫（`PrepareCaller` → `CompleteCaller`）与被叫（`PrepareRecipient` → `CompleteRecipient`）完整握手及 Telegram 2048-bit DH 参数校验；
+- 可选启用 `tgcalls-backend` 特性对接原生 `tgcalls` 会话（参见 `native/tgcalls-shim`）。
 
-The worker accepts framed binary requests on standard input and writes framed binary public responses on standard output. `--unix <path>` serves the same protocol on a Unix-domain socket, with exactly one request/response exchange per connection. The socket parent is forced to mode `0700`; startup refuses an existing socket path; the socket is forced to mode `0600` regardless of the process umask; Linux `SO_PEERCRED` requires the connecting process to have the worker's UID; and each connection has five-second read/write timeouts. It neither persists nor logs call endpoints, signaling, secret material, audio, or keys. Production continues to use `UnavailableMediaBackend`; the optional seam does not link or select tgcalls by itself.
+Worker 默认从标准输入/输出收发二进制帧；传入 `--unix <path>` 时监听本地 Unix Socket（父目录权限 `0700`，Socket 权限 `0600`，Linux 下通过 `SO_PEERCRED` 校验同 UID 进程，每次连接处理单次请求/响应，读写超时 5 秒）。
 
-## Nix one-command launcher
+## 启动
 
-Start the Unix-socket worker with no arguments:
+使用 Nix 一键启动：
 
 ```sh
 nix run .#voice-worker
 ```
 
-The launcher chooses the socket path in this order:
+未传参数时，按以下优先级选择 Socket 路径（需将 Bridge 的 `voiceWorkerSocketPath` 配为同一路径）：
 
-1. `$CROSSGRAM_VOICE_WORKER_SOCKET`, when nonempty;
-2. `$XDG_RUNTIME_DIR/crossgram/voice-worker.sock`, when `XDG_RUNTIME_DIR` is set;
-3. `${TMPDIR:-/tmp}/crossgram-voice-worker-$UID/worker.sock` otherwise.
+1. `$CROSSGRAM_VOICE_WORKER_SOCKET`
+2. `$XDG_RUNTIME_DIR/crossgram/voice-worker.sock`
+3. `${TMPDIR:-/tmp}/crossgram-voice-worker-$UID/worker.sock`
 
-For no-argument launches, the launcher tightens the selected socket parent to `0700`, creates a private `0700` staging directory inside it, and binds the worker only in that staging directory. It records the staged socket device and inode, then atomically publishes it to the stable path through Linux `renameat2(RENAME_NOREPLACE)`. Any path already present before startup is refused, and any path that appears before publication makes startup fail closed: the stable path is never overwritten or removed. After a normal exit or `INT`, `TERM`, or `HUP`, cleanup removes only a stable socket whose device and inode still match this launch's published socket; publication failures remove only private staging artifacts. Explicit arguments bypass staging, publication, supervision, and launcher cleanup, and are passed unchanged to the real worker, for example:
+也可显式指定路径：
 
 ```sh
-nix run .#voice-worker -- --unix /custom/path
+nix run .#voice-worker -- --unix /custom/path/worker.sock
 ```
 
-Set the Bridge `voiceWorkerSocketPath` to the same path selected by the launcher. The launcher does not modify or enable production runtime configuration.
+## IPC 帧格式
 
-## Wire format
+每条消息由 4 字节大端长度前缀 + 负载组成，负载首字节为 protocol version (`3`)，次字节为消息 Tag。除特别注明小端（LE）的字段外，整数字段均为大端（BE）。
 
-Every message is a `u32` big-endian payload length followed by a payload beginning with the one-byte protocol version (`3`) and one-byte message tag. Lengths are checked before allocation; integer fields are big-endian unless marked little-endian.
+### 请求帧
 
-### Requests
+| Tag | 负载字段 | 说明 |
+|---|---|---|
+| `0x01` | `call_id: u64` | 主叫准备（生成 `ga_hash`） |
+| `0x02` | `call_id: u64`, `ga_hash: [u8; 32]` | 被叫准备（生成 `gb`） |
+| `0x03` | `call_id: u64`, `gb: [u8; 256]` | 主叫完成握手 |
+| `0x04` | `call_id: u64`, `ga: [u8; 256]`, `expected_fingerprint: i64` (LE) | 被叫完成握手 |
+| `0x05` | `call_id: u64`, `request_id: u64`, `signal_length: u16`, `signal: [u8; len]` | 转发信令（上限 32 KiB） |
+| `0x06` | `call_id: u64` | 挂断通话 |
+| `0x07` | `call_id: u64`, `request_id: u64` | 绑定单次 PCM 端点令牌 |
+| `0x08` | `call_id: u64`, `capability: [u8; 32]`, `pcm: [u8; 1920]` | 发送一帧 20 ms PCM（48 kHz 单声道 s16le） |
+| `0x09` | `call_id: u64`, `capability: [u8; 32]` | 拉取一帧下行 PCM |
+| `0x0a` | `call_id: u64`, `capability: [u8; 32]` | 关闭 PCM 端点并结束通话 |
 
-| Tag | Request payload after version and tag |
-| --- | --- |
-| `0x01` | `call_id: u64` — prepare caller |
-| `0x02` | `call_id: u64`, `ga_hash: [u8; 32]` — prepare recipient |
-| `0x03` | `call_id: u64`, `gb: [u8; 256]` — complete caller |
-| `0x04` | `call_id: u64`, `ga: [u8; 256]`, `expected_fingerprint: i64` little-endian — complete recipient |
-| `0x05` | `call_id: u64`, caller-supplied `request_id: u64`, `signal_length: u16`, `signal: [u8; signal_length]` — forward signal; signal length is at most 32,768 bytes |
-| `0x06` | `call_id: u64` — hang up |
-| `0x07` | `call_id: u64`, caller-supplied `request_id: u64` — attach the single PCM endpoint after media is active |
-| `0x08` | `call_id: u64`, `capability: [u8; 32]`, one 1,920-byte PCM frame — send fixed-format PCM to the worker |
-| `0x09` | `call_id: u64`, `capability: [u8; 32]` — receive one fixed-format PCM frame, if available |
-| `0x0a` | `call_id: u64`, `capability: [u8; 32]` — permanently close the PCM endpoint and call |
+### 响应帧
 
-### Responses
+| Tag | 负载字段 | 说明 |
+|---|---|---|
+| `0x81` | `ga_hash: [u8; 32]` | 主叫准备完成 |
+| `0x82` | `gb: [u8; 256]` | 被叫准备完成 |
+| `0x83` | `ga: [u8; 256]`, `fingerprint: i64` (LE) | 主叫握手完成 |
+| `0x84` | `fingerprint: i64` (LE) | 被叫握手完成 |
+| `0x85` | `request_id: u64` | 信令已转发 |
+| `0x86` | 无 | 已挂断 |
+| `0x87` | `request_id: u64`, `capability: [u8; 32]` | 返回 PCM 端点令牌 |
+| `0x88` | 无 | 已接收上行 PCM 帧 |
+| `0x89` | `pcm: [u8; 1920]` | 返回下行 PCM 帧 |
+| `0x8a` | 无 | 当前无可用下行 PCM 帧 |
+| `0x8b` | 无 | PCM 端点与通话已关闭 |
+| `0xff` | `error_code: u8` | 错误（`1` 请求非法、`2` 忙、`3` 状态错误、`4` 密码学校验失败、`5` 媒体后端不可用） |
 
-| Tag | Response payload after version and tag |
-| --- | --- |
-| `0x81` | `ga_hash: [u8; 32]` — caller prepared |
-| `0x82` | `gb: [u8; 256]` — recipient prepared |
-| `0x83` | `ga: [u8; 256]`, `fingerprint: i64` little-endian — caller completed |
-| `0x84` | `fingerprint: i64` little-endian — recipient completed |
-| `0x85` | `request_id: u64` — signal forwarded; correlates the caller-supplied signal request ID |
-| `0x86` | no fields — hung up |
-| `0x87` | `request_id: u64`, `capability: [u8; 32]` — the one-use PCM endpoint attachment |
-| `0x88` | no fields — fixed-format PCM frame accepted |
-| `0x89` | one 1,920-byte PCM frame — fixed-format PCM received from the worker |
-| `0x8a` | no fields — no worker PCM frame is currently available |
-| `0x8b` | no fields — PCM endpoint and call closed |
-| `0xff` | `error_code: u8` — public error (`1` invalid request, `2` busy, `3` invalid state, `4` crypto, `5` media unavailable) |
-
-PCM is 20 ms of mono 48 kHz signed-16-bit little-endian audio. An attach replay with the exact call/request pair returns the same capability without opening another backend endpoint; a different attach request is rejected. The capability is held only by the local bridge endpoint, never logged, and is zeroized on local closure, hangup, timeout, worker failure, or client shutdown. PCM is accepted only after the backend has started the call and opened both PCM directions; the production placeholder never does either.
-
-An active call retains at most 16 signal request identities (SHA-256 digest plus public response) for replay. An exact retry returns the original public response without forwarding again; a reused request ID with a different signal, or a new signal after the cache is full, fails closed. The cache is dropped with the active call on timeout, hangup, or terminal media failure; signal bytes are never retained beyond handling, and cache entries retain only digests and public responses. See `src/ipc.rs` for the authoritative limits.
-
-## Third-party licenses
-
-Direct dependencies are exact-pinned in `Cargo.toml`:
-
-| Crate | Version | License |
-| --- | --- | --- |
-| `crypto-bigint` | 0.7.5 | Apache-2.0 OR MIT |
-| `nix` | 0.30.1 | MIT |
-| `sha1` | 0.10.6 | MIT OR Apache-2.0 |
-| `sha2` | 0.10.9 | MIT OR Apache-2.0 |
-| `zeroize` | 1.8.2 | Apache-2.0 OR MIT |
-
-`crypto-bigint` is exact-pinned and built with only its `zeroize` feature. The DH implementation uses its fixed-width pure-Rust `U2048` Montgomery arithmetic; this crate has no `num-bigint`, OpenSSL, or GMP dependency. Transitive dependency license information is recorded by Cargo in `Cargo.lock` and should be reviewed before distribution.
-
-## Verification
+## 测试与检查
 
 ```sh
 cargo fmt --check --manifest-path packages/voice-worker/Cargo.toml
 cargo test --locked --manifest-path packages/voice-worker/Cargo.toml
 cargo clippy --locked --manifest-path packages/voice-worker/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path packages/voice-worker/Cargo.toml --features tgcalls-backend
-cargo clippy --locked --manifest-path packages/voice-worker/Cargo.toml --all-targets --features tgcalls-backend -- -D warnings
 ```

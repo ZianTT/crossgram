@@ -14,28 +14,14 @@ export interface UpdateDelivery {
   seq: number
   date: number
   published: boolean
-  /**
-   * Wall-clock second when a publisher last claimed responsibility for this
-   * delivery's payload, or null when no publisher of the current process has
-   * taken it. Readers keep waiting for a claimed reservation but may release
-   * an unclaimed one, which can never be completed.
-   */
+  /** 发布者认领该预留记录的秒级时间戳；为 `null` 时表示无进程认领，读取端可直接释放。 */
   claimedAt: number | null
   payload: UpdateJson | null
 }
 
 export type NewUpdateDelivery = Omit<UpdateDelivery, 'messageId'>
 
-/**
- * One channel whose update pts advanced at or after a client's date cursor.
- *
- * `pts` is the newest pts of that channel, which is what `updateChannelTooLong`
- * carries. `firstDeliveryId` is the oldest retained delivery of the scope; it
- * only keeps the announcement order stable, so a difference never reorders
- * channels just because a backend aggregates differently. Both come from one
- * grouped query, so announcing N changed channels costs O(N) instead of loading
- * every retained delivery of every channel.
- */
+/** 游标 `date` 之后发生过更新的频道摘要（`pts` 为最新值，`firstDeliveryId` 用于稳定排序）。 */
 export interface ChannelScopeUpdate {
   scope: string
   pts: number
@@ -48,18 +34,14 @@ export interface UpdateStoreBackend {
   markPublished(eventKey: string): Promise<void>
   claim(eventKey: string, claimedAt: number): Promise<void>
   setPayload(eventKey: string, payload: UpdateJson): Promise<void>
-  /** Drop a reserved delivery whose payload never became durable. */
   remove(eventKey: string): Promise<void>
   getPending(platformSessionId: string): Promise<UpdateDelivery[]>
   getAfter(platformSessionId: string, scope: string, pts: number, limit: number): Promise<UpdateDelivery[]>
-  /** `limit` bounds the page: a stale cursor must never load the whole journal. */
   getSince(platformSessionId: string, date: number, limit: number): Promise<UpdateDelivery[]>
-  /** Channel scopes that changed since `date`, aggregated per scope. */
   getChangedChannelScopes(platformSessionId: string, date: number): Promise<ChannelScopeUpdate[]>
   prune(platformSessionId: string, scope: string): Promise<void>
 }
 
-/** Hot-path storage seam for deduplication and Telegram update gap recovery. */
 export abstract class UpdateStore extends Service implements UpdateStoreBackend {
   constructor(ctx: Context) {
     super(ctx, 'updateStore')

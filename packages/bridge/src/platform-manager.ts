@@ -65,7 +65,6 @@ export type CommittedPlatformEventListener = (
   event: CommittedPlatformEvent,
 ) => void
 
-/** Resolve the stable Cordis config-entry ID, with a fallback for direct `ctx.plugin()` usage. */
 export function resolvePlatformPluginId(ctx: Context, fallback?: string): string {
   const entryId = (ctx.fiber as typeof ctx.fiber & {
     entry?: { options?: { id?: unknown } }
@@ -75,7 +74,6 @@ export function resolvePlatformPluginId(ctx: Context, fallback?: string): string
   throw new Error('IM platform must be loaded from a named Cordis config entry')
 }
 
-/** Cordis-owned adapter registry exposed as `ctx.imPlatform`. */
 export class IMPlatformService extends Service {
   readonly registry: PlatformRegistry
   private readonly _activeSessions = new Map<string, ActivePlatformSession>()
@@ -153,7 +151,6 @@ export class IMPlatformService extends Service {
     this.ctx.emit('im-platform/event-committed', session, event)
   }
 
-  /** Register an adapter for the lifetime of the calling Cordis plugin fiber. */
   register(platform: IMPlatform, registrationId = resolvePlatformPluginId(this.ctx)): Unsubscribe {
     return this.ctx.effect(() => {
       const unregister = this.registry.register(registrationId, platform)
@@ -208,7 +205,6 @@ async function platformEventFiber(ctx: Context, config: PlatformEventFiberConfig
   config.result = await config.run(eventCtx)
 }
 
-/** Owns one durable event subscription per active platform session. */
 export class PlatformSubscriptionManager {
   private readonly _subscriptions = new Map<string, {
     platformId: string
@@ -322,9 +318,7 @@ export class PlatformSubscriptionManager {
     while (!visitedCursors.has(cursor)) {
       visitedCursors.add(cursor)
       const page = await platform.getRequests(session, { limit: 500, cursor })
-      // Cursor pages may overlap. Re-ingesting an unchanged request is a
-      // no-op, while a later duplicate can carry its terminal state and must
-      // edit the pending inbox projection rather than being discarded.
+      // 分页结果可能重叠；重复入库未变更的申请是空操作，而后续携带终态的重复项则会更新收件箱消息。
       for (const request of page.requests) {
         await this._enqueue(session, { type: 'request', request })
       }
@@ -333,10 +327,6 @@ export class PlatformSubscriptionManager {
     }
   }
 
-  /**
-   * Commits an event produced by a local RPC action through the same ordered
-   * persistence and update-delivery pipeline as adapter subscription events.
-   */
   ingestLocalEvent(
     session: PlatformSession,
     event: IMEvent,
@@ -501,10 +491,7 @@ export class PlatformSubscriptionManager {
       const stored = await this._store.ingestRequest(session, event.request)
       const conversation = requestInboxConversation()
       const message = requestInboxMessage(stored.request)
-      // Request persistence alone is not a delivery marker: a prior failure may
-      // have committed a legacy request row before its inbox projection. The
-      // message ingestion result determines whether this replay is a new
-      // message, an edit, or a complete no-op.
+      // 依据收件箱消息的入库结果判断本次是新消息、状态编辑还是无变更，兼容早期仅落库申请但未生成消息的记录。
       if (!stored.message.created && !stored.message.changed && event.delivery !== 'recovery') return
       if (stored.message.created) {
         return this._publishCommitted(eventCtx, session, {
@@ -524,7 +511,6 @@ export class PlatformSubscriptionManager {
       const result = await this._store.markRead(session, event.conversationId, event.upToMessageId)
       if (result) return this._publishCommitted(eventCtx, session, { event, result }, options)
     } else if (event.type === 'voice-call') {
-      // Calls are intentionally transient and bypass every database/journal path.
       return this._publishCommitted(eventCtx, session, { event }, options)
     }
   }
@@ -598,23 +584,20 @@ export type CommittedPlatformEvent =
   | { event: Extract<IMEvent, { type: 'voice-call' }> }
 
 export interface PlatformEventDeliveryOptions {
-  /** Do not push an update to the auth key receiving the same payload via RPC. */
   excludeAuthKeyId?: string
-  /** Do not push the update back through the connection receiving it via RPC. */
   excludeConnection?: ServerConnection
-  /** Treat the durable delivery as published even when no socket push was sent. */
+  /** 即使没有活跃连接收到推送，也将投递标记为已发布（如已通过当前 RPC 响应返回）。 */
   deliveredViaRpc?: boolean
-  /** Correlate observer pushes with optimistic messages created by the sending client. */
+  /** 关联发送端乐观插入消息的 randomId。 */
   messageRandomIds?: readonly Long[]
-  /** Preserve the sending client's reply thread root while reconciling its optimistic item. */
+  /** 合并发送端乐观消息时保留其话题/回复根消息 ID。 */
   messageReplyToTopId?: number
-  /** Internal recovery path for an unchanged projection whose update was not delivered. */
+  /** 对投影未变但尚未成功下发 update 的记录强制重新投递。 */
   forceDelivery?: boolean
 }
 
 export type PlatformEventPublishResult = tl.RawUpdates | void
 
-/** Synchronizes optional upstream history into the canonical database before reads. */
 export class PlatformDataService {
   private readonly _dialogPageLoads = new Map<string, Promise<IMDialogPage>>()
   private readonly _historyLoads = new Map<string, Promise<IMMessage[]>>()
@@ -674,8 +657,7 @@ export class PlatformDataService {
     if (!this._platform.capabilities.history || !this._platform.getDialogs) {
       return { dialogs: stored, total: stored.length }
     }
-    // Bridge-owned peers are a fully local prefix. Enumerate it in batches so
-    // the cursor remains independent from adapters and is never capped at 500.
+    // bridge 自有会话固定排在列表最前，游标独立于上游平台。
     const allBridgeOwned = await this._bridgeOwnedDialogs()
     const ownedAnchor = query.afterId === undefined
       ? -1
@@ -686,8 +668,7 @@ export class PlatformDataService {
       : []
     const bridgeOwnedRemaining = continuingBridgeOwned && ownedAnchor + 1 + bridgeOwned.length < allBridgeOwned.length
     const injectBridgeOwned = bridgeOwned.length > 0
-    // A local cursor must never be forwarded upstream. Fetch one upstream row
-    // only to retain its total while the local prefix still has another page.
+    // 本地会话游标不能传给上游；若本地前缀仍有剩余页，仅向上游拉 1 条以获取 total。
     const upstreamQuery = continuingBridgeOwned
       ? { ...query, afterId: undefined, limit: bridgeOwnedRemaining ? 1 : Math.max(1, (query.limit ?? 100) - bridgeOwned.length) }
       : injectBridgeOwned
@@ -704,22 +685,14 @@ export class PlatformDataService {
       )
       return { dialogs: stored, total: stored.length }
     }
-    // Some QQNT pages have been observed to contain the same conversation
-    // more than once (for example when pinned/unread projections overlap).
-    // PostgreSQL rejects an INSERT ... ON CONFLICT statement when the input
-    // batch contains duplicate conflict keys.  Collapse duplicate dialog
-    // rows before persistence while preserving the upstream order and the
-    // newest preview payload for each conversation.
+    // QQNT 单页可能返回重复会话（如置顶与未读重叠），入库前需去重，否则 PostgreSQL ON CONFLICT 批量写入会报错。
     const upstreamDialogs = uniqueDialogsByConversationId(upstreamPage.dialogs)
       .filter((dialog) => dialog.conversation.metadata?.bridgeOwned !== true)
     const persistedDialogs = await this._store.readDialogs(
       this._session.platformSessionId,
       upstreamDialogs.map((dialog) => dialog.conversation.id),
     )
-    // Dialog projections call _userId while materializing preview messages.
-    // Await the durable ingest so sender/referenced-user rows are visible
-    // before returning the authoritative page; never race persistence against
-    // projection or continue it in the background.
+    // 会话列表投影预览消息时依赖已落库的用户记录，必须等待入库完成后再返回。
     await this._persistDialogs(upstreamDialogs, persistedDialogs)
     this._scheduleDialogReconciliation(upstreamDialogs, persistedDialogs)
     const persisted = new Map(persistedDialogs.map((dialog) => [dialog.conversation.id, dialog]))
@@ -732,9 +705,6 @@ export class PlatformDataService {
         lastMessage: dialog.lastMessage ?? previous?.lastMessage,
       }
     })
-    // Fetching one upstream entry for a limit-one request preserves its total
-    // and continuation cursor, but the synthetic inbox still consumes that
-    // requested slot.
     const upstreamSlots = injectBridgeOwned ? Math.max(0, (query.limit ?? 100) - bridgeOwned.length) : undefined
     const pageDialogs = upstreamSlots === undefined ? dialogs : dialogs.slice(0, upstreamSlots)
     return {
@@ -835,7 +805,6 @@ export class PlatformDataService {
     return { messages: await this._coalescedHistoryLoad(conversationId, query, true) }
   }
 
-  /** Fetch and persist one upstream page before every read; HTTP ETag handles unchanged QQNT responses. */
   async syncHistory(conversationId: string, query: IMHistoryQuery = { limit: 100 }): Promise<void> {
     await this._coalescedHistoryLoad(conversationId, query, false)
   }
@@ -1004,14 +973,7 @@ function dialogNeedsPersistence(upstream: IMDialog, stored: IMDialog | undefined
     || !jsonContains(storedMessage.metadata ?? {}, upstreamMessage.metadata ?? {})
 }
 
-/**
- * Return one authoritative row per conversation while retaining the first
- * occurrence's position in the upstream page. Duplicate rows can be emitted
- * by QQNT during pinned/unread reconciliation; feeding them to a single
- * database upsert would make PostgreSQL raise "cannot affect row a second
- * time". When duplicates differ, prefer the row with the newest preview
- * message and merge conversation metadata so no durable fields are lost.
- */
+/** 按会话 ID 去重，保留首次出现的位置，并合并 metadata 与最新预览消息。 */
 function uniqueDialogsByConversationId(dialogs: readonly IMDialog[]): IMDialog[] {
   const indexById = new Map<string, number>()
   const unique: IMDialog[] = []
@@ -1109,7 +1071,7 @@ export function sessionFromRow(row: PlatformSessionRow, virtualPhone?: string): 
   }
 }
 
-/** Repair IDs written by the short-lived implementation that persisted the full loader tree path. */
+/** 修复旧版本将完整加载树路径写入 platformId 的遗留记录。 */
 export async function migrateQualifiedPlatformIds(database: Database, platformId: string): Promise<number> {
   const rows = await database.get('mtproto_platform_session', {})
   const legacyIds = [...new Set(rows

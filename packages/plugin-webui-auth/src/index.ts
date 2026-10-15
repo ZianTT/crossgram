@@ -4,17 +4,11 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import z from 'schemastery'
 
 export interface Config {
-  /** Password required before anything under `publicPaths` is served. */
   password: string
-  /** Path prefixes left open to anonymous visitors (default: the WebZ mount). */
+  /** 允许匿名访问的路径前缀（默认放行 `/webz`）。 */
   publicPaths?: string[]
-  /** How long a successful login stays valid (default: 7 days). */
   sessionTtlMs?: number
-  /**
-   * Secret the login cookie is signed with. Set any long random string to keep
-   * logins across restarts; without it the secret is per-process and every
-   * restart logs clients out.
-   */
+  /** 用于签名登录 Cookie 的密钥；未配置时每次重启随机生成（重启后登录失效）。 */
   sessionSecret?: string
 }
 
@@ -32,17 +26,13 @@ function apply(ctx: Context, config: Config): void {
   const password = config.password
   const publicPaths = config.publicPaths ?? ['/webz']
   const maxAgeSec = Math.floor((config.sessionTtlMs ?? 7 * 24 * 3600_000) / 1000)
-  // The cookie is a stateless HMAC of the password under a fixed secret, so it
-  // stays valid across restarts as long as both are unchanged — and rotating
-  // the password invalidates every outstanding cookie.
+  // Cookie 是基于密钥与当前密码的无状态 HMAC，修改密码后已签发的 Cookie 自动失效。
   const secret = config.sessionSecret
     ? Buffer.from(config.sessionSecret)
     : randomBytes(32)
   const token = createHmac('sha256', secret).update(`crossgram-webui-auth:${password}`).digest('base64url')
 
-  // A trailing `*` matches a bare prefix (`/bot*` covers `/bot<token>/...`);
-  // without it a match must end at a path boundary, so `/webz` never opens up
-  // `/webzanything` to the site behind the gate.
+  // 末尾带 `*` 时按裸前缀匹配（如 `/bot*`），否则必须匹配到路径边界（`/webz` 不会匹配 `/webzanything`）。
   const isPublic = (path: string) => publicPaths.some((entry) => (
     entry.endsWith('*')
       ? path.startsWith(entry.slice(0, -1))
@@ -78,7 +68,6 @@ function apply(ctx: Context, config: Config): void {
 
     if (isAuthed(req)) return next()
 
-    // Anonymous: show a form to browsers, refuse data requests outright.
     if (req.method === 'GET' && (req.headers.get('accept') ?? '').includes('text/html')) {
       return renderLogin(res, 200)
     }
@@ -104,7 +93,6 @@ async function readPassword(req: Request): Promise<string | undefined> {
   }
 }
 
-/** Constant-time comparison that never throws on length mismatch. */
 function matches(candidate: string, expected: string): boolean {
   const a = Buffer.from(candidate)
   const b = Buffer.from(expected)

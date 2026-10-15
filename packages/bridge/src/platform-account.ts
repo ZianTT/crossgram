@@ -12,7 +12,6 @@ export interface ProvisionedPlatformAccount {
   session: PlatformSession
 }
 
-/** Coalesce startup scans and registry events for the same platform entry. */
 export class PlatformAccountProvisioner {
   private readonly _pending = new Map<string, Promise<ProvisionedPlatformAccount | undefined>>()
 
@@ -30,7 +29,6 @@ export class PlatformAccountProvisioner {
   }
 }
 
-/** Replace every non-888 virtual phone, including inactive adapters. */
 export async function migrateLegacyVirtualPhones(database: Database): Promise<number> {
   const legacy = (await database.get('mtproto_auth_session', {}))
     .filter(auth => !is888VirtualPhone(auth.virtualPhone))
@@ -42,10 +40,7 @@ export async function migrateLegacyVirtualPhones(database: Database): Promise<nu
   return legacy.length
 }
 
-/**
- * Ask an adapter for its own account and keep exactly one canonical login
- * identity for that Cordis platform entry.
- */
+/** 从平台适配器同步当前账号，并确保该平台实例只有唯一活跃会话与登录凭证。 */
 export async function provisionPlatformAccount(
   database: Database,
   platformId: string,
@@ -94,8 +89,6 @@ export async function provisionPlatformAccount(
     await database.create('mtproto_platform_session', row)
   }
 
-  // Old development databases may contain more than one session for an entry.
-  // Keep their data but make the platform-provided identity the sole active one.
   for (const duplicate of existingSessions.slice(1)) {
     if (duplicate.active) await database.set('mtproto_platform_session', { id: duplicate.id }, { active: false })
   }

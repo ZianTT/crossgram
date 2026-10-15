@@ -57,11 +57,6 @@ class SessionAdapter {
   virtual void Join() = 0;
 };
 
-/**
- * Adapter construction is deliberately separated from the C ABI. The installed
- * build has no transport adapter until the approved tgcalls linkage is present.
- * Unit tests inject an in-memory adapter through this C++ seam.
- */
 class Session final {
  public:
   Session(SessionParameters parameters,

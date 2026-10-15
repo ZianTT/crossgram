@@ -7,7 +7,6 @@ import {
 } from './system-peer.js'
 
 export const REQUEST_INBOX_CONVERSATION_ID = 'bridge:request-inbox'
-// The inbox is a direct peer, so its synthetic sender must be that same peer.
 export const REQUEST_INBOX_SENDER_ID = REQUEST_INBOX_CONVERSATION_ID
 export const REQUEST_ACCEPT_CALLBACK_DATA = 'bridge-request:accept'
 export const REQUEST_REJECT_CALLBACK_DATA = 'bridge-request:reject'
@@ -55,7 +54,6 @@ export function requestInboxMessage(request: IMRequest): IMMessage {
   }
 }
 
-/** Legacy request-inbox rows remain local-only after an upgrade. */
 export function isLocalOnlyConversation(conversation: IMConversation | undefined): boolean {
   return conversation?.metadata?.localOnly === true
     || (conversation?.metadata?.bridgeOwned === true && conversation.metadata?.requestInbox === true)
@@ -67,11 +65,6 @@ export function isRequestInboxConversation(conversation: IMConversation | undefi
     && conversation.metadata?.requestInbox === true
 }
 
-/**
- * Builds the request resolver wired into the request-inbox system peer.
- * The platform method must be invoked on its instance: detaching it would
- * drop the receiver and crash implementations that read `this.client`.
- */
 export function createRequestResolver(registry: PlatformRegistry) {
   return async (session: PlatformSession, requestId: string, action: IMRequestAction): Promise<IMRequest> => {
     const platform = registry.require(session.platformId)
@@ -80,11 +73,7 @@ export function createRequestResolver(registry: PlatformRegistry) {
   }
 }
 
-/**
- * Read-only system peer for durable friend and group request projections.
- * Request persistence and event delivery remain in MessageStore and
- * PlatformSubscriptionManager respectively, avoiding re-entrant queue waits.
- */
+/** 好友与入群申请的只读收件箱系统会话。 */
 export class RequestInboxSystemPeerProvider implements SystemPeerProvider {
   private readonly _locks = new Map<string, Promise<void>>()
 
@@ -206,7 +195,6 @@ function requestInboxText(request: IMRequest): string {
   return lines.join('\n')
 }
 
-/** Unix seconds for a platform creation time, or 0 when the platform reported none. */
 export function requestTimestamp(value: IMRequest['createdAt']): number {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return Math.floor(value > 10_000_000_000 ? value / 1000 : value)

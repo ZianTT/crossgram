@@ -29,19 +29,11 @@ import type { MessageProjectionPipeline } from './message-projection.js'
 const CHANNEL_POLL_TIMEOUT_SECONDS = 30
 const PENDING_CHANNEL_POLL_TIMEOUT_SECONDS = 1
 
-/**
- * Channel messages one account difference mirrors so newly announced channels
- * exist as dialogs before their markers are processed.
- *
- * The figure is a page, not a share of the journal: a client that returns after
- * days offline may have missed tens of thousands of channel deliveries, and
- * loading them all is what pushed the process over its memory cap. Channels the
- * page does not cover are topped up with one message each, so the mirrored set
- * stays proportional to the changed channels.
- */
+// updates.getDifference 附带的新频道消息条数上限。
+// 客户端长期离线后重新连接时，全量加载错过的所有频道消息会导致内存溢出；
+// 这里只镜像一页，未覆盖到的变更频道再各自补一条最新消息，确保客户端在处理 updateChannelTooLong 前已知晓对应会话。
 const CHANNEL_MIRROR_PAGE = 100
 
-/** Bounded wait for a reservation whose payload is still being published. */
 const PENDING_DELIVERY_WAIT_MS = 1_500
 const PENDING_DELIVERY_POLL_MS = 50
 
@@ -50,7 +42,6 @@ export interface MentionReadPublishResult {
   ptsCount: number
 }
 
-/** Converts committed platform events to account-scoped MTProto updates. */
 export class UpdateManager {
   constructor(
     private readonly _database: Database,
@@ -78,10 +69,7 @@ export class UpdateManager {
     ) => number | undefined,
   ) {}
 
-  /**
-   * Canonical document id of an inline custom emoji, registering the document
-   * so the client that renders the message can resolve it.
-   */
+  /** 注册行内自定义表情的 document，使渲染消息的客户端能解析对应资源。 */
   private _inlineDocumentId(
     session: PlatformSession,
     conversationId: string,
@@ -132,12 +120,8 @@ export class UpdateManager {
   }
 
   /**
-   * Materialize the members a service notice names.
-   *
-   * A join notice can reference a member that has never produced a message, so
-   * the notice is unusable until the profile is persisted and the Telegram
-   * user id exists. Profile lookup failures fall back to the name QQ attached
-   * to the notice so the notice still renders instead of dropping the update.
+   * 补全系统提示中涉及的群成员资料并落库分配 Telegram userId。
+   * 刚入群等尚未发过消息的成员可能还没有本地记录；拉取资料失败时回退到提示自带的昵称。
    */
   private async _hydrateServiceActionMembers(
     session: PlatformSession,
@@ -318,7 +302,6 @@ export class UpdateManager {
     }, excludeAuthKeyId)
   }
 
-  /** Publishes mention-content acknowledgements to every other authorized device. */
   async publishMentionRead(
     session: PlatformSession,
     conversation: IMConversation,
@@ -348,9 +331,7 @@ export class UpdateManager {
     const delivery = await this._store.prepareUpdateDelivery(
       eventKey,
       session.platformSessionId,
-      // updateChannelReadMessagesContents carries no channel pts. Advancing
-      // the channel cursor for this acknowledgement makes clients see a hole
-      // before the next channel message and repeatedly call getChannelDifference.
+      // updateChannelReadMessagesContents 不带频道 pts；若递增频道 pts 会导致下一条频道消息前出现空洞，触发客户端反复调用 getChannelDifference。
       channelId === undefined ? messageIds.length : 0,
       date,
       channelId,
@@ -378,9 +359,7 @@ export class UpdateManager {
     }
     await this._store.setUpdatePayload(eventKey, updateToJson(payload))
     await this._send(session.platformSessionId, payload, undefined, excludeConnection)
-    // The initiating connection acknowledged the same mutation through its RPC
-    // result, while offline devices can still recover the retained payload via
-    // updates.getDifference / updates.getChannelDifference.
+    // 发起端连接已通过 RPC 返回值确认该变更，离线设备后续可通过 getDifference / getChannelDifference 补齐。
     await this._store.markUpdatePublished(eventKey)
 
     if (channelId === undefined) return { pts: delivery.pts, ptsCount: delivery.ptsCount }
@@ -388,7 +367,7 @@ export class UpdateManager {
     return { pts: state.pts, ptsCount: 0 }
   }
 
-  /** Sends an ephemeral phone update without adding call data to the update journal. */
+  /** 发送瞬态通话状态更新，不写入 update 日志。 */
   async publishPhoneCall(
     session: PlatformSession,
     update: tl.RawUpdatePhoneCall,
@@ -407,7 +386,7 @@ export class UpdateManager {
     return delivered
   }
 
-  /** Sends one ephemeral call-scoped signaling update without journaling it. */
+  /** 发送瞬态通话信令更新，不写入 update 日志。 */
   async publishPhoneSignaling(
     session: PlatformSession,
     update: tl.RawUpdatePhoneCallSignalingData,
@@ -426,7 +405,6 @@ export class UpdateManager {
     return delivered
   }
 
-  /** Replays only a current in-memory call snapshot to its already-authorized binding. */
   async replayPhoneCall(
     session: PlatformSession,
     update: tl.RawUpdatePhoneCall,
@@ -449,9 +427,7 @@ export class UpdateManager {
       session.platformId, session.platformSessionId, committedEventSummary(committed),
     )
     if (committed.event.type === 'voice-call') return
-    // A reservation that never received its payload is invisible to clients and
-    // pins its whole scope's difference cursor, so release it whenever the
-    // publisher cannot finish. A later replay then reserves a fresh pts.
+    // 未写入 payload 的预留记录会卡死整个作用域的 difference 游标，发布异常时必须释放，以便后续重试重新分配 pts。
     const eventKey = platformEventUpdateKey(session, committed)
     try {
       if (committed.event.type === 'message-delete') {
@@ -489,7 +465,6 @@ export class UpdateManager {
     }
   }
 
-  /** Drop a reservation whose publisher failed before its payload was durable. */
   private async _releaseAbandonedDelivery(eventKey: string, session: PlatformSession): Promise<void> {
     try {
       if (!await this._store.discardPendingUpdateDelivery(eventKey)) return
@@ -498,7 +473,6 @@ export class UpdateManager {
         session.platformSessionId, eventKey,
       )
     } catch (error) {
-      // Never mask the publish failure that triggered the cleanup.
       this._onTrace?.('abandoned update delivery release failed eventKey=%s error=%s', eventKey, String(error))
     }
   }
@@ -550,8 +524,7 @@ export class UpdateManager {
       msgId,
       reactions,
     }))
-    // updateMessageReactions itself does not carry pts; account pts is retained
-    // in the durable delivery state for difference/retry ordering.
+    // updateMessageReactions 本身不带 pts，账号级 pts 保存在投递记录中用于 difference 与重试排序。
     pts += updates.length
     void pts
     const payload: tl.RawUpdates = {
@@ -579,9 +552,7 @@ export class UpdateManager {
     const eventKey = platformEventUpdateKey(session, committed)!
     let delivery = await this._store.getUpdateDelivery(eventKey)
     delivery ??= await this._store.prepareUpdateDelivery(
-      // Telegram clients apply updateReadChannelInbox as read state, but do
-      // not use it as a channel-update queue item. Keep it on the current
-      // channel pts instead of creating a permanent gap before the next message.
+      // 客户端仅用 updateReadChannelInbox 更新已读位置，不会将其纳入频道 pts 队列；若递增频道 pts 会造成后续消息前出现空洞。
       eventKey, session.platformSessionId, channelId === undefined ? 1 : 0,
       result.message.timestamp, channelId,
     )
@@ -643,10 +614,7 @@ export class UpdateManager {
     const isEdit = event.type === 'message-edit'
     const eventKey = platformEventUpdateKey(session, committed)!
     let delivery = await this._store.getUpdateDelivery(eventKey)
-    // A live message can race with history ingestion. In that case the store
-    // quite correctly reports an unchanged row, but the live event still has
-    // to create its durable Telegram update. Only unchanged edits are safe to
-    // discard unless the caller explicitly requests recovery delivery.
+    // 实时消息若与历史拉取并发，入库时可能显示未变更，但仍需生成对应的 Telegram update；仅未变更的编辑事件可直接跳过。
     if (!delivery && isEdit && !result.created && !result.changed && !options.forceDelivery) {
       this._onTrace?.('update publish skipped eventKey=%s reason=unchanged-message', eventKey)
       return
@@ -705,8 +673,6 @@ export class UpdateManager {
     const userIds = new Map([selfRow, senderRow, ...(directPeerRow ? [directPeerRow] : [])]
       .map((row) => [row.platformUserId, row.id]))
     for (const [id, tlId] of reactionUsers.ids) userIds.set(id, tlId)
-    // Members the notice names may already be covered by the sender or a
-    // reaction actor; those rows keep the profile they were sent with.
     const noticeUsers = await this._hydrateServiceActionMembers(session, visibleMessage, userIds.keys())
     for (const [id, tlId] of noticeUsers.ids) userIds.set(id, tlId)
     let pts = delivery.pts - delivery.ptsCount
@@ -762,9 +728,7 @@ export class UpdateManager {
           )
         }
       }
-      // QQ names the gray-tip sidecar of a message when a reply targets that
-      // message's slot; the reply belongs to the content message, which is also
-      // what QQ renders and what a later recall of the slot deletes.
+      // QQ 灰条与所附着的正文共用同一个 msgSeq，回复该位置时可能指向灰条 ID，需重定向回正文消息。
       if (replied) replied = await this._store.preferContentReplyTarget(session.platformSessionId, replied)
       const mentioned = event.conversation.kind !== 'direct'
         && part.ordinal === 0 && projected.source.outgoing !== true && (
@@ -786,8 +750,7 @@ export class UpdateManager {
       }
       const fallback = async () => {
         const projectedSource = draft.source as IMMessage
-        // Hydrate only references used by this projection, including changes made
-        // by projection middleware. Never scan the platform's entire user table.
+        // 仅按需加载当前投影（含中间件改写后）引用到的用户，避免全表扫描。
         const referenced = new Set<string>()
         for (const item of projectedSource.content.parts) {
           if (item.type !== 'text') continue
@@ -897,9 +860,7 @@ export class UpdateManager {
           })
     }
     if (!updates.length) {
-      // The pts is already reserved, but this projection produced nothing to
-      // send: release it instead of leaving a delivery that can never be
-      // replayed and would block the account's difference cursor.
+      // 已预留 pts 但未生成任何 update 时需立即释放，防止残留在队列中阻塞 difference 游标。
       await this._releaseAbandonedDelivery(eventKey, session)
       this._onTrace?.('update publish skipped eventKey=%s reason=no-projected-updates', eventKey)
       return
@@ -1012,17 +973,8 @@ export class UpdateManager {
   }
 
   /**
-   * Drop reservations whose publisher never made its payload durable.
-   *
-   * `prepareUpdateDelivery` reserves a pts before the publisher can know whether
-   * the update is even buildable, and that builder lives only in memory. A
-   * publish that throws half-way (an upstream error) or a process restart
-   * therefore leaves a delivery that can never carry its update. Both difference
-   * paths must stop at the first incomplete delivery they see, so a single
-   * abandoned reservation pins every device at the previous pts: the client
-   * re-requests the same difference immediately and replays the channel messages
-   * that ride along with it. Release the ones the store reports as unowned so
-   * clients skip the lost pts value instead.
+   * 清理发布中途失败或进程重启留下的无 payload 预留记录。
+   * difference 遇到未完成的记录必须停下等待；若不清理无主记录，所有设备都会卡在前一个 pts 并反复重放频道消息。
    */
   private async _withoutAbandonedDeliveries(
     deliveries: readonly UpdateDelivery[],
@@ -1041,25 +993,18 @@ export class UpdateManager {
         )
         continue
       }
-      // Either a publisher is still building the payload or it became durable
-      // between the read and the cleanup: keep the fresh row when there is one.
       const settled = await this._store.getUpdateDelivery(delivery.eventKey)
       if (settled) kept.push(settled)
     }
     return kept
   }
 
-  /**
-   * Wait, within a bounded window, for a delivery whose payload is being built.
-   * A client that receives a difference slice asks again immediately, so this
-   * wait is what keeps a slow publish from becoming a difference loop.
-   */
+  /** 短暂等待正在构建 payload 的投递，避免慢发布导致客户端拿到分片后立即循环请求 difference。 */
   private async _awaitPendingDelivery(delivery: UpdateDelivery): Promise<void> {
     const deadline = Date.now() + PENDING_DELIVERY_WAIT_MS
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, PENDING_DELIVERY_POLL_MS))
       const current = await this._store.getUpdateDelivery(delivery.eventKey)
-      // A missing row means another reader already dropped it as abandoned.
       if (!current || current.payload) return
     }
   }
@@ -1095,19 +1040,14 @@ export class UpdateManager {
       'update send complete session=%s bindings=%d connections=%d missed=%d',
       platformSessionId, bindings.length, delivered, missed,
     )
-    // Publication is best-effort live delivery, not an acknowledgement from every
-    // historical authorization. Each device recovers independently from the durable
-    // pts/date journal, regardless of this housekeeping flag.
     return delivered > 0
   }
 
-  /** Tell only the reconnecting transport to recover from its own durable cursor. */
   requestRecovery(rpc: Pick<ServerRpcContext, 'connection' | 'sendUpdate' | 'afterResponse'>): void {
     const send = () => {
       if (!rpc.connection.closed) rpc.sendUpdate({ _: 'updatesTooLong' })
     }
-    // Queue after the successful authorization/initial RPC result: never flood
-    // other devices or send historical payloads ahead of the response itself.
+    // 必须在当前 RPC 响应发出后再推送 updatesTooLong，避免抢在响应前到达。
     if (rpc.afterResponse) rpc.afterResponse(send)
     else send()
   }
@@ -1128,27 +1068,19 @@ export class UpdateManager {
     let deliveries = await this._withoutAbandonedDeliveries(
       await this._store.getUpdateDeliveriesAfter(platformSessionId, request.pts),
     )
-    // Clients answer a slice by asking again at once, so waiting here for a
-    // publisher that is still building its payload keeps a slow publish from
-    // turning into a difference loop that replays the same channel messages.
     if (deliveries.length && !deliveries[0].payload) {
       await this._awaitPendingDelivery(deliveries[0])
       deliveries = await this._withoutAbandonedDeliveries(
         await this._store.getUpdateDeliveriesAfter(platformSessionId, request.pts),
       )
     }
-    // Channel pts are intentionally independent from account pts, so a client
-    // that was disconnected cannot identify missed dialogs from its account
-    // cursor alone. The changed channels are resolved as one aggregate per
-    // scope: announcing them by walking their retained deliveries makes a
-    // days-old cursor decode the entire journal inside a single request.
+    // 频道 pts 独立于账号 pts，需按 date 聚合出变更过的频道作用域，不能逐条扫描完整日志。
     const channelScopes = await this._store.getChangedChannelScopes(platformSessionId, request.date)
     if (!deliveries.length && !channelScopes.length && request.pts === state.pts) {
       return { _: 'updates.differenceEmpty', date: state.date, seq: state.seq }
     }
     const requestedLimit = request.ptsLimit ?? request.ptsTotalLimit ?? 100
-    // prepareUpdateDelivery reserves pts before the publisher finishes the payload.
-    // A concurrent difference must stop there or the client permanently skips it.
+    // 遇到尚未写入 payload 的预留记录时必须截断，防止客户端永久跳过该 pts。
     const firstIncomplete = deliveries.findIndex((delivery) => !delivery.payload)
     const readyDeliveries = firstIncomplete < 0 ? deliveries : deliveries.slice(0, firstIncomplete)
     const page = readyDeliveries.slice(0, Math.max(1, Math.min(requestedLimit, 100)))
@@ -1168,26 +1100,15 @@ export class UpdateManager {
       for (const chat of payload.chats) chats.set(`${chat._}:${chat.id}`, chat)
       for (const user of payload.users) users.set(`${user._}:${user.id}`, user)
     }
-    // Surface one channel-too-long marker per changed channel; Telegram clients
-    // then compare their durable channel pts and fetch every missing channel
-    // without opening the chat first. Repeated markers are safe when multiple
-    // events share the same second because channel difference is itself
-    // pts-deduplicated.
+    // 为每个变更频道下发 updateChannelTooLong，触发客户端对比本地频道 pts 并主动拉取缺失消息。
     const changedChannels = new Map<number, number>()
     for (const scope of channelScopes) {
       const channelId = channelScopeId(scope.scope)
       if (channelId === undefined) continue
       changedChannels.set(channelId, Math.max(changedChannels.get(channelId) ?? 0, scope.pts))
     }
-    // A device without a local dialog for the channel cannot resolve the marker
-    // at all: Telegram Desktop parks the update until the channel is known,
-    // dialogs only load after the difference completes, and the two wait on
-    // each other forever. Mirror the official server here and let the account
-    // difference carry the channel messages themselves so the dialog exists
-    // before the marker is processed. The ride-along is one bounded page, and
-    // every announced channel the page did not cover is topped up with its
-    // newest message, so the cost follows the channel count — never the number
-    // of retained deliveries.
+    // 若客户端本地尚无该频道的会话记录，Telegram Desktop 会挂起 updateChannelTooLong，而会话列表又要等 difference 结束才会加载，造成死锁。
+    // 这里像官方服务端一样随响应附带一页频道消息（未覆盖到的变更频道各补最新一条），让会话在标记处理前就已存在。
     const mergeChannelPayload = (delivery: UpdateDelivery) => {
       const payload = updateFromJson(delivery.payload!)
       for (const update of payload.updates) {
@@ -1261,14 +1182,12 @@ export class UpdateManager {
         timeout: CHANNEL_POLL_TIMEOUT_SECONDS,
       }
     }
-    // Channel short-polls race live publication frequently, so never acknowledge
-    // the reserved pts until the corresponding update payload is durable.
+    // 遇到尚未写入 payload 的预留记录时截断，避免客户端跳过未完成发布的 pts。
     const firstIncomplete = deliveries.findIndex((delivery) => !delivery.payload)
     const readyDeliveries = firstIncomplete < 0 ? deliveries : deliveries.slice(0, firstIncomplete)
     const page = readyDeliveries.slice(0, Math.max(1, Math.min(request.limit, 100)))
     if (!page.length) {
-      // Non-final makes Desktop and Android immediately request another page.
-      // Pause at the durable frontier instead of busy-looping on an unfinished payload.
+      // final=false 会让客户端立即发起下一次请求；这里返回 final=true 配合短 timeout，等待 payload 写完。
       return {
         _: 'updates.channelDifferenceEmpty', final: true, pts: request.pts,
         timeout: PENDING_CHANNEL_POLL_TIMEOUT_SECONDS,
@@ -1299,18 +1218,12 @@ export class UpdateManager {
 
 type CommittedMessageEvent = Extract<CommittedPlatformEvent, { event: { type: 'message' } }>
 
-/** Telegram channel id carried by one per-channel update scope, when it has one. */
 function channelScopeId(scope: string): number | undefined {
   if (!scope.startsWith('channel:')) return undefined
   const channelId = Number(scope.slice('channel:'.length))
   return Number.isSafeInteger(channelId) ? channelId : undefined
 }
 
-/**
- * Durable journal key of a committed platform event. Publishers reserve the pts
- * with it and `publish` releases the reservation under the same key when the
- * payload never became durable.
- */
 function platformEventUpdateKey(
   session: PlatformSession,
   committed: CommittedPlatformEvent,
@@ -1318,8 +1231,6 @@ function platformEventUpdateKey(
   const prefix = session.platformSessionId
   switch (committed.event.type) {
     case 'message':
-      // TypeScript cannot narrow the union through the nested event type, and
-      // the only member without an ingestion result is voice-call.
       return `${prefix}:message:${(committed as CommittedMessageEvent).result.message.id}`
     case 'message-edit':
       return `${prefix}:edit:${committed.event.eventId}`

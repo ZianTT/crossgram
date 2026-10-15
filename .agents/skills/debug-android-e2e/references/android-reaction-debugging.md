@@ -1,152 +1,30 @@
-# Android reaction, media, and login debugging
+# Android 回应、媒体与登录调试参考
 
-## Contents
+## 1. AVD 与自定义服务器路由
 
-1. AVD and custom server routing
-2. Reaction panel probe pattern
-3. Media queue failure modes
-4. First-login probe
-5. Protocol and Frida correlation
-6. Native and Java build workflow
+Android 模拟器通过 `10.0.2.2` 访问宿主机。启用自定义服务器时，主连接与媒体连接（IPv4 类型 `0` 与 `2`）都必须使用自定义路由，避免 `FileLoader` 根据 `help.getConfig.dc_options` 回退连接到不可达的 `127.0.0.1`。
 
-## 1. AVD and custom server routing
+## 2. 回应面板（Reactions）探测
 
-Android Emulator reaches the host through `10.0.2.2`, not host loopback. A custom MTProto main connection may use the configured host correctly while later `FileLoader` connections trust `help.getConfig.dc_options` and reconnect to an unusable `127.0.0.1` address.
+在真实 Activity 中构造 `ReactionsContainerLayout` 时必须按顺序执行：
+1. 构造面板并设置只读 Delegate
+2. 设置 `LayoutParams`
+3. 调用 `setMessage(...)`
+4. 挂载到窗口 DecorView 并启动进入动画
 
-When custom-server mode is active:
+紧凑栏与展开面板（`showCustomEmojiReactionDialog()`）需分别校验 `ImageReceiver.hasImageLoaded()` 及对应的落盘文件。冷启动测试前必须清空全部回应目录缓存文件。
 
-- Keep the configured route instead of replacing it with server-advertised loopback DC options.
-- Apply the route to generic IPv4 address type `0` and media/download IPv4 type `2`.
-- Clear stale IPv6 address types `1` and `3` when the custom endpoint is IPv4-only.
-- Confirm logcat shows media connections to `10.0.2.2:<port>` and the server receives `upload.getFile`.
+## 3. 媒体队列常见问题
 
-## 2. Reaction panel probe pattern
+- **`Document.size` 必须等于实际返回字节数**：若声明大小比实际多，客户端 `FileLoadOperation` 会在 EOF 处无限等待下一分片并占死下载队列。
+- **原始格式自定义回应**：APNG/GIF/PNG 等无独立缩略图的自定义表情，必须直接加载 `ImageLocation.getForDocument(document)`。
 
-Use the real `ReactionsContainerLayout` inside `LaunchActivity` or another production Activity.
+## 4. 首次登录探测
 
-Required ordering:
+测试首次登录前执行 `adb shell pm clear <package>` 并授予通知权限。按顺序确认以下 logcat 标记：
+`server_config_applied` → `page_opened:login` → `login_phone_submitted` → `login_code_page_ready` → `login_code_submitted` → `state activated=true`。
 
-1. Construct the panel.
-2. Set a no-op read-only delegate.
-3. Create and set `LayoutParams`.
-4. Call `setMessage(...)`.
-5. Attach to the Activity decor/root.
-6. Start the normal enter animation.
+## 5. 原生与 Java 构建注意
 
-Setting the message before layout parameters can break measurement. Drawing without a delegate can trigger a null dereference.
-
-Validate compact holders through their actual receivers:
-
-- `enterImageView.getImageReceiver()`
-- `loopImageView.animatedEmojiDrawable.getImageReceiver()` for custom emoji
-- otherwise `loopImageView.getImageReceiver()`
-
-Open the full panel by invoking the production expansion method, such as `showCustomEmojiReactionDialog()`, rather than clicking its screen coordinates. Obtain the real `SelectAnimatedEmojiDialog.emojiGridView` from the resulting reactions window.
-
-For each visible `ImageViewEmoji`:
-
-- Default reaction: require its `imageReceiver.hasImageLoaded()` and the selected animation document file.
-- Custom reaction: require the `AnimatedEmojiDrawable` receiver and the main custom document file.
-- Other network cell: require its receiver and `cell.document` file.
-- Local-only drawable: require a non-null drawable.
-
-Record ready adapter positions in a set. Scroll only after the whole visible page is ready. Finish only when:
-
-```text
-loadedPositions.size == adapter.itemCount
-expandedFiles > 0
-lastVisible == adapter.itemCount - 1
-```
-
-Before a cold run, cancel background loads and delete every reaction catalog document, not only the seven compact entries. Otherwise an old blocked queue or warm cache can make results misleading.
-
-## 3. Media queue failure modes
-
-### Document size must match EOF
-
-Telegram clients use `Document.size` to decide whether to request another part. If metadata advertises even one or two bytes more than the server can return, `FileLoadOperation` waits forever at EOF. A small-media operation can then occupy a queue slot and block later reaction assets.
-
-Build resource metadata from the actual served file size and test every bundled reaction asset:
-
-```text
-document.size == servedBytes.length
-```
-
-### Raw custom reaction documents need the main document
-
-APNG, GIF, WebP, PNG, and other raw custom reactions may have no thumbnail. If `AnimatedEmojiDrawable` only loads TGS/WebM main documents and otherwise asks for a missing thumb, no network request starts.
-
-For raw sticker/custom-emoji MIME types:
-
-- Load `ImageLocation.getForDocument(document)`.
-- Use the main document in LiteMode/static-preview paths too.
-- Add a first-frame filter for raw animated formats when appropriate.
-
-### Placeholders are not success
-
-An SVG thumb or static fallback can draw while the real document is still absent. Require both `hasImageLoaded()` on the production receiver and file existence after cache deletion.
-
-## 4. First-login probe
-
-Use a dispatcher Activity to apply server configuration before presenting `LoginActivity`. Drive `PhoneView.onNextPressed(...)` and the active code view's `onNextPressed(code)` programmatically.
-
-Recommended markers:
-
-```text
-server_config_applied
-page_opened:login
-login_phone_submitted
-login_code_page_ready
-login_code_submitted
-state activated=true
-```
-
-If code submission never occurs:
-
-1. Confirm `auth.sendCode` reached the server.
-2. Confirm the response returned and the LoginActivity changed to a code page.
-3. Confirm the second E2E intent still targets the same LoginActivity instance.
-4. Generate the TOTP near submission time; avoid crossing a 30-second window during a slow send-code response.
-5. Distinguish a stale local activated flag from a server-recognized auth key.
-
-## 5. Protocol and Frida correlation
-
-Use structured logcat markers around each UI stage. Immediately query the server MTProto capture with narrow filters so background contacts/sticker traffic does not evict the relevant event.
-
-For media loading, align:
-
-```text
-cell/holder starts loading
-Android connects to media DC type 2
-server receives upload.getFile
-server returns the final part/EOF
-FileLoader path appears
-receiver reports hasImageLoaded
-```
-
-Use Frida only when an object field or native queue cannot be observed through the E2E Activity. Prefer one-shot scripts that attach, print bounded state, and exit. Never dump auth keys or message content.
-
-## 6. Native and Java build workflow
-
-Run source patching before E2E injection. If `patch:source` runs after `e2e:source`, inject E2E again.
-
-For Nagram debug builds, use the persistent E2E keystore at:
-
-```text
-D:\crossgram\work\e2e-signing\release.keystore
-```
-
-Store/key password and alias are project-local test configuration; do not print them in reports.
-
-Use a full native build after changing tgnet/C++ routing. Before building, remove any stale prebuilt `TMessagesProj/src/main/libs/x86_64/libtmessages.49.so`; Gradle `pickFirst` can otherwise package the stale prebuilt instead of the CMake output.
-
-For Java-only E2E probe changes after the correct native library is already built, set:
-
-```text
-NAGRAM_BUILD_ARGS=skip_buildCMakeDebug
-```
-
-After installation, test both:
-
-1. `adb install -r` to preserve an existing session.
-2. `adb shell pm clear <package>` followed by programmatic login for a true first-install path.
+- 修改 C++ (`tgnet`) 后执行完整原生编译，并删除预编译的 `TMessagesProj/src/main/libs/x86_64/libtmessages.49.so`，防止 Gradle `pickFirst` 打入旧库。
+- 仅修改 Java 代码时可设置 `NAGRAM_BUILD_ARGS=skip_buildCMakeDebug` 跳过 CMake 编译。

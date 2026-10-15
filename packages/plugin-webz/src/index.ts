@@ -4,11 +4,11 @@ import { extname, normalize, resolve, sep } from 'node:path'
 import z from 'schemastery'
 
 export interface Config {
-  /** Directory holding the built site (index.html plus its assets). */
+  /** 已构建站点的目录（含 `index.html` 与静态资源）。 */
   root: string
-  /** URL prefix to serve under (default: ''). */
+  /** 挂载 URL 前缀（默认 `''`）。 */
   path?: string
-  /** Serve index.html for unknown paths so client-side routing works (default: true). */
+  /** 未知路径是否回退到 `index.html` 以支持前端路由（默认 `true`）。 */
   spa?: boolean
 }
 
@@ -47,31 +47,20 @@ const MIME_TYPES: Record<string, string> = {
   '.webmanifest': 'application/manifest+json',
 }
 
-/**
- * Serve a built single-page site (Telegram Web and similar) straight from the
- * crossgram process, so no separate static server or proxy needs to exist.
- *
- * Files are read from disk per request — a rebuilt site is picked up without a
- * restart, and nothing is held in memory. Only paths that stay inside `root`
- * after normalization are served; everything else falls back to index.html.
- */
 function apply(ctx: Context, config: Config): void {
   const root = resolve(config.root)
   const prefix = normalizePrefix(config.path ?? '')
   const spa = config.spa ?? true
 
   ctx.server.get('{/*path}', async (req, res, next) => {
-    // Only engage for our own prefix; every other path belongs to the plugins
-    // around us (the WebUI keeps the site root, for instance).
     if (prefix && req.path !== prefix && !req.path.startsWith(`${prefix}/`)) return next()
     if (!prefix) {
-      // Mounted at the root: defer once so a co-mounted plugin can claim first.
+      // 挂载在根路径时先让其他同级插件尝试处理。
       const prior = await next()
       if (prior || res.claimed) return prior
     }
 
-    // A relative base (`./assets/...`) only resolves under the trailing-slash
-    // form, so redirect the bare prefix before serving anything.
+    // 相对路径资源（`./assets/...`）依赖末尾斜杠，裸前缀访问时先重定向到 `${prefix}/`。
     if (prefix && req.path === prefix) return redirect(`${prefix}/`)
 
     const route = req.path.slice(prefix.length) || '/'
@@ -99,12 +88,10 @@ function apply(ctx: Context, config: Config): void {
   })
 }
 
-/** Temporary redirect that keeps the browser on the same host and scheme. */
 function redirect(location: string): Response {
   return new Response(null, { status: 302, headers: { location } })
 }
 
-/** Resolve a URL path to a file inside `root`, or `undefined` if it escapes. */
 function resolveFile(root: string, route: string): string | undefined {
   let decoded: string
   try {
@@ -117,7 +104,6 @@ function resolveFile(root: string, route: string): string | undefined {
   return candidate
 }
 
-/** Content-addressed asset filenames are immutable; HTML must revalidate. */
 function cacheControl(file: string): string {
   return file.endsWith('.html')
     ? 'no-cache'
@@ -130,8 +116,6 @@ function normalizePrefix(value: string): string {
   return trimmed.startsWith('/') ? trimmed : `/${trimmed}`
 }
 
-// Attach the Cordis inject declaration to the plugin function itself so both
-// `ctx.plugin(apply)` and the config loader see it.
 apply.inject = ['server']
 
 export const inject = ['server']

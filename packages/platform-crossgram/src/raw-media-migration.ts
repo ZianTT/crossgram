@@ -16,10 +16,7 @@ export interface RawMediaMigrationResult {
 const RAW_MESSAGE_MEDIA_MIGRATION = 'raw-message-media-v1'
 const MIGRATION_BATCH_SIZE = 250
 
-/**
- * Reverts message media created by the removed server-side preview/transcode
- * pipeline. Sticker and reaction cache rows are deliberately left untouched.
- */
+/** 将旧版服务端转码/预览流水线写入的消息媒体还原为原始直链投影，保留贴纸与回应缓存。 */
 export async function migrateLegacyQQMessageMedia(
   database: Database,
   platformId: string,
@@ -97,8 +94,6 @@ export async function migrateLegacyQQMessageMedia(
   }
   result.messages = changedMessageIds.size
 
-  // No runtime path consumes these former transform tables anymore. Purge
-  // every row, including orphaned assets no longer referenced by messages.
   const previewRows = await database.get('mtproto_qqnt_media_preview', {})
   result.previewRows = previewRows.length
   if (previewRows.length) await database.remove('mtproto_qqnt_media_preview', {})

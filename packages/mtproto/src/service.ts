@@ -29,40 +29,37 @@ import enUS from './locales/en-US.yml'
 import zhCN from './locales/zh-CN.yml'
 
 export interface MtprotoConfig {
-  /** TCP port to listen on (default: 4430; 0 = ephemeral) */
+  /** TCP 监听端口（默认 4430；0 表示随机端口） */
   port?: number
-  /** WebSocket port for browser clients (omitted = disabled; 0 = ephemeral) */
+  /** 浏览器客户端使用的独立 WebSocket 端口（不传则禁用；0 表示随机端口） */
   wsPort?: number
-  /**
-   * Serve MTProto-over-WebSocket at this path on the shared Cordis HTTP server,
-   * so a browser client hosted by that server connects to its own origin.
-   */
+  /** 在宿主 Cordis HTTP 服务上挂载同源 MTProto-over-WebSocket 的路径 */
   wsPath?: string
-  /** Host to bind to (default: 127.0.0.1) */
+  /** 监听地址（默认 127.0.0.1） */
   host?: string
-  /** Crypto provider (default: NodeCryptoProvider) */
+  /** 加密实现（默认 NodeCryptoProvider） */
   crypto?: ICryptoProvider
-  /** RSA key pair (if omitted and no rsaKeyPath, a new one is generated) */
+  /** 服务端 RSA 密钥对（若与 rsaKeyPath 均未指定则自动生成） */
   rsaKey?: ServerRsaKey
-  /** Path to load/save the RSA key pair JSON (public PEM written to `<path>.pem`) */
+  /** RSA 密钥对 JSON 持久化路径（公钥 PEM 同步写入 `<path>.pem`） */
   rsaKeyPath?: string
-  /** TL reader map (default: server reader map with method requests) */
+  /** TL reader map（默认使用包含 RPC 方法请求的服务端 reader map） */
   readerMap?: TlReaderMap
-  /** TL writer map (default: mtcute's built-in) */
+  /** TL writer map（默认使用 mtcute 内置实例） */
   writerMap?: TlWriterMap
-  /** Persistent auth-key store path (default: in-memory). */
+  /** auth key 持久化文件路径（默认仅存内存） */
   authKeyStorePath?: string
-  /** Auth-key store instance (overrides authKeyStorePath). */
+  /** 自定义 auth key 存储实例（优先于 authKeyStorePath） */
   authKeyStore?: AuthKeyStore
-  /** Optional mtcute logger override (default: routed through ctx.logger). */
+  /** 自定义 mtcute 日志器（默认转发至 `ctx.logger`） */
   log?: Logger | LogManager
-  /** Maximum simultaneously retained TCP connections (default: 256). */
+  /** 全局最大并发 TCP 连接数（默认 256） */
   maxConnections?: number
-  /** Maximum retained TCP connections from one remote IP (default: 64). */
+  /** 单 IP 最大并发 TCP 连接数（默认 64） */
   maxConnectionsPerIp?: number
-  /** Close after this many milliseconds without socket activity (default: 10 minutes; 0 disables). */
+  /** 连接空闲超时毫秒数（默认 10 分钟；0 表示禁用） */
   connectionIdleTimeoutMs?: number
-  /** Start TCP keepalive probes after this idle delay (default: 60 seconds). */
+  /** TCP keepalive 首次探测延迟毫秒数（默认 60 秒） */
   keepAliveInitialDelayMs?: number
 }
 
@@ -96,7 +93,7 @@ interface SocketRecord {
   connectedAt: number
 }
 
-/** The slice of a Cordis HTTP server this service borrows for same-origin WS. */
+/** 宿主 Cordis HTTP 服务用于挂载同源 WebSocket 的最小接口 */
 interface WsCapableServer {
   ws(path: string, handler: (
     req: { _req: IncomingMessage },
@@ -113,12 +110,10 @@ function connectionFiber(ctx: Context, config: ConnectionFiberConfig) {
 }
 
 /**
- * Cordis-native MTProto server.
+ * 基于 Cordis 的 MTProto 服务端。
  *
- * The service owns only process-wide resources. Every accepted TCP connection
- * is a child fiber, every RPC is a short-lived child fiber of that connection,
- * and protocol extension points are Cordis events dispatched with derived
- * contexts carrying the current connection/packet/RPC metadata.
+ * 每个客户端连接与每次 RPC 调用分别运行在独立的子 Fiber 中，
+ * 协议扩展点通过携带连接/报文/RPC 上下文的 Cordis 事件派发。
  */
 export class Mtproto extends Service {
   static Config = Config
@@ -178,23 +173,23 @@ export class Mtproto extends Service {
     }
   }
 
-  /** The actual bound port (useful when configured with port 0). */
+  /** 实际绑定的 TCP 端口（配置为 0 时返回系统分配的端口） */
   get port(): number {
     const addr = this._server?.address()
     return addr && typeof addr === 'object' ? addr.port : (this.config.port ?? 4430)
   }
 
-  /** The actually bound WebSocket port, or `null` when the WS transport is off. */
+  /** 实际绑定的独立 WebSocket 端口（未启用时为 `null`） */
   get wsPort(): number | null {
     return this._wsServer?.port ?? null
   }
 
-  /** Number of currently open MTProto transport connections. */
+  /** 当前活跃的传输层连接数 */
   get activeConnectionCount(): number {
     return this._sessions.size
   }
 
-  /** Number of open transports that have selected an auth key. */
+  /** 已完成 auth key 协商的连接数 */
   get authorizedConnectionCount(): number {
     let count = 0
     for (const session of this._sessions) {
@@ -203,22 +198,17 @@ export class Mtproto extends Service {
     return count
   }
 
-  /**
-   * Register one RPC route on the calling plugin's fiber.
-   *
-   * The routed Cordis event keeps registration HMR-safe and lets the
-   * dispatch context select listeners through normal derived-context filters.
-   */
+  /** 在调用方插件的 Fiber 上注册一条 RPC 路由，随插件生命周期自动卸载 */
   register(method: string, handler: RpcHandler): () => boolean {
     return registerRpcRoute(this.ctx, method, handler)
   }
 
-  /** Dispatch a decoded RPC through a short-lived invocation fiber. */
+  /** 在短生命周期的调用子 Fiber 中派发一次已解码的 RPC 请求 */
   async dispatch(source: ServerRpcContext, request: tl.RpcMethod): Promise<RpcResult> {
     return invokeRpc(this.ctx, source, request)
   }
 
-  /** Broadcast a server-initiated update to all authorized, non-stalled sessions. */
+  /** 向所有已授权且未卡死的会话广播服务端主动推送的 Update */
   broadcastUpdate(update: tl.TypeUpdates): void {
     for (const session of this._sessions) {
       if (session.connection.stalledForMs >= STALL_TIMEOUT_MS) continue
@@ -227,7 +217,7 @@ export class Mtproto extends Service {
     }
   }
 
-  /** Send an update to connections authenticated with the given permanent auth key. */
+  /** 向指定永久 auth key 关联的连接推送 Update，返回实际投递的连接数 */
   sendUpdateToAuthKey(
     authKeyId: Uint8Array,
     update: tl.TypeUpdates,
@@ -238,13 +228,9 @@ export class Mtproto extends Service {
     const healthy = candidates.filter((session) =>
       session.connection.stalledForMs < STALL_TIMEOUT_MS)
     const updateSessions = healthy.filter((session) => session.acceptsUpdates)
-    // A client only marks a connection as accepting updates once it calls
-    // updates.getState/getDifference/getChannelDifference. Every reconnect
-    // has a window before that where no connection qualifies, and Telegram
-    // Desktop keeps parallel main/upload/download connections on one key.
-    // Picking an arbitrary one there silently drops the push; send to all
-    // healthy candidates instead. ServerSession buffers until the API layer
-    // is negotiated, and clients dedupe by pts, so extra copies are harmless.
+    // 客户端仅在调用 updates.getState/getDifference/getChannelDifference 后才会标记连接接收推送。
+    // 重连初期尚未调用这些方法，且 Telegram Desktop 会在同一 key 下并行维持主连接与媒体连接；
+    // 若此时尚无明确接收推送的连接，则向该 key 下所有健康连接投递（ServerSession 会缓存至协商出 API layer，客户端也会按 pts 去重）。
     const targets = updateSessions.length ? updateSessions : healthy
     for (const session of targets) {
       this._applyKnownApiLayer(session)
@@ -253,7 +239,7 @@ export class Mtproto extends Service {
     return targets.length
   }
 
-  /** Notify every eligible unauthenticated connection that its QR login token was approved. */
+  /** 通知指定 auth key 下等待扫码登录的连接：二维码已被确认 */
   sendLoginTokenUpdateToAuthKey(authKeyId: Uint8Array, token: Uint8Array): number {
     let delivered = 0
     for (const session of this._sessions) {
@@ -264,12 +250,12 @@ export class Mtproto extends Service {
     return delivered
   }
 
-  /** Whether a permanent auth key is still registered for resumed connections. */
+  /** 检查永久 auth key 是否仍在存储中注册有效 */
   async hasAuthKey(authKeyId: Uint8Array): Promise<boolean> {
     return Boolean(await this._authKeyStore.get(authKeyId))
   }
 
-  /** Write the durable fail-closed marker and close other connections using this permanent key. */
+  /** 写入持久化吊销 tombstone，并关闭该永久 key 关联的其他连接 */
   async beginAuthKeyRevocation(authKeyId: Uint8Array, originConnection?: ServerConnection): Promise<void> {
     try {
       await this._authKeyStore.beginRevocation(authKeyId)
@@ -280,7 +266,7 @@ export class Mtproto extends Service {
     this._closeAuthKeyConnections(authKeyId, originConnection)
   }
 
-  /** Purge one revoked key and close all connections using it. */
+  /** 彻底移除已吊销的 key 及其关联状态，并关闭所有使用该 key 的连接 */
   async finishAuthKeyRevocation(authKeyId: Uint8Array): Promise<boolean> {
     try {
       return await this._authKeyStore.finishRevocation(authKeyId)
@@ -307,7 +293,7 @@ export class Mtproto extends Service {
     }
   }
 
-  /** Revoke one permanent authorization and disconnect every connection using it. */
+  /** 吊销指定永久 auth key 并断开其所有连接 */
   async revokeAuthKey(authKeyId: Uint8Array): Promise<boolean> {
     await this.beginAuthKeyRevocation(authKeyId)
     return this.finishAuthKeyRevocation(authKeyId)
@@ -345,8 +331,7 @@ export class Mtproto extends Service {
     }
 
     if (this.config.wsPath) {
-      // Optional dependency: only apps that also host an HTTP server (the web
-      // client) get the same-origin endpoint, and tests without one still run.
+      // 仅在宿主同时启用了 HTTP server 服务时注册同源 WebSocket 路由
       this.ctx.inject(['server'], (ctx) => {
         const wsServer = (ctx as unknown as { server: WsCapableServer }).server
         const path = this.config.wsPath!
@@ -515,8 +500,7 @@ export class Mtproto extends Service {
     const emitClose = () => {
       if (closeEmitted) return
       closeEmitted = true
-      // Stop routing updates to this session immediately. Fiber disposal also
-      // removes it, but asynchronous teardown may lag behind a reconnect storm.
+      // 立即从活跃会话集合中移除，避免异步 Fiber 清理完成前继续向已断开的连接推送消息
       this._sessions.delete(session)
       debug({
         direction: 'client->server', phase: 'connection', timestamp: Date.now(),

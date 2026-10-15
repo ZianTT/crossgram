@@ -3,11 +3,7 @@ interface PromiseCacheEntry<T> {
   settled: boolean
 }
 
-/**
- * Deduplicates recent successful operations without retaining their results
- * forever. Pending operations are never evicted, so exceeding the limit under
- * extreme concurrency cannot cause the same side effect to run twice.
- */
+/** 近期 Promise 去重缓存：仅淘汰已完成的条目，进行中的操作绝不淘汰，防止高并发下同一副作用重复执行。 */
 export class RecentPromiseCache<T> {
   private readonly entries = new Map<string, PromiseCacheEntry<T>>()
 

@@ -35,24 +35,16 @@ import type {
 } from './protocol.js'
 
 
-/**
- * Oldest bridge this adapter can drive.
- *
- * This is the only version gate: a newer bridge is accepted as-is, because
- * every additive capability is gated where it is used (voice, video, ordered
- * bodies). A bridge that raises its protocol version must not need a relay
- * change to keep working — see `PROTOCOL_VERSION` in qqnt-bridge's protocol.ts.
- */
+/** 支持的最低 qqnt-bridge 协议版本；更高版本的增量能力在各自调用处按需检查。 */
 const MIN_PROTOCOL_VERSION = 19
-/** Poke bursts a single request may send; QQ treats longer bursts as flooding. */
+/** 单次戳一戳请求的最大连击数。 */
 const QQ_POKE_MAX_COUNT = 10
 
 export interface Config extends QQNTClientOptions {
-  /** Hide QQ gray-tip service messages whose text contains any configured entry. */
+  /** 隐藏包含任一配置关键词的 QQ 灰条提示。 */
   grayTipFilters?: string[]
-  /** Generate tiny photoStrippedSize payloads after delivering the original message. */
+  /** 在消息投递后异步生成 `photoStrippedSize` 内联缩略图。 */
   generatePreviews?: boolean
-  /** Maximum number of concurrent inline preview generation jobs. */
   previewConcurrency?: number
 }
 
@@ -78,11 +70,8 @@ const REACTION_CATALOG_GRACE_MS = 10
 const REACTION_CATALOG_RPC_GRACE_MS = 250
 const REACTION_CATALOG_RETRY_DELAY_MS = 60_000
 const REACTION_RESOURCE_SIZE_TIMEOUT_MS = 5_000
-/** How long a resolved reaction asset size/version stays authoritative. */
 const REACTION_RESOURCE_META_TTL_MS = 10 * 60_000
 const STICKER_ASSET_META_TTL_MS = 10 * 60_000
-// qlogo avatar URLs are unsigned, so the TTL only bounds how long a consumer
-// keeps a picture the user may since have changed.
 const AVATAR_DIRECT_URL_TTL_MS = 10 * 60_000
 const WEBSOCKET_RECONNECT_BASE_DELAY_MS = 1_000
 const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 60_000
@@ -255,7 +244,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   >()
   private readonly inlinePreviewMessageJobs = new Map<string, Promise<void>>()
   private readonly inlinePreviewPublished = new Set<string>()
-  /** Reads a video's first frame from its direct URL; replaceable in tests. */
   videoFrameReader: RemoteVideoFrameExtractor = (url, signal) => extractRemoteVideoFrame(url, signal)
 
   constructor(
@@ -300,7 +288,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         token: lease.token,
       })
     } finally {
-      // The media service consumes the token; this also covers invalid transport setup.
       lease.token.fill(0)
     }
   }
@@ -339,12 +326,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     handler: (event: IMEvent<QQMediaLocator>) => void | Promise<void>,
   ): Promise<Unsubscribe> {
     await this.cleanupLegacyDialogs(session)
-    // Reaction events only carry native reaction keys/counts.  The bridge
-    // needs the catalog definitions while mapping the event; starting the
-    // WebSocket before the catalog finishes creates an event with an empty
-    // `available` list, which is then persisted as an apparent reaction
-    // removal.  Warm the catalog before consuming any events so the first
-    // snapshot is renderable and actor hydration can resolve its keys.
+    // 启动 WebSocket 前先预热回应表情目录，避免首帧回应事件因 `available` 为空被误判为清空回应。
     await this.ensureReactionCatalog().catch((error) => {
       this.logger?.warn(
         'QQ reaction catalog warmup failed before subscription error=%s',
@@ -367,9 +349,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         await running
       })(),
     }
-    // Install the replacement before stopping its predecessor. A third
-    // concurrent subscribe then supersedes this lease instead of starting a
-    // second WebSocket after both callers observed the same predecessor.
+    // 先占位再停止旧租约，防止并发 `subscribe` 看到同一个旧租约而重复建连。
     leases.set(leaseKey, lease)
     if (predecessor) {
       await predecessor.stop().catch((error) => this.logger?.error(
@@ -430,9 +410,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       )
       try {
         await this.client.subscribe(async (event, eventId) => {
-          // Receiving any frame proves that the transport is healthy. Future
-          // connection failures start a fresh backoff sequence instead of
-          // inheriting an outage that has already recovered.
           consecutiveStreamFailures = 0
           try {
             if (event.type === 'native-avsdk') {
@@ -504,9 +481,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         }, signal, {
           lastEventId,
           onEventId: async (eventId) => {
-            // The client invokes this only after the event handler commits.
-            // Persist before advancing memory so a crash or reconnect can
-            // replay the event, but can never skip an uncommitted event.
+            // 先落库再推进内存游标，保证崩溃重连宁可重放也不会漏事件。
             if (this.database) {
               await this.database.upsert('mtproto_qqnt_event_checkpoint', [{
                 platformSessionId,
@@ -598,9 +573,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     while (!signal.aborted) {
       try {
         if (!hasBaseline) {
-          // The baseline must include every page. Otherwise a conversation
-          // outside the first page is misclassified as newly received when it
-          // later moves to the top after a message arrives.
+          // 基线必须扫描全部会话页，否则首页之外的旧会话后续升到顶部时会被误判为新消息。
           let cursor: string | undefined
           const seenCursors = new Set<string>()
           do {
@@ -617,8 +590,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
           } while (cursor && !signal.aborted)
           hasBaseline = true
         } else {
-          // Recent changes move to the first page, so subsequent polling only
-          // needs that page rather than scanning hundreds of dialogs each time.
+          // 新消息会把会话顶到第一页，后续轮询只需拉取首页。
           const query = { limit: 100 }
           const page = await this.prepareDialogPage(
             session, await this.fetchDialogsPage(session, query, signal),
@@ -964,10 +936,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     messageId: string,
   ): Promise<IMMessage<QQMediaLocator> | null> {
     if (isFilteredConversationId(conversation.id)) return null
-    // A message opened directly from a Telegram link bypasses getHistory().
-    // Ensure the QQ face catalog is ready before mapping its entities, or the
-    // message is permanently projected with a plain-text fallback and no
-    // custom-emoji document for this request.
+    // 链接直开消息不会经过 `getHistory()`，需先确保 QQ 表情目录就绪，否则自定义表情会退化为纯文本。
     const reactionWarmup = this.ensureReactionCatalog().catch(() => undefined)
     const message = await this.client.getMessage(
       await this.wireConversationId(session, conversation.id), messageId,
@@ -1017,8 +986,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     const conversation = this.conversations.get(conversationId)
     if (!conversation) return
     const chatType = conversation.metadata?.chatType
-    // The QQNT bridge notification-mask route is keyed by chatType + peerUin
-    // (the numeric group code), stored on the conversation metadata as `qq`.
     const peerUin = conversation.metadata?.qq
     if (typeof chatType !== 'number' || typeof peerUin !== 'string' || !peerUin) return
     await this.client.setNotificationMask(chatType, peerUin, mask)
@@ -1049,10 +1016,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     }
   }
 
-  /**
-   * Send QQ poke (nudge) notices. QQ records a notice message for each poke, so
-   * the newest confirmed notice travels back with the request.
-   */
   async sendPoke(
     session: PlatformSession,
     conversation: IMConversationRef,
@@ -1108,14 +1071,12 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       const user = await this.getUser(session, userId)
       if (user) return { user, role: selfRole, permissions: permissions(selfRole) }
     }
-    // Opening a Telegram megagroup commonly probes inputPeerSelf. Never turn a
-    // temporarily missing group profile into a full QQ member-list scan.
+    // 客户端打开超级群时会探测 `inputPeerSelf`；群资料暂缺时直接返回 null，避免触发全量群成员扫描。
     if (userId === session.userId) return null
     let cursor: string | undefined
     do {
       const page = await this.getConversationMembers(session, conversation, { cursor, limit: 500 })
-      // Match the numeric QQ account (username) too: Satori clients address
-      // members by QQ number after the exporter switched event IDs to it.
+      // Satori 侧以 QQ 号（`username`）寻址成员，因此同时匹配 UID 与 QQ 号。
       const found = page.members.find((member) => member.user.id === userId || member.user.username === userId)
       if (found) return found
       cursor = page.nextCursor
@@ -1189,8 +1150,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       voice: part.media.voice,
       source: part.media.source,
     }))
-    // The send body mirrors the message: its text and media elements in the
-    // order the relayed message has them.
     let textCursor = 0
     let mediaCursor = 0
     const parts: QQSendPart[] = content.parts.flatMap((part): QQSendPart[] => part.type === 'text'
@@ -1294,8 +1253,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
             },
           }
         : options
-      // A physical message carries the plan's own elements, still in the order
-      // the relayed message had them.
       const planParts = parts.filter((part) => part.type === 'text'
         ? plan.includeText
         : plan.media.some(({ item }) => item === part.media))
@@ -1472,8 +1429,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         yield chunk
       }
     } catch (error) {
-      // Telegram probes the next chunk to learn EOF. QQNT reports this normal
-      // ranged-read terminator as HTTP 400 instead of an empty response.
+      // Telegram 会继续请求下一分片以探测 EOF；QQNT 对越界 Range 返回 HTTP 400 而非空响应。
       if ((options.offset ?? 0) > 0 && isQQNTDownloadPastEnd(error)) return
       if (isQQNTMediaUnavailable(error)) {
         throw new IMMediaUnavailableError(error instanceof Error ? error.message : String(error), {
@@ -1491,8 +1447,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     let locator = media.locator
     if (!locator || locator.deferred) return
     if (media.id.startsWith('avatar:')) {
-      // Avatars carry no rich-media file identity; their public URL comes from
-      // the QQ number or the face URL QQ archived with the author.
       if (needsUserAvatarRefresh(media, locator)) {
         const refreshed = await this.client.getUser(locator.peerUid).catch(() => null)
         locator = refreshed?.avatar?.locator ?? locator
@@ -1671,11 +1625,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
 
   private async withReactionCatalog(state: WireReactionState): Promise<IMReactionContext> {
     const loading = this.ensureReactionCatalog()
-    // A reaction count without its definition cannot be represented in TL:
-    // ReactionRpc will omit it and therefore never register the custom emoji
-    // document requested by Telegram clients. Keep reaction-free message paths
-    // non-blocking, but wait for the shared catalog whenever the response
-    // actually contains reactions that need projecting.
+    // 含有回应计数时必须等待目录加载完成，否则 `ReactionRpc` 会丢弃未知定义且不会注册对应的自定义表情文档。
     const catalog = state.reactions.length
       ? await loading
       : this.reactionCatalog ?? EMPTY_GROUP_REACTION_CATALOG
@@ -1703,34 +1653,18 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     message: IMMessage<QQMediaLocator>,
   ): Promise<IMMessage<QQMediaLocator>> {
     const handler = this.eventHandlers.get(session.platformSessionId)
-    // History refreshes rewrite the stored message, so they must carry the
-    // same merged-forward preview the live event resolved; otherwise every
-    // re-fetch replaces it with QQ's content-free card footer.
+    // 历史刷新会覆写落库消息，需同样补齐合并转发预览，避免被 QQ 空摘要覆盖。
     const withFaceSizes = await this.hydrateReactionResourceSizes(
       session, await this.prepareInitialMessage(message),
     )
     const prepared = await this.hydrateStickerAssetSizes(session, withFaceSizes)
     this.scheduleInlinePreview(session, conversation, prepared, handler)
-    // Keep history metadata-only. The patched client asks getFileUrl for the
-    // original and downloads it from QQ's CDN. Inline preview work is queued
-    // after this return and can only publish a later message-edit event.
     return prepared
   }
 
   /**
-   * Publishes the exact byte length and content identity of the QQ face assets
-   * a message references.
-   *
-   * Telegram schedules custom-emoji downloads from `Document.size` and caches
-   * them by document id, which is derived from the resource version, so both
-   * have to describe the bytes the relay will actually serve. The bridge reads
-   * them from the bundle's central directory (or the local file) instead of the
-   * payload, and re-resolves after a TTL so remote changes re-key the document
-   * instead of silently serving new bytes under an old identity.
-   *
-   * Inline custom emoji and the reactions attached to the message both reach
-   * clients as custom-emoji documents, so both definition sources are hydrated
-   * here instead of only the message text.
+   * 补齐消息内联表情与回应表情的精确字节大小和版本。
+   * 客户端依赖 `Document.size` 调度下载并按版本派生的文档 ID 缓存，两者必须与实际返回的字节一致。
    */
   private async hydrateReactionResourceSizes(
     session: PlatformSession,
@@ -1757,8 +1691,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         collect(definition.presentation.resource)
       }
     }
-    // The shared catalog is warmed in the background; messages only need the
-    // assets they reference, but those must always be resolved.
     this.scheduleReactionResourceWarmup(session)
     if (!targets.size) return message
     const resolved = await this.resolveReactionResourceMetas(session, targets)
@@ -1812,11 +1744,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     return changed ? { ...context, available } : context
   }
 
-  /**
-   * Resolves the referenced assets, preferring the bridge's directory-based
-   * metadata over streaming a face. Downloads stay as a fallback when the
-   * metadata endpoint is unavailable.
-   */
   private async resolveReactionResourceMetas(
     session: PlatformSession,
     targets: ReadonlyMap<string, IMReactionResource>,
@@ -1836,8 +1763,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   ): Promise<ResolvedReactionResourceMeta | undefined> {
     const cached = this.reactionResourceMeta.get(reactionKey)
     if (cached && Date.now() - cached.resolvedAt <= REACTION_RESOURCE_META_TTL_MS) return cached
-    // Message hydration and the catalog warmup may ask for the same face at the
-    // same time; share one lookup instead of querying the bridge twice.
     const pending = this.reactionResourceMetaPending.get(reactionKey)
     if (pending) return pending
     let lookup!: Promise<ResolvedReactionResourceMeta | undefined>
@@ -1870,8 +1795,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         return entry
       }
     } catch {
-      // Fall through to measuring the payload; the bridge may be restarted or
-      // the bridge may not expose metadata for this key yet.
+      // bridge 元数据接口不可用时回退为流式测量字节数。
     }
     const measured = await this.measureReactionResourceSize(session, resource)
     if (!measured) return undefined
@@ -1893,30 +1817,13 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       }
       return size > 0 ? size : undefined
     } catch {
-      // Keep the original metadata when the CDN is temporarily unavailable;
-      // a later message refresh can retry the size hydration.
       return undefined
     } finally {
       clearTimeout(timer)
     }
   }
 
-  /**
-   * Resolves the published catalog once per process so reaction pickers and the
-   * emoji sticker set describe their documents correctly without waiting for a
-   * message to reference each face. Definitions are patched in place because
-   * the catalog object is shared with every consumer.
-   */
-  /**
-   * Publishes the exact byte length and content identity of the QQ face image a
-   * relayed sticker serves.
-   *
-   * Telegram schedules sticker downloads from `Document.size` and caches the
-   * bytes by document identity, so a message must describe the image the relay
-   * will serve. QQ hands system faces out as ZIP bundles and only lists its
-   * newest faces in the runtime panel catalog, which is why the bridge resolves
-   * the wrapped image and reports its length, version, and MIME type here.
-   */
+  /** 补齐 QQ 系统大表情（ZIP 打包图片）解包后的精确字节大小、版本与 MIME 类型。 */
   private async hydrateStickerAssetSizes(
     _session: PlatformSession,
     message: IMMessage<QQMediaLocator>,
@@ -1960,7 +1867,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   ): Promise<ResolvedStickerAssetMeta | undefined> {
     const cached = this.stickerAssetMeta.get(stickerId)
     if (cached && Date.now() - cached.resolvedAt <= STICKER_ASSET_META_TTL_MS) return cached
-    // One message can repeat the same face; share a single lookup per sticker.
     const pending = this.stickerAssetMetaPending.get(stickerId)
     if (pending) return pending
     let lookup!: Promise<ResolvedStickerAssetMeta | undefined>
@@ -1973,12 +1879,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     return lookup
   }
 
-  /**
-   * Asks the bridge for the size of the image a face sticker serves. A bridge
-   * without the metadata endpoint reports nothing and the sticker keeps the
-   * metadata the message already carried; bytes are never opened during
-   * projection, because the patched client downloads them itself.
-   */
   private async lookupStickerAssetMeta(sticker: IMSticker): Promise<ResolvedStickerAssetMeta | undefined> {
     try {
       const meta = await this.client.resolveStickerAssetMeta(sticker.locator as QQStickerReference)
@@ -1996,8 +1896,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         return entry
       }
     } catch {
-      // The bridge may be restarting or older than this endpoint; a failed
-      // lookup must not hide or delay the sticker itself.
+      // bridge 重启或旧版本不支持该接口时保留消息自带元数据。
     }
     return undefined
   }
@@ -2005,8 +1904,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   private scheduleReactionResourceWarmup(session: PlatformSession): void {
     const catalog = this.reactionCatalog
     if (!catalog || this.reactionResourceWarmup) return
-    // Local faces already carry their on-disk size; only the CDN-backed ones
-    // need a lookup, and each process starts from the published catalog again.
     const targets = catalog.available.filter((definition) => definition.presentation.type === 'custom'
       && definition.presentation.resource.size === undefined
       && reactionResourceLocatorKey(definition.presentation.resource))
@@ -2023,8 +1920,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         if (meta.width !== undefined && resource.width !== meta.width) resource.width = meta.width
         if (meta.height !== undefined && resource.height !== meta.height) resource.height = meta.height
       } catch {
-        // The published catalog keeps its previous values; per-message
-        // hydration retries once the bridge answers again.
+        // 忽略单次预热失败，后续消息按需重试。
       }
     }).then(() => undefined)
     void this.reactionResourceWarmup.catch(() => undefined)
@@ -2081,9 +1977,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       try {
         if (part.media.kind === 'file' && !part.media.preview) {
           if (!isVideoFramePreviewCandidate(part.media)) return part
-          // No native thumbnail reached the bridge (QQ file transfers never
-          // carry one). Decode the first frame from QQ's CDN instead so the
-          // bubble shows the video rather than a black loading square.
+          // 文件形式的视频没有原生缩略图，直接从 QQ CDN 解码首帧。
           const locator = rawQQMediaLocator(part.media.locator)
           const media = await this.mediaPreviews.prepareVideoFrame(
             part.media,
@@ -2215,7 +2109,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       ?? conversationId
   }
 
-  /** Select a real QQ C2C/group target for CDN negotiation without sending it a message. */
+  /** 挑选一个真实好友或群会话供闪传借道申请 CDN 上传参数（不会实际发消息）。 */
   private async flashTransferUploadConversationId(): Promise<string> {
     const known = [...this.conversations.values()].filter((conversation) => {
       const chatType = conversation.metadata?.chatType
@@ -2445,14 +2339,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     return pending
   }
 
-  /**
-   * Avatar of the chat a merged forward was archived from.
-   *
-   * QQ keeps multi-forward records without sender identities, so the only
-   * avatar the relay can offer for such a transcript is the peer photo of the
-   * conversation the bundle belongs to: the group a group history came from,
-   * or the contact of a private-chat history.
-   */
+  /** 读取合并转发归属会话（群或私聊联系人）的头像。 */
   private async loadMessageBundleAvatar(
     session: PlatformSession,
     locator: WireMultiForwardLocator,
@@ -2644,7 +2531,6 @@ function mapRequest(input: WireRequest): IMRequest<QQMediaLocator> {
   }
 }
 
-/** Shared user metadata; `bot` is the bridge-wide robot flag read by MTProto and Satori. */
 function qqUserMetadata(user: { numericId?: string, bot?: true }): JsonObject {
   return {
     ...(user.numericId ? { qq: user.numericId } : {}),
@@ -2673,7 +2559,6 @@ function isVideoMime(mimeType: string | undefined): boolean {
   return mimeType?.toLowerCase().startsWith('video/') === true
 }
 
-/** Videos without a native thumbnail whose first frame QQ's CDN can serve. */
 function isVideoFramePreviewCandidate(media: IMMedia<QQMediaLocator>): boolean {
   return media.kind === 'file' && !media.preview && !media.voice && isVideoMime(media.mimeType)
     && Boolean(media.locator?.fileUuid) && !media.locator?.deferred
@@ -2807,11 +2692,7 @@ function mapParts(
   projectMedia?: (media: IMMedia<QQMediaLocator>) => IMMedia<QQMediaLocator>,
 ): IMMessage<QQMediaLocator>['content']['parts'] {
   const parts: IMMessage<QQMediaLocator>['content']['parts'] = []
-  // QQ bot messages carry a plain-text fallback beside the markdown body for
-  // clients without markdown support; QQ itself only renders the markdown. The
-  // fallback is that body's rendition, so the two are compared as rendition
-  // keys: `renditionKey` drops the layout markers QQ may or may not keep, and a
-  // relayed message therefore never carries the body twice.
+  // QQ 机器人消息常在 Markdown 旁附带纯文本回退段；通过 renditionKey 归一化比对后跳过重复的回退文本
   const markdownKey = input.parts
     .flatMap((part) => part.type === 'markdown' ? [renditionKey(parseQQMarkdown(part.content).text)] : [])
     .join('')
@@ -2841,8 +2722,6 @@ function mapParts(
         bundle: {
           id: multiForwardBundleId(part.locator),
           title: part.title || '聊天记录',
-          // QQ's card footer names no content; leave the preview empty so it is
-          // built from the archived records instead.
           preview: part.preview && isDetailedMultiForwardPreview(part.preview) ? part.preview : undefined,
           locator: { ...part.locator },
         },
@@ -3161,7 +3040,6 @@ export function parseQQMarkdown(content: string): Extract<
       const rendered = renderQQTable(block.rows)
       const start = append(rendered)
       if (!rendered) continue
-      // A quoted table keeps its quote on top of the monospace block.
       if (block.quoted) {
         entities.push({ type: 'blockquote', offset: start, length: rendered.length })
       }
@@ -3170,8 +3048,6 @@ export function parseQQMarkdown(content: string): Extract<
     }
     const inline = parseQQInline(block.text)
     const start = append(inline.text)
-    // Consecutive quoted lines are one block, so one entity: a client draws
-    // each blockquote entity as its own quote.
     if (block.quoted) {
       entities.push({ type: 'blockquote', offset: start, length: inline.text.length })
     }
@@ -3223,7 +3099,6 @@ function isReactionResourceLocator(value: unknown): value is { reactionKey: stri
     && typeof (value as { reactionKey?: unknown }).reactionKey === 'string')
 }
 
-/** Size and content identity the bridge reported for one reaction asset. */
 interface ResolvedStickerAssetMeta {
   size: number
   version?: number
@@ -3234,16 +3109,11 @@ interface ResolvedStickerAssetMeta {
   resolvedAt: number
 }
 
-/** True for the QQ system-face stickers whose bytes the bridge has to resolve. */
 function isQQFaceSticker(sticker: IMSticker): boolean {
   const locator = sticker.locator as { kind?: unknown } | undefined
   return Boolean(locator && typeof locator === 'object' && locator.kind === 'sysface')
 }
 
-/**
- * Rewrites a sticker with the metadata of the image it will serve, or returns
- * undefined when the message already describes those bytes.
- */
 function applyStickerAssetMeta(
   sticker: IMSticker,
   meta: ResolvedStickerAssetMeta,
@@ -3285,23 +3155,15 @@ interface ResolvedReactionResourceMeta {
   resolvedAt: number
 }
 
-/** Reaction key of a resource the bridge can resolve metadata for. */
 function reactionResourceLocatorKey(resource: IMReactionResource): string | undefined {
   const locator = resource.locator
   return isReactionResourceLocator(locator) ? locator.reactionKey : undefined
 }
 
-/** Keeps a reported image dimension, dropping the zeroes a bridge may send. */
 function positiveDimension(value: number | undefined): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.trunc(value) : undefined
 }
 
-/**
- * Returns a resource copy when the resolved metadata differs from what the
- * definition advertises. Stale sizes (for example one measured while the bridge
- * still relayed archives) and remote-side changes are corrected here instead of
- * being trusted forever.
- */
 function applyReactionResourceMeta(
   resource: IMReactionResource,
   resolved: ReadonlyMap<string, ResolvedReactionResourceMeta>,
@@ -3313,8 +3175,6 @@ function applyReactionResourceMeta(
   const meta = resolved.get(key) ?? cache.get(key)
   if (!meta) return undefined
   const version = meta.version ?? resource.version
-  // The bytes decide the geometry too: a wide face resolves its canvas entry
-  // while an inline one resolves the square icon of the same bundle.
   const width = meta.width ?? resource.width
   const height = meta.height ?? resource.height
   if (resource.size === meta.size && resource.version === version
@@ -3374,9 +3234,7 @@ function normalizeTextPart(
     }
   }
 
-  // QQ embeds faces in the text as placeholders (for example, `[微笑]` or
-  // `/续标识`). Replace every known placeholder, including faces occurring
-  // inline with regular text, and translate offsets to the rendered string.
+  // 将文本中的 QQ 表情占位符（如 `[微笑]`、`/续标识`）替换为 emoji 或自定义表情，并重算后续实体的偏移。
   const faces = [...sourceFaces].sort((a, b) => a.offset - b.offset)
   const replacements: Array<{ sourceOffset: number, sourceLength: number, outputOffset: number, outputLength: number }> = []
   const customEmojiEntities: import('@mtproto-relay/bridge').IMTextEntity[] = []
@@ -3394,10 +3252,7 @@ function normalizeTextPart(
       replacement = definition.presentation.alt
       customEmojiEntities.push({ type: 'custom-emoji', offset: outputOffset, length: replacement.length, definition })
     } else if (sourceText.startsWith('/')) {
-      // QQ can send newer system-face labels before its local resource pack
-      // contains the corresponding asset. Keep those labels from leaking into
-      // Telegram as literal slash commands; use the same fallback emoji as
-      // catalog-backed QQ system faces until the asset becomes available.
+      // 本地资源包尚未收录的新系统表情以 `/xxx` 占位，替换为默认 emoji 以免被客户端当成斜杠命令。
       replacement = '🙂'
     }
     output += replacement
@@ -3489,8 +3344,6 @@ function isQQNTMediaUnavailable(error: unknown): boolean {
 function needsUserAvatarRefresh(media: IMMedia<QQMediaLocator>, locator: QQMediaLocator): boolean {
   return media.id.startsWith('avatar:')
     && locator.chatType === 1
-    // An archived merged-forward author carries the avatar URL itself; asking
-    // the bridge for the placeholder peer would only waste a round trip.
     && !locator.avatarUrl
     && !locator.filePath
     && !locator.fileUuid

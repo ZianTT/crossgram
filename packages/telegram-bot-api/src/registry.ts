@@ -30,7 +30,7 @@ export interface BotOwner {
   userId: string
 }
 
-/** Durable token verifier and identity registry. Raw Bot API tokens never leave the caller's stack. */
+/** 持久化的 Bot 身份注册表与 token 校验器；明文 token 不落库。 */
 export class BotRegistry extends Service {
   private readonly _listeners = new Set<(bot: BotIdentity) => void>()
   private readonly _tokenLocks = new Map<string, Promise<void>>()
@@ -73,7 +73,7 @@ export class BotRegistry extends Service {
         if (!isUniqueError(error)) throw error
         const [taken] = await this.ctx.database.get('mtproto_bot_identity', { usernameNormalized })
         if (taken) throw new BotUsernameTakenError()
-        // The username is still available, so this was a random numeric bot-ID collision.
+        // 用户名仍可用，说明是随机生成的数字 Bot ID 碰撞，继续下一轮重试。
       }
     }
     throw new Error('BOT_ID_ALLOCATION_FAILED')
@@ -90,14 +90,13 @@ export class BotRegistry extends Service {
     return publicBot(row)
   }
 
-  /** Atomically validate a raw token and snapshot its current version. */
   async authenticate(token: string): Promise<BotIdentity | undefined> {
     const id = tokenId(token)
     if (!id) return
     return this._withTokenLock(id, () => this.verifyToken(token))
   }
 
-  /** Serialize token verification with reset/revoke and an immediate side effect. */
+  /** 将 token 校验、后续副作用与 reset/revoke 串行化。 */
   async withToken<T>(token: string, callback: (bot: BotIdentity) => Promise<T>): Promise<T | undefined> {
     const id = tokenId(token)
     if (!id) return
@@ -129,7 +128,6 @@ export class BotRegistry extends Service {
     return rows.map(publicBot)
   }
 
-  /** Active bots across all owners, used only by the protected Crossgram management UI. */
   async listAll(): Promise<BotIdentity[]> {
     const rows = await this.ctx.database.select('mtproto_bot_identity', { enabled: true })
       .orderBy('createdAt').execute()

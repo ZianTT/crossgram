@@ -6,7 +6,6 @@ import type {
 } from './platform.js'
 import type { PlatformEventDeliveryOptions, PlatformEventPublishResult } from './platform-manager.js'
 
-/** A bridge-owned direct peer supplied by an optional, provider-neutral package. */
 export interface SystemPeer {
   id: string
   conversation: IMConversation
@@ -15,19 +14,16 @@ export interface SystemPeer {
 import type { SystemBot } from './dashboard-types.js'
 export type { SystemBot } from './dashboard-types.js'
 
-/** A peer resolution permanently bound to the provider that resolved it. */
 export interface SystemPeerResolution {
   peer: SystemPeer
   readonly provider: SystemPeerProvider
 }
 
-/** Provider-neutral callback input sourced from a durable bridge message. */
 export interface SystemPeerCallbackInput {
   message: IMMessage
   data: string
 }
 
-/** Provider-neutral callback response mapped by the MTProto RPC boundary. */
 export interface SystemPeerCallbackResult {
   alert?: boolean
   message?: string
@@ -35,13 +31,10 @@ export interface SystemPeerCallbackResult {
   cacheTime?: number
 }
 
-/** Provider contract for bridge-owned peers. It intentionally has no protocol-specific types. */
 export interface SystemPeerProvider {
-  /** Create any peers and durable welcome messages for one active platform session. */
   bootstrap(session: PlatformSession, peers: SystemPeerService): Promise<void>
-  /** Return a peer only when it belongs to this platform session. */
   resolve(session: PlatformSession, conversationId: string): Promise<SystemPeer | undefined>
-  /** Called only after the user's outgoing message was canonically committed. */
+  /** 用户发出的消息完成落库后调用。 */
   receive?(
     session: PlatformSession,
     peer: SystemPeer,
@@ -49,36 +42,29 @@ export interface SystemPeerProvider {
     peers: SystemPeerService,
     input?: IMMessageInput,
   ): Promise<void>
-  /** Let a local peer consume Telegram upload parts without platform staging. */
+  /** 允许本地会话直接消费 Telegram 上传分片，无需经过平台暂存。 */
   prepareMediaUpload?(
     session: PlatformSession,
     peer: SystemPeer,
     media: IMMediaUploadProbe,
     peers: SystemPeerService,
   ): Promise<IMMediaUploadPreparation | undefined>
-  /** Resolve a provider-owned callback from its durable source message. */
   callback?(
     session: PlatformSession,
     peer: SystemPeer,
     input: SystemPeerCallbackInput,
     peers: SystemPeerService,
   ): Promise<SystemPeerCallbackResult | undefined>
-  /** Enumerate the Telegram-style bots owned by this provider. */
   listBots?(): Promise<readonly SystemBot[]> | readonly SystemBot[]
 }
 
-/** A provider-neutral failure that the RPC boundary maps to its existing error text. */
 export class SystemPeerCallbackError extends Error {
   constructor(readonly code: string) {
     super(code)
   }
 }
 
-/**
- * Provider-neutral bridge seam for local direct conversations. Providers submit
- * ordinary IM events, so persistence, committed-event observers and MTProto
- * updates remain owned by the bridge.
- */
+/** 管理 bridge 自有的本地私聊会话（如系统机器人、请求收件箱）。 */
 export class SystemPeerService extends Service {
   private readonly _providers = new Set<SystemPeerProvider>()
   private readonly _listeners = new Set<() => void>()
@@ -114,7 +100,6 @@ export class SystemPeerService extends Service {
     }, 'systemPeer.register')
   }
 
-  /** List bridge-owned bots for the management dashboard. */
   async listBots(): Promise<SystemBot[]> {
     const listed = await Promise.all([...this._providers].map(async (provider) =>
       provider.listBots ? await provider.listBots() : []))
@@ -136,7 +121,6 @@ export class SystemPeerService extends Service {
       left.username.localeCompare(right.username, 'en-US', { sensitivity: 'base' }))
   }
 
-  /** Resolve a `t.me/<username>` target that is available to this platform session. */
   async resolveUsername(session: PlatformSession, username: string): Promise<SystemPeerResolution | undefined> {
     const normalized = normalizeUsername(username)
     if (!normalized) return
@@ -149,7 +133,6 @@ export class SystemPeerService extends Service {
     }
   }
 
-  /** Notify dashboards when optional bot plugins or their dynamic bots change. */
   onChanged(listener: () => void): Unsubscribe {
     return this.ctx.effect(() => {
       this._listeners.add(listener)
@@ -157,7 +140,6 @@ export class SystemPeerService extends Service {
     }, 'systemPeer.onChanged')
   }
 
-  /** Called by providers whose bot list changes without being re-registered. */
   notifyChanged(): void {
     this._changed()
   }
@@ -216,9 +198,7 @@ export class SystemPeerService extends Service {
             media: {
               ...part.media,
               id: `bridge:system-peer-media:${randomUUID()}`,
-              // IMMediaInput deliberately omits locator at the top level when
-              // reusing an existing platform media; recover it from origin so
-              // the persisted system-peer message remains downloadable.
+              // 复用已有平台媒体时顶层无 locator，从 origin 中提取以确保落库后仍可下载。
               ...((part.media.origin?.locator) !== undefined
                 ? { locator: part.media.origin.locator }
                 : {}),

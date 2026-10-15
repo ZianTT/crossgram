@@ -10,7 +10,6 @@ export interface AuthSessionRow {
   totpSecret: string
   platformId: string
   platformSessionId: string
-  /** SRP verifier for the optional two-step verification password. */
   passwordSrp?: SrpVerifier | null
 }
 
@@ -97,7 +96,6 @@ export interface IMMessageRow {
   updatedAt: Date
 }
 
-/** Canonical platform request, deliberately independent from its inbox projection message. */
 export interface IMRequestRow {
   id: number
   platformSessionId: string
@@ -118,7 +116,6 @@ export interface IMMessageAliasRow {
   ordinal: number
 }
 
-/** Bridge-owned Telegram unread-mention state for one logical platform message. */
 export interface MessageMentionRow {
   messageId: number
   platformSessionId: string
@@ -241,7 +238,7 @@ export interface StickerSetInstallRow {
   installedAt: Date
   sortOrder: number
   archived: boolean
-  /** Persisted tombstone for provider packs removed from Telegram's installed catalog. */
+  /** 标记已被用户从 Telegram 已安装列表中移除的贴纸包。 */
   uninstalled: boolean
 }
 
@@ -320,7 +317,6 @@ declare module '@cordisjs/plugin-database' {
   }
 }
 
-/** Register all bridge models. The project is pre-release, so these are the canonical schemas. */
 export function defineModels(ctx: Context): void {
   ctx.model.extend('mtproto_auth_session', {
     id: 'string', virtualPhone: 'string', totpSecret: 'string', platformId: 'string',
@@ -410,9 +406,7 @@ export function defineModels(ctx: Context): void {
   ctx.model.extend('mtproto_im_media', {
     id: 'unsigned', messageId: 'unsigned', ordinal: 'unsigned', partIndex: 'unsigned', platformMediaId: 'text',
     kind: 'string', name: { type: 'text', nullable: true }, mimeType: { type: 'text', nullable: true },
-    // QQNT file sizes can exceed PostgreSQL int4 (for example a 2.77 GB zip).
-    // Keep the value lossless as a scale-zero numeric while retaining the
-    // number-shaped API exposed by IMMediaRow and Telegram projections.
+    // QQNT 文件大小可能超过 PostgreSQL int4 上限（如 >2GB 压缩包），使用 scale=0 的 decimal 存储。
     size: { type: 'decimal', precision: 20, scale: 0, nullable: true }, width: { type: 'unsigned', nullable: true },
     height: { type: 'unsigned', nullable: true }, duration: { type: 'unsigned', nullable: true }, voice: 'boolean',
     preview: { type: 'json', nullable: true },
@@ -437,8 +431,7 @@ export function defineModels(ctx: Context): void {
       'messageId',
       ['platformSessionId', 'tlMessageId'],
       ['platformSessionId', 'conversationId', 'tlMessageId'],
-      // conversationId is globally unique; this also keeps the generated index
-      // name below PostgreSQL's 63-byte limit (the longer prefix collides).
+      // conversationId 全局唯一，省略前缀可避免生成的索引名超出 PostgreSQL 63 字节上限导致冲突。
       ['conversationId', 'nativeSequence'],
       ['scope', 'nativeOrderKey'],
     ],

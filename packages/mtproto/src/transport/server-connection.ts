@@ -26,22 +26,11 @@ interface PendingSend {
 }
 
 /**
- * A single client TCP connection, with MTProto transport framing handled by an
- * mtcute-compatible `IPacketCodec`.
- *
- * The transport is auto-detected from the first bytes the client sends, since
- * different clients pick different transports:
- *   - `0xef`                — abridged (plaintext)
- *   - `0xEEEEEEEE`          — intermediate (plaintext; what mtcute's TcpTransport uses)
- *   - `0xDDDDDDDD`          — padded intermediate (plaintext)
- *   - anything else         — obfuscated: a random 64-byte AES-CTR init header
- *                             (what Telegram Desktop / TDLib forks use)
- *
- * Lifecycle:
- * 1. On connect: nothing is written — the client speaks first.
- * 2. On data: detect the transport (once), then feed raw bytes into the codec's
- *    `decode()` and emit decoded frames.
- * 3. On send: call the codec's `encode()`, write the result to the socket.
+ * 单个客户端传输连接，根据客户端首包自动识别 MTProto 传输协议：
+ *   - `0xef`：abridged（明文）
+ *   - `0xeeeeeeee`：intermediate（明文）
+ *   - `0xdddddddd`：padded intermediate（明文）
+ *   - 其余 64 字节头：obfuscated2（AES-CTR）
  */
 export class ServerConnection {
   private _closed = false
@@ -55,15 +44,8 @@ export class ServerConnection {
   private _closing = false
   private _pendingCloseFrame: Uint8Array | null = null
   private _messageHandler: ((data: Uint8Array) => void) | null = null
-  /** Codec is `null` until the transport is detected from the first bytes. */
   private _codec: IPacketCodec | null = null
-  /**
-   * Monotonic timestamp (ms) when the socket last reported write
-   * backpressure (`socket.write()` returned false). Reset on `drain`.
-   * A connection that stays backpressured for a long time is stalled —
-   * the peer is not consuming bytes (dead app, black-holed path), while TCP
-   * still reports ESTABLISHED. Without this signal updates pile up forever.
-   */
+  // 记录出现写背压（socket.write 返回 false）的起始时间，drain 时清零；用于检测对端假死但 TCP 仍保持 ESTABLISHED 的僵尸连接。
   private _backpressuredSince: number | null = null
   private readonly _onDrain = (): void => {
     this._backpressuredSince = null
@@ -92,7 +74,6 @@ export class ServerConnection {
     _socket.on('close', this._onClose)
   }
 
-  /** Install the single frame consumer owned by this connection fiber. */
   listen(handler: (data: Uint8Array) => void): () => void {
     if (this._messageHandler) throw new Error('MTProto connection already has a frame consumer')
     this._messageHandler = handler
@@ -101,20 +82,14 @@ export class ServerConnection {
     }
   }
 
-  /**
-   * Send a raw framed packet to the client.
-   * The packet is encoded by the (detected) codec before writing to the socket.
-   */
   send(data: Uint8Array): void {
     this._send(data, false)
   }
 
-  /** Queue a packet and resolve when its socket write callback settles. */
   sendAndWait(data: Uint8Array): Promise<TransportSendCompletion> {
     return new Promise((resolve) => this._send(data, false, resolve))
   }
 
-  /** Send one final framed packet and close after the socket flushes it. */
   sendAndClose(data: Uint8Array): void {
     this._send(data, true)
   }
@@ -151,9 +126,7 @@ export class ServerConnection {
         completion(outcome)
       }
     }
-    // Obfuscated transports use a stateful AES-CTR encoder. Keep both codec
-    // mutation and socket writes strictly ordered when callers send multiple
-    // replies before an asynchronous encode has completed.
+    // 混淆传输使用有状态的 AES-CTR，编码与底层写入必须严格保序
     this._pendingSends.push(pending)
     this._drainSendQueue()
   }
@@ -243,50 +216,40 @@ export class ServerConnection {
     }
   }
 
-  /**
-   * Milliseconds this connection has been write-backpressured without the
-   * peer draining it. `0` means the peer is consuming bytes normally.
-   */
+  /** 当前连接持续处于写背压且对端未消费的毫秒数（正常时为 0） */
   get stalledForMs(): number {
     if (this._backpressuredSince === null) return 0
     return Date.now() - this._backpressuredSince
   }
 
-  /** Bytes currently queued in the Node writable buffer. */
   get bufferedBytes(): number {
     return this._socket.writableLength
   }
 
-  /** Whether the transport can no longer deliver RPC results to its peer. */
   get closed(): boolean {
     return this._closed
   }
 
-  /** Pause kernel-to-userland reads while the session drains bounded work. */
   pauseReading(): void {
     if (this._closed || this._readPaused) return
     this._readPaused = true
     this._socket.pause()
   }
 
-  /** Resume reads after both frame and RPC queues fall below their low watermarks. */
   resumeReading(): void {
     if (this._closed || !this._readPaused) return
     this._readPaused = false
     this._socket.resume()
   }
 
-  /** Remote IP address for connection-level rate limits. */
   get remoteAddress(): string | undefined {
     return this._socket.remoteAddress
   }
 
-  /** Human-readable peer identity for logs. */
   get label(): string {
     return `${this._socket.remoteAddress ?? '?'}:${this._socket.remotePort ?? '?'}`
   }
 
-  /** Close the connection */
   close(): void {
     if (this._closed) return
     this._closed = true
@@ -298,7 +261,6 @@ export class ServerConnection {
     this._socket.destroy()
   }
 
-  /** Detach all native socket listeners owned by this transport wrapper. */
   dispose(): void {
     this._messageHandler = null
     this._socket.off('data', this._onData)
@@ -313,9 +275,7 @@ export class ServerConnection {
     this._onTraffic?.({ direction: 'received', bytes: data.length, timestamp: Date.now() })
     this._log.debug('received %d bytes from socket', data.length)
 
-    // Node owns the socket Buffer and packet codecs may decode asynchronously.
-    // Queue owned chunks so the receive cursor and obfuscation state are only
-    // touched by one drain at a time.
+    // 拷贝底层的 socket Buffer 并串行解码，避免异步解码期间破坏接收游标和混淆流状态
     this._pendingSocketData.push(new Uint8Array(data))
     this._scheduleDecode()
   }
@@ -340,8 +300,6 @@ export class ServerConnection {
         this._recvBuffer.disposeWriteSync(chunk.length)
       }
 
-      // Detect the transport from the first bytes (once). Returns false while
-      // more bytes are needed to disambiguate.
       if (!this._codec && !this._detectTransport()) continue
 
       this._log.debug('recv buffer available for decode: %d bytes', this._recvBuffer.available)
@@ -354,8 +312,7 @@ export class ServerConnection {
         }
 
         this._log.debug('decoded frame: %d bytes', frame.length)
-        // The Cordis packet pipeline is asynchronous. Give it an owned frame,
-        // never a view into `_recvBuffer` that reclaim() will overwrite.
+        // 向下游异步管线传递独立拷贝，防止后续 reclaim 覆盖还未消费的数据
         this._messageHandler?.(new Uint8Array(frame))
       }
 
@@ -363,16 +320,10 @@ export class ServerConnection {
     }
   }
 
-  /**
-   * Inspect the buffered bytes and select the transport codec, consuming the
-   * transport header/tag. Returns `true` once a codec has been chosen, or
-   * `false` if more bytes are needed to decide.
-   */
   private _detectTransport(): boolean {
     const avail = this._recvBuffer.available
     if (avail < 1) return false
 
-    // Abridged: a single 0xEF tag byte.
     const firstByte = this._recvBuffer.readSync(1)[0]
     this._recvBuffer.rewind(1)
     if (firstByte === 0xef) {
@@ -382,7 +333,6 @@ export class ServerConnection {
       return true
     }
 
-    // The remaining transports need at least 4 bytes to disambiguate.
     if (avail < 4) return false
     const tag = this._recvBuffer.readSync(4)
     const isAll = (v: number) => tag[0] === v && tag[1] === v && tag[2] === v && tag[3] === v
@@ -405,7 +355,6 @@ export class ServerConnection {
       return true
     }
 
-    // Otherwise: obfuscated transport, which begins with a 64-byte init header.
     if (avail < 64) return false
     const header = new Uint8Array(this._recvBuffer.readSync(64))
     const { codec, innerTag } = createServerObfuscation(header, this._crypto, this._log)

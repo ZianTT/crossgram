@@ -4,30 +4,25 @@ import type { MtprotoClientInfo, ServerRpcContext } from './context.js'
 import { RpcError, RpcErrors, isRpcError, toRpcError } from './errors.js'
 
 /**
- * A bare `Vector<X>` RPC result. Serialized as `0x1cb5c415` + count + items,
- * with no wrapping object — this is what `users.getUsers`, the legacy
- * `messages.getDialogFilters`, etc. return. Use {@link bareVector} to build one.
+ * 裸 `Vector<X>` RPC 返回值（`0x1cb5c415` + 数量 + 元素，无外层包装对象），
+ * 用于 `users.getUsers`、旧版 `messages.getDialogFilters` 等接口。
  */
 export interface BareVector {
-  /** Marker discriminant — distinguishes a bare vector from a TL object. */
   readonly _: 'vector'
   readonly items: readonly tl.TlObject[]
 }
 
-/** A bare Bool constructor serialized directly inside `rpc_result`. */
+/** 直接在 `rpc_result` 内序列化的裸 Bool 构造器 */
 export interface BareBool {
   readonly _: 'boolTrue' | 'boolFalse'
 }
 
-/** Result of an RPC call — a TL response object, bare result, or MTProto rpc_error. */
 export type RpcResult = tl.TlObject | BareBool | BareVector | mtp.RawMt_rpc_error
 
-/** Build a bare `Vector<X>` RPC result (e.g. for `users.getUsers`). */
 export function bareVector(items: readonly tl.TlObject[]): BareVector {
   return { _: 'vector', items }
 }
 
-/** Type guard for a {@link BareVector} result. */
 export function isBareVector(result: unknown): result is BareVector {
   return typeof result === 'object'
     && result !== null
@@ -37,11 +32,11 @@ export function isBareVector(result: unknown): result is BareVector {
 
 export interface UnwrappedRpcRequest {
   request: tl.RpcMethod
-  /** Layer declared by invokeWithLayer, if this request negotiated one. */
+  /** `invokeWithLayer` 声明的 API layer */
   apiLayer: number | null
-  /** Device/application metadata declared by initConnection, if present. */
+  /** `initConnection` 携带的客户端信息 */
   clientInfo: MtprotoClientInfo | null
-  /** Earlier MTProto message ids that must finish before this request runs. */
+  /** `invokeAfterMsg(s)` 依赖的前置消息 ID */
   afterMessageIds: readonly Long[]
 }
 
@@ -55,12 +50,11 @@ const RPC_WRAPPER_METHODS = new Set([
   'invokeWithoutUpdates',
 ])
 
-/** Whether a decoded TL object is an API RPC method or a known RPC envelope. */
 export function isRpcRequestObject(method: string): boolean {
   return method.includes('.') || RPC_WRAPPER_METHODS.has(method)
 }
 
-/** Unwrap Telegram RPC envelopes while explicitly returning invokeWithLayer.layer. */
+/** 剥离外层 RPC 包装（`invokeWithLayer`、`initConnection`、`invokeAfterMsg` 等）并提取元信息 */
 export function unwrapRpcRequest(request: tl.RpcMethod): UnwrappedRpcRequest {
   let req = request
   let apiLayer: number | null = null
@@ -112,10 +106,6 @@ export function unwrapRpcRequest(request: tl.RpcMethod): UnwrappedRpcRequest {
   }
 }
 
-/**
- * An RPC handler receives the deserialized TL request and context,
- * and returns an RPC result (or throws an RpcError).
- */
 export type RpcHandler = (ctx: ServerRpcContext, request: tl.RpcMethod) => Promise<RpcResult>
 
 export { RpcError, RpcErrors, toRpcError, isRpcError }

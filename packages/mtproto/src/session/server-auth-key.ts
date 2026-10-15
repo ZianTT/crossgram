@@ -7,30 +7,19 @@ import { TlBinaryReader } from '@mtcute/tl-runtime'
 import { createAesIgeForMessage } from '@mtcute/core/utils.js'
 
 /**
- * Server-side auth key wrapper.
+ * 服务端 MTProto v2 消息加解密封装。
  *
- * The MTProto message encryption is symmetric — the same algorithm is used
- * in both directions, but with different slices of the auth key:
- *
- * Client → Server (decrypting client messages):
- *   - message_key = SHA256(authKey[88:88+32] + plaintext)[8:24]
- *   - AES key/IV derived from `createAesIgeForMessage(crypto, key, msgKey, client=true)` (x=0)
- *
- * Server → Client (encrypting server responses):
- *   - message_key = SHA256(authKey[96:96+32] + plaintext)[8:24]
- *   - AES key/IV derived from `createAesIgeForMessage(crypto, key, msgKey, client=false)` (x=8)
- *
- * mtcute's `AuthKey.encryptMessage` uses `client=true` (x=0, clientSalt=authKey[88:120])
- * and `AuthKey.decryptMessage` uses `client=false` (x=8, serverSalt=authKey[96:128]).
- * On the server, we swap: we encrypt with `client=false` and decrypt with `client=true`.
+ * 客户端与服务端使用同一 auth key 的不同切片派生密钥：
+ * - 解密客户端消息：`msg_key = SHA256(authKey[88:120] + plaintext)[8:24]`，`client=true` (x=0)
+ * - 加密服务端消息：`msg_key = SHA256(authKey[96:128] + plaintext)[8:24]`，`client=false` (x=8)
  */
 export class ServerAuthKey {
   ready = false
   key!: Uint8Array
   id!: Uint8Array
-  /** authKey[88:120] — used to derive msg_key when decrypting client→server messages */
+  /** authKey[88:120]，用于派生客户端→服务端方向的 msg_key */
   clientSalt!: Uint8Array
-  /** authKey[96:128] — used to derive msg_key when encrypting server→client messages */
+  /** authKey[96:128]，用于派生服务端→客户端方向的 msg_key */
   serverSalt!: Uint8Array
 
   constructor(
@@ -61,20 +50,13 @@ export class ServerAuthKey {
   }
 
   /**
-   * Encrypt a server→client message (MTProto v2).
-   *
-   * This is the mirror of mtcute's `AuthKey.decryptMessage` — we use
-   * `client=false` (x=8) which corresponds to the server direction.
-   *
-   * @param message  The serialized message body (msg_id + seq_no + length + body)
-   * @param serverSalt  Current server salt
-   * @param sessionId  Session ID
-   * @returns Encrypted packet: authKeyId(8) + messageKey(16) + ciphertext
+   * 加密服务端→客户端消息（MTProto v2，`client=false` / x=8）。
+   * 输入 `message` 为 `msg_id + seq_no + length + body`，返回 `authKeyId(8) + messageKey(16) + ciphertext`。
    */
   encryptMessage(message: Uint8Array, serverSalt: Long, sessionId: Long): Uint8Array {
     if (!this.ready) throw new Error('Auth key not set up')
 
-    // Pad to 16-byte alignment with at least 12 bytes of random padding
+    // 填充至少 12 字节随机数据，并对齐到 16 字节边界
     let padding = (16 + message.length + 12) % 16
     padding = 12 + (padding ? 16 - padding : 0)
 
@@ -87,24 +69,16 @@ export class ServerAuthKey {
     buf.set(message, 16)
     this._crypto.randomFill(buf.subarray(16 + message.length, 16 + message.length + padding))
 
-    // Server direction: use serverSalt (authKey[96:128]) and client=false
     const messageKey = this._crypto.sha256(u8.concat2(this.serverSalt, buf)).subarray(8, 24)
-    const ige = createAesIgeForMessage(this._crypto, this.key, messageKey, false) // client=false = server direction
+    const ige = createAesIgeForMessage(this._crypto, this.key, messageKey, false)
     const encryptedData = ige.encrypt(buf)
 
     return u8.concat3(this.id, messageKey, encryptedData)
   }
 
   /**
-   * Decrypt a client→server message (MTProto v2).
-   *
-   * This is the mirror of mtcute's `AuthKey.encryptMessage` — we use
-   * `client=true` (x=0) which corresponds to the client direction.
-   *
-   * @param data  The encrypted packet: authKeyId(8) + messageKey(16) + ciphertext
-   * @param sessionId  Expected session ID. If null, session ID validation is skipped
-   *   (used for the first message to extract the client's session ID).
-   * @param callback  Called with (msgId, seqNo, reader) for each message in the packet
+   * 解密客户端→服务端消息（MTProto v2，`client=true` / x=0）。
+   * `sessionId` 为 `null` 时跳过校验（用于从首包提取客户端 session_id）。
    */
   decryptMessage(
     data: Uint8Array,
@@ -114,17 +88,15 @@ export class ServerAuthKey {
     const messageKey = data.subarray(8, 24)
     let encryptedData = data.subarray(24)
 
-    // Strip transport padding (not a multiple of 16)
+    // 剥离非 16 字节对齐的传输层填充
     const mod16 = encryptedData.byteLength % 16
     if (mod16 !== 0) {
       encryptedData = encryptedData.subarray(0, encryptedData.byteLength - mod16)
     }
 
-    // Client direction: use clientSalt (authKey[88:120]) and client=true
-    const ige = createAesIgeForMessage(this._crypto, this.key, messageKey, true) // client=true = client direction
+    const ige = createAesIgeForMessage(this._crypto, this.key, messageKey, true)
     const innerData = ige.decrypt(encryptedData)
 
-    // Verify message key: SHA256(clientSalt + innerData)[8:24]
     const expectedMessageKey = this._crypto.sha256(u8.concat2(this.clientSalt, innerData)).subarray(8, 24)
     if (!typed.equal(messageKey, expectedMessageKey)) {
       this._log.warn('received message with invalid messageKey = %h (expected %h)', messageKey, expectedMessageKey)
@@ -132,7 +104,7 @@ export class ServerAuthKey {
     }
 
     const innerReader = new TlBinaryReader(this._readerMap, innerData)
-    innerReader.seek(8) // skip salt
+    innerReader.seek(8) // 跳过 server_salt
     const sessionId_ = innerReader.long()
     const rawBytes = innerData.subarray(0, 32)
     this._log.verbose('decrypted innerData[0:32] = %h, sessionId = %h', rawBytes, sessionId_)

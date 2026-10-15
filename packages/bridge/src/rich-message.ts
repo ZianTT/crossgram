@@ -3,29 +3,20 @@ import type { tl } from '@mtcute/core'
 import type { IMMediaInput, IMMessageInputPart } from './platform.js'
 
 /**
- * Telegram "rich messages" (articles) arrive as `inputRichMessage`,
- * `inputRichMessageMarkdown` or `inputRichMessageHTML`. No platform this relay
- * talks to stores an article, so an article is relayed as one ordered body of
- * text and media, and the platform decides how much of the structure it can
- * show: QQ renders the text and the pictures in place, adapters with real
- * formatting keep the entities.
+ * 将 Telegram 富文本消息（`inputRichMessage`、`inputRichMessageMarkdown`、`inputRichMessageHTML`）
+ * 转换为按文章顺序排列的文本与媒体分段。
  */
 
-/** One media item an article names, as its block refers to it. */
 export interface RichMediaReference {
   kind: 'photo' | 'document'
-  /** `pageBlockPhoto.photoId` and friends: the id the declared vector entries carry. */
   id: Long
-  /** The declared `inputPhoto`/`inputDocument`, when the request carried one. */
   input?: tl.TypeInputPhoto | tl.TypeInputDocument
-  /** Caption of the referencing block, appended after the media. */
   caption?: RichTextContent
 }
 
-/** Media the relay resolved for one article reference. */
 export interface ResolvedRichMedia {
   media: IMMediaInput
-  /** Raw object for a stored article (client drafts); absent for a plain send. */
+  /** 保存草稿等需要落库文章结构时保留的原始对象。 */
   rawPhoto?: tl.RawPhoto
   rawDocument?: tl.RawDocument
 }
@@ -35,31 +26,18 @@ export type RichMediaResolver = (
 ) => Promise<ResolvedRichMedia | undefined>
 
 export interface RichMessageConversion {
-  /** Ordered relay content: text segments and media, alternating in article order. */
   parts: RichMessagePart[]
-  /**
-   * Blocks an article keeps once stored, such as a client draft. Media blocks
-   * stay only when the resolver produced a raw object for them, so the list
-   * always agrees with `photos`/`documents`.
-   */
+  /** 落库保留的块列表；媒体块仅在解析出原始对象时保留，确保与 `photos`/`documents` 一致。 */
   blocks: tl.TypePageBlock[]
   photos: tl.RawPhoto[]
   documents: tl.RawDocument[]
-  /** Whole article text, without media, for previews and length limits. */
   text: string
 }
 
-/**
- * One ordered piece of article content.
- *
- * Text parts keep their Telegram entities so the caller can map them with the
- * same rules it uses for an ordinary message.
- */
 export type RichMessagePart =
   | { type: 'text', text: string, entities: tl.TypeMessageEntity[] }
   | { type: 'media', media: IMMediaInput }
 
-/** Rich text rendered as one paragraph, with Telegram entities rebased onto it. */
 export interface RichTextContent {
   text: string
   entities: tl.TypeMessageEntity[]
@@ -68,16 +46,11 @@ export interface RichTextContent {
 interface DeclaredMedia {
   kind: 'photo' | 'document'
   input?: tl.TypeInputPhoto | tl.TypeInputDocument
-  /** File key of a markdown/HTML request, which its body names instead of an id. */
+  /** Markdown/HTML 请求中正文引用的文件 key。 */
   key?: string
 }
 
-/**
- * Resolve a rich message into relay content.
- *
- * Returns `undefined` when the request carries no usable content, which a
- * caller reports as an empty message rather than sending an empty body.
- */
+/** 将富文本请求解析为可转发的消息内容；无有效内容时返回 `undefined`。 */
 export async function convertRichMessage(
   input: tl.TypeInputRichMessage,
   resolve: RichMediaResolver,
@@ -108,9 +81,7 @@ export async function convertRichMessage(
     }
     const resolved = await resolve(reference)
     if (!resolved) {
-      // An article may reference media the relay can no longer resolve, such
-      // as a draft whose upload was swept. Keep its words, drop the picture,
-      // and keep the draft itself usable.
+      // 草稿引用的上传文件可能已被清理；丢弃无法解析的媒体但保留图注文本。
       if (reference.caption?.text.trim()) pending.push(reference.caption)
       continue
     }
@@ -139,7 +110,6 @@ export async function convertRichMessage(
   }
 }
 
-/** Media vectors a request declares, keyed by the id its blocks name. */
 function declaredRichMedia(input: tl.TypeInputRichMessage): Map<string, DeclaredMedia> {
   const declared = new Map<string, DeclaredMedia>()
   if (input._ === 'inputRichMessage') {
@@ -153,9 +123,7 @@ function declaredRichMedia(input: tl.TypeInputRichMessage): Map<string, Declared
     }
     return declared
   }
-  // A text body names its files by an arbitrary key, while a block can only
-  // refer to a numeric id. Every file therefore gets a private placeholder id
-  // that the resolved media replaces once its real id is known.
+  // Markdown/HTML 正文按字符串 key 引用文件，而 PageBlock 只能引用数字 ID；这里先分配负数占位 ID，解析出实际媒体后再替换。
   for (const [index, file] of (input.files ?? []).entries()) {
     declared.set(String(-(index + 1)), file._ === 'inputRichFilePhoto'
       ? { kind: 'photo', input: file.photo, key: file.id }
@@ -164,13 +132,6 @@ function declaredRichMedia(input: tl.TypeInputRichMessage): Map<string, Declared
   return declared
 }
 
-/**
- * Blocks a request carries.
- *
- * The markdown and HTML constructors describe the same page in another
- * notation, so they are parsed into the block form the rest of the relay
- * understands.
- */
 function normalizeRichBlocks(
   input: tl.TypeInputRichMessage,
   declared: Map<string, DeclaredMedia>,
@@ -189,9 +150,7 @@ function normalizeRichBlocks(
   const blocks = input._ === 'inputRichMessageMarkdown'
     ? markdownBlocks(input.markdown, image)
     : htmlBlocks(input.html, image)
-  // Inline file references are not standardized across clients, so a file the
-  // body names is placed where it appears and every other file follows the
-  // text: no attachment is silently dropped.
+  // 正文中未内联引用的附件统一追加在末尾，防止丢失。
   for (const [id, media] of declared) {
     if (placed.has(id)) continue
     blocks.push(media.kind === 'photo'
@@ -201,7 +160,6 @@ function normalizeRichBlocks(
   return blocks
 }
 
-/** The declared file an image reference names, when it names one at all. */
 function declaredImageId(declared: Map<string, DeclaredMedia>, target: string): string | undefined {
   const tail = /(?:^|[/?#&]|id=)([^/?#&]+)$/u.exec(target)?.[1]
   for (const [id, media] of declared) {
@@ -240,7 +198,6 @@ function mediaReference(
   return undefined
 }
 
-/** Point a media block at the object the relay will store. */
 function copyMediaBlock(block: tl.TypePageBlock, id: Long): tl.TypePageBlock {
   if (block._ === 'pageBlockPhoto') return { ...block, photoId: id }
   if (block._ === 'pageBlockVideo') return { ...block, videoId: id }
@@ -270,7 +227,6 @@ function shiftEntities(entities: tl.TypeMessageEntity[], delta: number): void {
   for (const entity of entities) entity.offset += delta
 }
 
-/** Text one block contributes, with the formatting Telegram entities can carry. */
 function blockText(block: tl.TypePageBlock): RichTextContent | undefined {
   switch (block._) {
     case 'pageBlockTitle':
@@ -382,7 +338,6 @@ function boldRichText(content: RichTextContent): RichTextContent {
   }
 }
 
-/** Render Telegram rich text as plain text plus the entities that can carry it. */
 export function richTextContent(input: tl.TypeRichText | undefined): RichTextContent | undefined {
   if (!input) return undefined
   const state: { text: string, entities: tl.TypeMessageEntity[], pre?: string } = { text: '', entities: [] }
@@ -480,9 +435,7 @@ function walkRichText(
       break
     }
     default: {
-      // Remaining constructors (mail, phone, hashtag, anchors, spoilers,
-      // subscript and friends) either wrap another rich text or carry their
-      // own plain text; keep the words and drop the decoration.
+      // 其余构造器（邮箱、电话、话题标签、锚点、剧透、上下标等）仅提取纯文本，丢弃外层样式。
       if (typeof node.text === 'string') {
         state.text += node.text
         break
@@ -550,10 +503,8 @@ function wrapRichText(text: tl.TypeRichText, entity: tl.TypeMessageEntity): tl.T
   }
 }
 
-/** Inline image reference, whose target may name a file of the article. */
 const MARKDOWN_IMAGE = /!\[([^\]]*)\]\(([^)\s]+)\)/gu
 
-/** One row of a markdown table, or nothing when the line is not one. */
 function markdownTableRow(line: string): string[] | undefined {
   const trimmed = line.trim()
   if (!trimmed.includes('|')) return undefined
@@ -561,11 +512,7 @@ function markdownTableRow(line: string): string[] | undefined {
   return cells.length > 1 ? cells : undefined
 }
 
-/**
- * A markdown table at `start`: a header row, a `--- | ---` delimiter row that
- * also carries the alignment, then body rows. Markdown expresses no colspan or
- * rowspan, so every cell is a cell of its own.
- */
+/** 解析从 `start` 行开始的 Markdown 表格（表头 + `--- | ---` 对齐分隔行 + 数据行） */
 function markdownTable(
   lines: readonly string[],
   start: number,
@@ -587,8 +534,6 @@ function markdownTable(
       _: 'pageBlockTable',
       bordered: true,
       striped: true,
-      // Telegram's own clients draw the title above the border; a markdown
-      // table has none.
       title: { _: 'textEmpty' },
       rows: rows.map((row, rowIndex) => ({
         _: 'pageTableRow' as const,
@@ -596,7 +541,6 @@ function markdownTable(
           const alignment = delimiter[column]!
           return {
             _: 'pageTableCell' as const,
-            // The first row is the table's header, as markdown declares it.
             header: rowIndex === 0 || undefined,
             alignCenter: alignment.startsWith(':') && alignment.endsWith(':') || undefined,
             alignRight: !alignment.startsWith(':') && alignment.endsWith(':') || undefined,
@@ -609,13 +553,7 @@ function markdownTable(
   }
 }
 
-/**
- * Markdown body as the blocks of a Telegram rich message (article).
- *
- * Never throws: a body this converter cannot read is sent as the styled text
- * the message already carries, so no client ever fails to receive a message
- * because its body was markdown the relay could not render.
- */
+/** 将 Markdown 正文转换为 Telegram `richMessage`（解析失败时返回 `undefined` 以回退到普通带实体文本） */
 export function markdownRichMessage(markdown: string): tl.RawRichMessage | undefined {
   try {
     const blocks = markdownBlocks(markdown)
@@ -625,12 +563,7 @@ export function markdownRichMessage(markdown: string): tl.RawRichMessage | undef
   }
 }
 
-/**
- * Markdown article body, rendered into the block form of an article.
- *
- * `image` decides what an inline image reference means: a declared file becomes
- * a media block in place, and anything else stays as its own text.
- */
+/** 将 Markdown 正文解析为 PageBlock 列表；`image` 回调可将内联图片引用替换为对应的媒体块。 */
 export function markdownBlocks(
   markdown: string,
   image?: (target: string) => tl.TypePageBlock | undefined,
@@ -764,7 +697,6 @@ const INLINE_MARKDOWN: Array<{ pattern: RegExp, type: tl.TypeMessageEntity['_'] 
   { pattern: /`([^`]+)`/gu, type: 'messageEntityCode' },
 ]
 
-/** Inline markdown subset: bold, strike, italic, code and links. */
 export function parseInlineMarkdown(text: string): RichTextContent {
   let content: RichTextContent = { text, entities: [] }
   for (const rule of INLINE_MARKDOWN) {
@@ -784,7 +716,6 @@ export function parseInlineMarkdown(text: string): RichTextContent {
   return content
 }
 
-/** Replace one matched span with its inner text, keeping the entities around it aligned. */
 function wrapInlineRange(
   content: RichTextContent,
   offset: number,
@@ -800,8 +731,7 @@ function wrapInlineRange(
     if (entity.offset >= offset + fullLength) {
       return [{ ...entity, offset: entity.offset + delta } as tl.TypeMessageEntity]
     }
-    // An entity that straddled a marker boundary has no safe rebase; drop it
-    // rather than cover text it never described.
+    // 跨越标记边界的实体无法安全重算偏移，直接丢弃。
     return []
   })
   const added = url
@@ -810,12 +740,7 @@ function wrapInlineRange(
   return { text, entities: [...entities, added] }
 }
 
-/**
- * HTML article body, rendered into the block form of an article.
- *
- * Only the document structure (paragraphs, headings, lists, preformatted code)
- * survives; inline HTML formatting is not translated into entities.
- */
+/** 将 HTML 正文解析为 PageBlock 列表（仅保留段落、标题、列表、代码块等块级结构）。 */
 export function htmlBlocks(
   html: string,
   image?: (target: string) => tl.TypePageBlock | undefined,

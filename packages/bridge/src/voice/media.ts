@@ -1,7 +1,7 @@
 import type { PlatformSession } from '../platform.js'
 import type { VoiceWorkerCall } from './call-registry.js'
 
-/** One 20 ms 48 kHz mono signed-16-bit-little-endian PCM frame. */
+/** 20ms、48kHz、单声道 s16le PCM 音频帧。 */
 export interface VoicePcmFrame {
   readonly format: {
     readonly encoding: 's16le'
@@ -14,7 +14,6 @@ export interface VoicePcmFrame {
   readonly data: Uint8Array
 }
 
-/** The QQ-side media session. Token ownership belongs to its provider. */
 export interface VoiceMediaSession {
   send(frame: VoicePcmFrame, options?: { signal?: AbortSignal }): void
   receive(options?: { signal?: AbortSignal }): Promise<VoicePcmFrame>
@@ -22,14 +21,12 @@ export interface VoiceMediaSession {
   readonly finished: Promise<void>
 }
 
-/** A confirmed native-worker PCM endpoint for a single call. */
 export interface VoiceWorkerMediaEndpoint {
   send(frame: VoicePcmFrame, options: { signal: AbortSignal }): Promise<void>
   receive(options: { signal: AbortSignal }): AsyncIterable<VoicePcmFrame>
   close(): Promise<void> | void
 }
 
-/** Platform seam which consumes a one-use media lease after worker endpoint confirmation. */
 export interface VoiceCallMediaProvider {
   start(
     call: VoiceWorkerCall,
@@ -38,11 +35,7 @@ export interface VoiceCallMediaProvider {
   ): Promise<VoiceMediaSession>
 }
 
-/**
- * Keeps one worker endpoint and one platform PCM session bidirectionally linked.
- * It owns neither keys nor lease tokens, and treats either side becoming terminal
- * as a reason to close both sides.
- */
+/** 双向桥接 worker PCM 端点与平台音频会话，任一侧结束时自动关闭双端。 */
 export class VoiceMediaAttachment {
   private readonly controller = new AbortController()
   private readonly completed = Promise.withResolvers<void>()
@@ -62,7 +55,6 @@ export class VoiceMediaAttachment {
     )
   }
 
-  /** Resolves after both media resources and both copy loops are terminal. */
   get finished(): Promise<void> {
     return this.completed.promise
   }
@@ -78,7 +70,6 @@ export class VoiceMediaAttachment {
         this.media.send(copyFrame(frame), { signal: this.controller.signal })
       }
     } catch (error) {
-      // The terminal path below deliberately exposes no platform or worker data.
       if (!this.controller.signal.aborted) this.reportTerminal('worker-receive', terminalCode(error))
     } finally {
       void this.close()
@@ -92,7 +83,6 @@ export class VoiceMediaAttachment {
         await abortable(this.worker.send(copyFrame(frame), { signal: this.controller.signal }), this.controller.signal)
       }
     } catch (error) {
-      // The terminal path below deliberately exposes no platform or worker data.
       if (!this.controller.signal.aborted) this.reportTerminal('worker-send', terminalCode(error))
     } finally {
       void this.close()
@@ -112,7 +102,6 @@ export class VoiceMediaAttachment {
     try {
       this.onTerminal?.(phase, code)
     } catch {
-      // Diagnostics must never change media lifecycle behavior.
     }
   }
 }

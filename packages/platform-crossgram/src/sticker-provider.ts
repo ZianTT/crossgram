@@ -5,7 +5,6 @@ import type {
 import type { QQNTClient } from './client.js'
 import type { QQStickerReference, WireSticker, WireStickerPack } from './protocol.js'
 
-/** Exposes QQ market packs and the account's QQ favorite collection. */
 export class QQStickerProvider implements IMStickerProvider {
   readonly capabilities
 
@@ -19,11 +18,7 @@ export class QQStickerProvider implements IMStickerProvider {
     this.capabilities = { platformKinds: ['qq'], sessionScoped: true, ownerPlatformId }
   }
 
-  /**
-   * Expression-CDN measurements for store faces the account also favorited,
-   * keyed by favorite res id. QQ publishes the size of an asset only through
-   * this probe, and clients need it to schedule the download at all.
-   */
+  /** 已收藏商城表情在 QQ 表情 CDN 上的探测缓存（按 `favoriteResId` 索引）；客户端依赖该大小发起下载。 */
   private readonly favoriteAssets = new Map<string, { url: string, size: number, mimeType?: string }>()
 
   async listPacks(_context: StickerProviderContext, query: StickerPageQuery = {}) {
@@ -77,9 +72,7 @@ export class QQStickerProvider implements IMStickerProvider {
   async openThumbnail(_context: StickerProviderContext, sticker: IMSticker): Promise<IMStickerAsset | null> {
     const reference = sticker.locator as unknown as QQStickerReference | undefined
     if (!reference || reference.kind !== 'market' || !reference.animated || !sticker.thumbnail) return null
-    // QQ market stickers expose a static type-3 asset alongside the animated
-    // original. Serve that asset as Telegram's lowest-tier `m` thumbnail so
-    // clients can keep their normal preview/loading pipeline.
+    // QQ 商城动图同时提供静态 PNG，用作 Telegram 的 `m` 级缩略图。
     const thumbnailReference: QQStickerReference = {
       ...reference,
       animated: false,
@@ -181,12 +174,8 @@ export class QQStickerProvider implements IMStickerProvider {
   }
 
   /**
-   * Store face the account favorited: QQ keeps it as a market reference, but
-   * the market path needs a native download slot (tens of seconds) and answers
-   * "file is missing" in this headless environment, so every client cell stayed
-   * empty. The same face is still on QQ's expression CDN under the favorite res
-   * id — the URL shape plain favorites already carry — and the bridge streams a
-   * favorite reference from that URL, so publish the favorite copy instead.
+   * 收藏的商城表情在无界面环境下走 `market` 路径会因本地缺失文件失败；
+   * 改用 `favoriteResId` 指向的 QQ 表情 CDN 副本对外提供。
    */
   private async servableFavoriteAsset(
     sticker: WireSticker,
@@ -238,7 +227,6 @@ export class QQStickerProvider implements IMStickerProvider {
   }
 }
 
-/** Image MIME types a favorite reference may carry. */
 function stickerImageMimeType(
   value: string | undefined,
 ): 'image/gif' | 'image/apng' | 'image/png' | 'image/jpeg' | 'image/webp' | 'image/bmp' | undefined {
@@ -255,11 +243,7 @@ function stickerImageMimeType(
   }
 }
 
-/**
- * QQ's expression CDN address of a favorite, the same URL the bridge reports for
- * plain favorites: `<uin>_...` res ids are account scoped, and the CDN serves
- * the file at index 0.
- */
+/** 根据 `<uin>_...` 格式的 `resId` 构造 QQ 收藏表情 CDN URL。 */
 export function favoriteStickerUrl(resId: string): string | undefined {
   const [uin] = resId.split('_')
   if (!uin || !/^\d+$/.test(uin)) return undefined

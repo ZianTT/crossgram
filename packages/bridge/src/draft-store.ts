@@ -9,7 +9,6 @@ export interface StoredDraft {
   draft: tl.RawDraftMessage
 }
 
-/** Durable, platform-independent storage for Telegram client drafts. */
 export class DraftStore {
   constructor(private readonly _database: Database) {}
 
@@ -32,12 +31,7 @@ export class DraftStore {
     return rows.map(decodeRow)
   }
 
-  /**
-   * Media ids stored drafts still reference, per platform session.
-   *
-   * A draft holds an article the client has not sent yet, so the upload it
-   * waits on must survive the abandoned-upload sweep until the draft is gone.
-   */
+  /** 返回各会话草稿中仍在引用的富文本媒体 ID，供上传清理任务豁免。 */
   async pinnedUploadIds(): Promise<Map<string, Set<string>>> {
     const rows = await this._database.select('mtproto_draft').execute()
     const pinned = new Map<string, Set<string>>()

@@ -21,9 +21,9 @@ interface UpdateDeliveryRecord {
   seq: number
   date: number
   published: boolean
-  /** Wall-clock second of the last publisher claim; null when unclaimed. */
+  /** 最近一次发布者认领的秒级时间戳；未认领时为 `null`。 */
   claimedAt: number | null
-  /** MessagePack-encoded UpdateJson. Null while the publisher is constructing the update. */
+  /** MessagePack 编码的 `UpdateJson`；发布者仍在构造更新时为 `null`。 */
   payload: ArrayBuffer | null
 }
 
@@ -34,12 +34,9 @@ declare module '@cordisjs/plugin-database' {
 }
 
 export interface Config {
-  /** Maximum retained deliveries for each Telegram account and update scope. */
+  /** 每个账号与 scope 下最多保留的 delivery 条数。 */
   retention?: number
-  /**
-   * Age limit of one delivery, in seconds. `0` keeps rows until the count cap
-   * evicts them.
-   */
+  /** 单条 delivery 的最大保留秒数；`0` 表示仅按条数清理。 */
   retentionSeconds?: number
 }
 
@@ -50,19 +47,10 @@ export const Config = z.object({
     .description('delivery 的保留时长（秒）：更旧的会被清理，0 表示只按条数保留。'),
 })
 
-/**
- * How often the age sweep runs.
- *
- * The count cap is per scope, so a busy channel keeps weeks of history on its
- * own; only a sweep of the whole table keeps the journal's size bounded. Five
- * minutes is frequent enough to stay near the configured window and rare enough
- * to stay invisible next to the write traffic.
- */
 const RETENTION_SWEEP_INTERVAL_MS = 5 * 60 * 1000
 
 const DEFAULT_RETENTION_SECONDS = 3 * 24 * 3600
 
-/** Context-free durable backend using compact MessagePack payloads and indexed account partitions. */
 export class DatabaseUpdateStoreBackend implements UpdateStoreBackend {
   private readonly _database: Database
   private readonly _retention: number
@@ -76,7 +64,6 @@ export class DatabaseUpdateStoreBackend implements UpdateStoreBackend {
     )
   }
 
-  /** Configured age cap in seconds; `0` disables the sweep. */
   get retentionSeconds(): number {
     return this._retentionSeconds
   }
@@ -134,14 +121,7 @@ export class DatabaseUpdateStoreBackend implements UpdateStoreBackend {
     return rows.map(decodeRow)
   }
 
-  /**
-   * One grouped row per changed channel scope.
-   *
-   * The aggregate runs in the database, so a client whose date cursor is days
-   * old costs one indexed pass and returns one row per channel — never the
-   * payloads of every retained delivery, which is what made a stale cursor
-   * decode tens of thousands of updates in one request.
-   */
+  /** 在数据库侧按频道 scope 分组聚合最大 `pts` 与最小 `messageId`，避免旧 `date` 游标解码全量 payload。 */
   async getChangedChannelScopes(
     platformSessionId: string,
     date: number,
@@ -176,8 +156,7 @@ export class DatabaseUpdateStoreBackend implements UpdateStoreBackend {
       return
     }
 
-    // One indexed seek detects overflow. Removing through the oldest overflow
-    // ID keeps exactly the newest configured count without loading payloads.
+    // 通过单次索引偏移定位超出条数上限的临界 `messageId`，避免读取 payload。
     const [oldestOverflow] = await database.select('mtproto_update_delivery', {
       platformSessionId, scope,
     }).orderBy('messageId', 'desc').offset(this._retention).limit(1).execute(['messageId'])
@@ -187,15 +166,7 @@ export class DatabaseUpdateStoreBackend implements UpdateStoreBackend {
     })
   }
 
-  /**
-   * Drop every delivery older than the configured age cap.
-   *
-   * This is a sweep of the whole table rather than another step of `_prune`:
-   * the count cap is per scope, so a channel that stopped receiving updates
-   * would keep its rows forever. Nothing in the read path depends on the
-   * removed rows — a cursor older than the window starts from the oldest
-   * retained delivery, exactly as it does past the count cap today.
-   */
+  /** 全表清理超过保留时长的 delivery（弥补单 scope 条数上限无法清理静默频道旧记录的问题）。 */
   async pruneExpired(now = Date.now()): Promise<number> {
     if (!this._retentionSeconds) return 0
     const cutoff = Math.floor(now / 1000) - this._retentionSeconds
@@ -206,7 +177,6 @@ export class DatabaseUpdateStoreBackend implements UpdateStoreBackend {
   }
 }
 
-/** Durable Cordis update-store provider. */
 export class DatabaseUpdateStore extends UpdateStore {
   static inject = ['database', 'model']
   static Config = Config
@@ -232,7 +202,6 @@ export class DatabaseUpdateStore extends UpdateStore {
     }
   }
 
-  /** Drop deliveries past the configured age cap; exposed for tests and probes. */
   pruneExpired(now = Date.now()) { return this._backend.pruneExpired(now) }
 
   get(eventKey: string) { return this._backend.get(eventKey) }
@@ -258,8 +227,6 @@ export function defineModel(ctx: Context): void {
   ctx.model.extend('mtproto_update_delivery', {
     messageId: 'unsigned', eventKey: 'text', platformSessionId: 'string', scope: 'string',
     pts: 'unsigned', ptsCount: 'unsigned', seq: 'unsigned', date: 'unsigned', published: 'boolean',
-    // Null for reservations created before claims were tracked and for rows
-    // written without a publisher, so readers can release them on sight.
     claimedAt: { type: 'unsigned', nullable: true },
     payload: { type: 'binary', nullable: true },
   }, {

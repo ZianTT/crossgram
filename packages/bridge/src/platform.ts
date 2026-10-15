@@ -1,7 +1,5 @@
 import type { VoiceCallMediaProvider } from './voice/media.js'
 
-/** Platform-neutral IM contract used by the bridge domain layer. */
-
 export type JsonValue = boolean | number | string | null | JsonObject | JsonValue[]
 
 export interface JsonObject {
@@ -12,14 +10,11 @@ export type IMConversationKind = 'direct' | 'group' | 'channel'
 
 export interface PlatformCapabilities {
   history: boolean
-  /** Synchronization of the current account's incoming-message read boundary. */
   readState?: {
-    /** Telegram read-history requests can be forwarded to the platform. */
     markRead: boolean
-    /** The platform may emit `read` events when another client advances the boundary. */
     events: boolean
   }
-  /** Server-side message search. When absent, the bridge falls back to loaded history. */
+  /** 服务端消息搜索；缺省时回退到已加载的历史消息。 */
   search?: boolean
   send: {
     text: boolean
@@ -38,7 +33,6 @@ export interface PlatformCapabilities {
     list: boolean
     administrators: boolean
     permissions: boolean
-    /** Promote and demote administrators through the platform's native API. */
     updateRoles?: boolean
   }
   avatars?: {
@@ -52,7 +46,6 @@ export interface PlatformCapabilities {
     }
     edit: {
       mode: 'native' | 'delete-and-resend' | 'unsupported'
-      /** Omitted means the platform does not impose a fixed age limit. */
       maxAgeSeconds?: number
     }
     forward: {
@@ -72,34 +65,26 @@ export interface PlatformCapabilities {
     actorList: boolean
     maxSelected: number
   }
-  /**
-   * Native nudge ("poke") notices. Absent when the platform has no poke at all,
-   * which is what hides the client entry on unsupported servers.
-   */
+  /** 原生戳一戳能力；缺省时客户端隐藏该入口。 */
   poke?: {
-    /** Largest burst a single request may send. */
     maxCount: number
   }
 }
 
 export interface IMMessageDeleteRule {
   supported: boolean
-  /** Omitted means messages of any age may be deleted. */
   maxAgeSeconds?: number
 }
 
-/** An authenticated platform session (created by the HTTP auth flow). */
 export interface PlatformSession {
   platformSessionId: string
   platformId: string
   userId: string
   credentials: JsonValue
   metadata: JsonObject
-  /** MTProto login phone from this session's auth binding. */
   virtualPhone?: string
 }
 
-/** The adapter-owned identity represented by one Cordis platform entry. */
 export interface IMPlatformAccount<TMediaLocator = unknown> {
   user: IMUser<TMediaLocator>
   credentials?: JsonValue
@@ -122,14 +107,10 @@ export interface IMConversationRef {
 export interface IMConversation<TMediaLocator = unknown> extends IMConversationRef {
   kind: IMConversationKind
   title: string
-  /** Parent channel/category/thread owner on hierarchical platforms such as Discord. */
   parentId?: string
-  /** Guild, workspace, or other top-level platform container. */
   spaceId?: string
   avatar?: IMMedia<TMediaLocator>
-  /** Current account's authoritative role in this conversation, when known. */
   selfRole?: IMConversationRole
-  /** Current account's authoritative permissions, when known. */
   selfPermissions?: IMConversationPermissions
   metadata?: JsonObject
 }
@@ -143,7 +124,6 @@ export interface IMConversationPermissions {
   editAnyMessage: boolean
   pinMessages: boolean
   inviteMembers: boolean
-  /** Whether this member may promote or demote administrators. */
   manageAdministrators?: boolean
 }
 
@@ -167,16 +147,14 @@ export interface IMUserPage<TMediaLocator = unknown> {
   nextCursor?: string
 }
 
-/** A pending friend or group-join request, kept separate from messages and system notifications. */
+/** 好友申请或入群申请，独立于普通消息与系统通知。 */
 export interface IMRequest<TMediaLocator = unknown> {
-  /** Stable opaque platform request ID. */
   id: string
   kind: 'friend' | 'group-join'
   state: 'pending' | 'accepted' | 'rejected'
   requester: IMUser<TMediaLocator>
   group?: IMConversation<TMediaLocator>
   message?: string
-  /** Platform-provided request creation time; adapters preserve its native representation. */
   createdAt?: string | number
   metadata?: JsonObject
 }
@@ -201,12 +179,11 @@ export interface IMMediaPreview<TLocator = unknown> {
   size: number
   width: number
   height: number
-  /** Adapter-owned locator for the extracted preview asset. */
   locator: TLocator
 }
 
 export interface IMMedia<TLocator = unknown> {
-  /** Opaque platform media ID. It is never parsed or truncated by the bridge. */
+  /** 平台原始媒体 ID，bridge 层不解析也不截断。 */
   id: string
   kind: IMMediaKind
   name?: string
@@ -214,65 +191,53 @@ export interface IMMedia<TLocator = unknown> {
   size?: number
   width?: number
   height?: number
-  /** Playback duration in seconds for streamable audio/video media. */
   duration?: number
-  /** True only for recorded voice messages, not ordinary audio files. */
+  /** 仅标记语音消息，不含普通音频文件。 */
   voice?: boolean
-  /** Optional speech-to-text text supplied by the source platform. */
   transcript?: string
-  /** Optional adapter-generated preview, downloaded through the same media method. */
   preview?: IMMediaPreview<TLocator>
-  /** Telegram-compatible inline stripped JPEG shown before any media download. */
+  /** Telegram 兼容的内联 stripped JPEG 缩略图。 */
   strippedThumbnail?: Uint8Array
-  /** Adapter-owned, typed data needed by downloadMedia(). */
   locator?: TLocator
 }
 
-/** A short-lived, adapter-issued URL that a patched client may download directly. */
+/** 供打补丁客户端直连下载的短期 URL。 */
 export interface IMDirectDownload {
   url: string
-  /** Absolute Unix timestamp in milliseconds. */
+  /** Unix 毫秒时间戳。 */
   expiresAt: number
-  /** Whether the origin is expected to honor HTTP byte-range requests. */
   supportsRange: boolean
 }
 
 export interface IMMediaSource {
   size?: number
   stream(options?: { signal?: AbortSignal }): AsyncIterable<Uint8Array>
-  /**
-   * Optional provider-native byte-range reader. Implement this when the
-   * upstream can avoid reopening and discarding the beginning of an asset for
-   * every Telegram upload.getFile request.
-   */
+  /** 按字节范围读取，避免每次 `upload.getFile` 都从头拉取并丢弃前缀数据。 */
   streamRange?(options: { offset: number, limit: number, signal?: AbortSignal }): AsyncIterable<Uint8Array>
 }
 
-/** Hash metadata computed by a client before it starts a relay upload. */
 export interface IMMediaUploadHashes {
   size: number
   md5: string
   sha1: string
-  /** QQ cumulative SHA-1 states for each 1 MiB boundary, followed by the final digest. */
+  /** QQ 视频按每 1 MiB 边界累计的 SHA-1 中间状态及最终摘要。 */
   sha1Checkpoints?: string[]
-  /** MD5 of the first 10 MiB, used by QQ private-file rapid upload. */
+  /** 前 10 MiB 的 MD5，用于 QQ 私聊文件秒传。 */
   file10MMd5: string
 }
 
-/** Client-prepared thumbnail used by a native video upload preflight. */
 export interface IMMediaUploadThumbnail {
   bytes: Uint8Array
   width: number
   height: number
 }
 
-/** Metadata-only upload probe computed before Telegram starts sending file parts. */
+/** 客户端上传文件分片前发送的元数据探测。 */
 export interface IMMediaUploadProbe extends Omit<IMMediaInput, 'source'> {
   hashes: IMMediaUploadHashes
   thumbnail?: IMMediaUploadThumbnail
 }
 
-/** Native upload sink fed in file order by the bridge after a metadata-only probe. */
 export interface IMMediaUploadSink {
   write(bytes: Uint8Array): Promise<void>
   complete(): Promise<void>
@@ -280,13 +245,8 @@ export interface IMMediaUploadSink {
 }
 
 /**
- * Platform-native upload preparation result.
- *
- * A missing sink means the bytes already exist remotely and the returned media
- * can be sent immediately. A sink means Telegram must still upload its normal
- * file parts; the bridge will reorder a small window, verify the supplied
- * hashes, and feed the bytes directly into this sink without staging them on
- * disk.
+ * 原生上传预检结果。无 `sink` 表示远端已命中秒传可直接发送；有 `sink` 时由 bridge 将
+ * 客户端上传的分片重排校验后直接写入 `sink`，不落盘暂存。
  */
 export interface IMMediaUploadPreparation {
   media: IMMediaInput
@@ -295,7 +255,7 @@ export interface IMMediaUploadPreparation {
 
 export interface IMMediaInput extends Omit<IMMedia, 'id' | 'locator'> {
   source: IMMediaSource
-  /** Existing source-platform media that can be reused without relaying its bytes again. */
+  /** 可直接复用的源平台媒体，无需重新上传字节流。 */
   origin?: IMMedia
 }
 
@@ -305,26 +265,15 @@ export interface IMFlashTransferResult {
   expiresAt?: number
 }
 
-/**
- * A finite archived message collection embedded in one message.
- *
- * The locator is adapter-owned data used only by `IMMessageBundleProvider`.
- * A bundle is not a conversation and therefore has no dialog/history identity.
- */
+/** 嵌入在单条消息内的合并转发消息包（非独立会话，仅由 `IMMessageBundleProvider` 解析）。 */
 export interface IMMessageBundle {
-  /** Stable identity within one platform session. */
   id: string
   title: string
   preview?: string
   locator: JsonValue
 }
 
-/** Optional platform-native bulk transfer creator used by bridge-owned tools. */
 export interface IMFlashTransferProvider {
-  /**
-   * Prepare one Telegram upload for direct platform ingestion before file parts
-   * arrive. The completed media is later passed back to {@link create}.
-   */
   prepareUpload?(
     session: PlatformSession,
     media: IMMediaUploadProbe,
@@ -339,12 +288,11 @@ export interface IMFlashTransferProvider {
 export type IMTextEntity =
   | {
       type: 'mention'
-      /** UTF-16 code-unit offset, matching Telegram and JavaScript string indexing. */
+      /** UTF-16 码元偏移，与 Telegram 及 JS 字符串索引一致。 */
       offset: number
       length: number
-      /** Opaque platform user ID. */
       userId: string
-      /** Optional platform display/account number (QQ UIN, etc.). */
+      /** 平台展示号（如 QQ 号）。 */
       numericId?: string
     }
   | {
@@ -363,14 +311,12 @@ export type IMTextEntity =
       type: 'custom-emoji'
       offset: number
       length: number
-      /** Definition includes the platform-native key and downloadable visual resource. */
       definition: IMReactionDefinition
     }
   | {
       type: 'conversation-link'
       offset: number
       length: number
-      /** A non-dialog conversation made addressable by this message. */
       conversation: IMConversation
     }
 
@@ -381,7 +327,6 @@ export type IMMessagePart<TMediaLocator = unknown> =
   | { type: 'card', card: IMMessageCard }
   | { type: 'message-bundle', bundle: IMMessageBundle }
 
-/** Platform share metadata projected as Telegram's native WebPage preview. */
 export interface IMMessageCard {
   kind: 'mini-app' | 'link' | 'music' | 'contact' | 'location' | 'application'
   title: string
@@ -396,40 +341,26 @@ export type IMMessageInputPart =
   | { type: 'media', media: IMMediaInput }
   | { type: 'sticker', sticker: import('./sticker-provider.js').IMStickerSendPlan }
 
-/** Member named by a platform service notice, such as a group member joining. */
 export interface IMServiceMember {
-  /** Platform user id of the member. */
   id: string
-  /** Display name carried by the notice, used until the profile resolves. */
   name?: string
 }
 
-/**
- * Service notice projected as a Telegram `MessageService`.
- *
- * `members-joined` keeps both the platform wording and the members it names so
- * the relay can render Telegram's native join action and still fall back to the
- * wording when the platform cannot name every member.
- */
+/** 投影为 Telegram `MessageService` 的系统提示；`members-joined` 同时保留成员列表与原始文案以便无法完整解析成员时回退。 */
 export type IMMessageServiceAction =
   | { type: 'custom', text: string }
   | { type: 'phone-call', duration?: number }
   | {
       type: 'members-joined'
-      /** Platform wording, used when the join action cannot be projected. */
       text: string
-      /** Members the notice says joined. */
       members: IMServiceMember[]
-      /** Member that invited or added them; absent when the platform names nobody. */
       actor?: IMServiceMember
-      /** The members joined through a shared invite link or QR code. */
       viaInviteLink?: boolean
     }
 
 export interface IMMessageContent<TMediaLocator = unknown> {
   parts: IMMessagePart<TMediaLocator>[]
   inlineKeyboard?: IMInlineKeyboard
-  /** Platform service/system message rendered by Telegram as a MessageService. */
   serviceAction?: IMMessageServiceAction
   /**
    * Markdown the body was written in, when the platform knows it (QQ official
@@ -459,63 +390,47 @@ export type IMInlineKeyboardButton =
 export interface IMMessageInput {
   parts: IMMessageInputPart[]
   replyToId?: string
-  /** Stable platform-native sequence used when the reply target's opaque ID changes between account views. */
+  /** 跨账号视角下消息 ID 变化时用于定位被回复消息的平台原生序号。 */
   replyToNativeSequence?: string
 }
 
 export interface IMMessage<TMediaLocator = unknown> {
-  /** Logical platform message ID. Strings may be arbitrarily long. */
   id: string
-  /** Physical platform IDs represented by this logical message, for example a Telegram album. */
+  /** 逻辑消息对应的底层物理消息 ID 列表（如相册分片）。 */
   sourceIds?: string[]
   conversationId: string
   senderId: string
-  /** Stable global sender profile. Conversation-scoped labels belong in `senderTitle`. */
   sender?: IMUser<TMediaLocator>
-  /** Conversation-scoped member tag/title shown beside the sender's global name. */
+  /** 会话内成员头衔。 */
   senderTitle?: string
   content: IMMessageContent<TMediaLocator>
   timestamp: number
-  /** Stable lexicographically sortable native ID used to preserve message order without relying on timestamps. */
+  /** 按字典序排列的平台原生排序键。 */
   nativeOrderKey?: string
   outgoing?: boolean
-  /** True when the upstream message was recalled but is retained as a tombstone. */
+  /** 标记上游已撤回但保留为墓碑的消息。 */
   recalled?: boolean
-  /** Opaque platform grouping key, retained for album reconciliation. */
   groupId?: string
   metadata?: JsonObject
   reactionContext?: IMReactionContext
-  /** Opaque platform message ID referenced by this reply. */
   replyToId?: string
 }
 
-/**
- * One immutable item inside an archived message bundle.
- *
- * Unlike `IMMessage`, a snapshot deliberately has no `conversationId`: its
- * Telegram target is supplied by the feature rendering the containing bundle.
- */
+/** 合并转发包内的单条消息快照，不含 `conversationId`。 */
 export interface IMMessageSnapshot<TMediaLocator = unknown>
   extends Omit<IMMessage<TMediaLocator>, 'conversationId'> {}
 
 export interface IMMessageBundleProvider<TMediaLocator = unknown> {
-  /** Load the complete finite bundle. Callers do not paginate it as history. */
   load(
     session: PlatformSession,
     locator: JsonValue,
   ): Promise<IMMessageSnapshot<TMediaLocator>[]>
-  /**
-   * Avatar of the chat the bundle was archived from, when the adapter can
-   * resolve one.  The relay renders a bundle as a synthetic transcript chat,
-   * so this image is its peer photo.
-   */
   avatar?(
     session: PlatformSession,
     locator: JsonValue,
   ): Promise<IMMedia<TMediaLocator> | undefined>
 }
 
-/** Whether a platform message explicitly mentions one platform user. */
 export function messageMentionsUser(message: IMMessage, userId: string): boolean {
   return message.content.parts.some((part) =>
     part.type === 'text'
@@ -550,7 +465,7 @@ export interface IMReactionSummary {
   key: string
   count: number
   selected?: boolean
-  /** Telegram chosen_order; larger values are more recently selected. */
+  /** Telegram `chosen_order`，值越大表示越晚选中。 */
   selectedOrder?: number
   recentActors?: IMReactionActor[]
 }
@@ -566,7 +481,6 @@ export interface IMReactionResource {
 }
 
 export interface IMReactionDefinition {
-  /** Stable platform-session-wide identity; reuse it when the same reaction is exposed in multiple conversations. */
   key: string
   title?: string
   presentation:
@@ -596,14 +510,11 @@ export interface IMMessageTarget {
   conversationId: string
   messageId: string
   targetId: string
-  /** Stable platform-native sequence used when opaque message IDs change between account views. */
   nativeSequence?: string
 }
 
-/** The platform permanently cannot resolve the requested stored message target. */
 export class IMMessageTargetUnavailableError extends Error {}
 
-/** The stored media reference can no longer produce bytes and must be refreshed. */
 export class IMMediaUnavailableError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options)
@@ -613,12 +524,10 @@ export class IMMediaUnavailableError extends Error {
 
 export interface IMReadTarget {
   conversationId: string
-  /** Opaque logical platform message ID through which incoming messages were read. */
   messageId: string
 }
 
 export interface IMDeleteMessagesOptions {
-  /** Request deletion for every participant instead of only the current user. */
   forEveryone: boolean
 }
 
@@ -630,7 +539,7 @@ export type IMConversationMemberModeration =
 export interface IMForwardMessagesOptions {
   dropAuthor?: boolean
   replyToId?: string
-  /** Authorized stored sources used when an adapter must copy instead of natively forward. */
+  /** 平台不支持原生转发时，供适配器按内容复制重发的源消息。 */
   sourceMessages?: readonly IMMessage<any>[]
 }
 
@@ -644,14 +553,12 @@ export interface IMDialog<TMediaLocator = unknown> {
   conversation: IMConversation<TMediaLocator>
   unreadCount: number
   lastMessage?: IMMessage<TMediaLocator>
-  /** Last platform message known to be read, when the upstream exposes an exact unread boundary. */
   readInboxMaxMessage?: IMMessage<TMediaLocator>
 }
 
 export interface IMPageQuery {
   cursor?: string
   limit?: number
-  /** Stable platform entity ID after which the next page starts. */
   afterId?: string
 }
 
@@ -661,18 +568,15 @@ export interface IMHistoryAnchor {
 }
 
 export interface IMHistoryQuery extends IMPageQuery {
-  /** Fetch messages strictly older than this platform message. */
   before?: IMHistoryAnchor
-  /** Fetch messages strictly newer than this platform message. */
   after?: IMHistoryAnchor
-  /** Without an anchor, start from the newest message instead of a platform-chosen window such as the unread boundary. */
+  /** 未指定锚点时固定从最新消息拉取，而非平台默认的未读边界窗口。 */
   latest?: boolean
 }
 
 export interface IMDialogPage<TMediaLocator = unknown> {
   dialogs: IMDialog<TMediaLocator>[]
   nextCursor?: string
-  /** Total dialogs available upstream, independent of this page's limit. */
   total?: number
 }
 
@@ -742,7 +646,6 @@ export interface IMTransferOptions {
 
 export type IMMessageSendRejectionReason = 'permission-denied' | 'platform-rejected'
 
-/** A platform permanently rejected a send that must not be retried unchanged. */
 export class IMMessageSendRejectedError extends Error {
   constructor(
     readonly reason: IMMessageSendRejectionReason,
@@ -764,7 +667,7 @@ export type IMEvent<TMediaLocator = unknown> =
       type: 'message'
       message: IMMessage<TMediaLocator>
       conversation: IMConversation<TMediaLocator>
-      /** Set when a read reconciles a message missed by the live subscription. */
+      /** 标记读取历史时补齐的实时订阅漏接消息。 */
       delivery?: 'recovery'
     }
   | { type: 'message-edit', eventId: string, message: IMMessage<TMediaLocator>, conversation: IMConversation<TMediaLocator> }
@@ -779,7 +682,6 @@ export type IMEvent<TMediaLocator = unknown> =
   | {
       type: 'request'
       request: IMRequest<TMediaLocator>
-      /** Re-attempt delivery for an already persisted request projection. */
       delivery?: 'recovery'
     }
   | { type: 'read', conversationId: string, upToMessageId: string }
@@ -792,7 +694,6 @@ export type IMEvent<TMediaLocator = unknown> =
       timestamp: number
     }
   | {
-      /** Asynchronous speech-to-text result for an existing voice message. */
       type: 'voice-transcript'
       eventId: string
       conversation: IMConversation<TMediaLocator>
@@ -801,7 +702,7 @@ export type IMEvent<TMediaLocator = unknown> =
       timestamp: number
     }
   | {
-      /** Transient one-to-one voice-call state; never persisted as a message. */
+      /** 瞬态一对一语音通话状态，不持久化为消息。 */
       type: 'voice-call'
       callRef: string
       signal: 'incoming' | 'accept-requested' | 'refuse-requested' | 'logout-requested' | 'ended'
@@ -821,16 +722,11 @@ export type Unsubscribe = () => void | Promise<void>
 export interface IMPlatform<TMediaLocator = unknown> {
   readonly platformKind?: string
   readonly capabilities: PlatformCapabilities
-  /** Optional one-call media composition for platforms that supply PCM transport. */
   readonly voiceMedia?: VoiceCallMediaProvider
-  /** Optional source-platform call controls; call references remain transient. */
   readonly voiceCalls?: IMVoiceCallController
-  /** Optional platform-native shareable file-set creation. */
   readonly flashTransfer?: IMFlashTransferProvider
-  /** Optional expansion of finite archived message bundles embedded in messages. */
   readonly messageBundles?: IMMessageBundleProvider<TMediaLocator>
 
-  /** Resolve the platform's current user; bridge never invents profile fields. */
   getAccount?(): Promise<IMPlatformAccount<TMediaLocator>>
 
   subscribe(
@@ -846,10 +742,8 @@ export interface IMPlatform<TMediaLocator = unknown> {
   ): Promise<IMMessage<TMediaLocator>>
 
   /**
-   * Prepare a native upload from metadata available before Telegram sends any
-   * bytes. Returning undefined keeps the ordinary disk-backed part-upload
-   * fallback. A preparation with a sink keeps the native plan while Telegram
-   * continues upload.saveFilePart; a preparation without one is a cache hit.
+   * 在客户端上传分片前基于元数据准备原生上传。返回 `undefined` 则回退到磁盘暂存分片；
+   * 含 `sink` 则继续接收 `upload.saveFilePart`；无 `sink` 则表示秒传命中。
    */
   prepareMediaUpload?(
     session: PlatformSession,
@@ -858,18 +752,16 @@ export interface IMPlatform<TMediaLocator = unknown> {
   ): Promise<IMMediaUploadPreparation | undefined>
 
   getDialogs?(session: PlatformSession, query?: IMPageQuery): Promise<IMDialogPage<TMediaLocator>>
-  /** Resolve one opaque platform conversation, used for targeted metadata backfill. */
   getConversation?(
     session: PlatformSession,
     conversationId: string,
   ): Promise<IMConversation<TMediaLocator> | null>
-  /** Child conversations exposed lazily beneath one parent dialog, such as Discord guild channels. */
+  /** 父会话下按需暴露的子频道（如 Discord 服务器频道）。 */
   getSubdialogs?(
     session: PlatformSession,
     parent: IMConversationRef,
     query?: IMPageQuery,
   ): Promise<IMDialogPage<TMediaLocator>>
-  /** Address-book contacts. This is intentionally separate from recent dialogs. */
   getContacts?(session: PlatformSession, query?: IMPageQuery): Promise<IMUserPage<TMediaLocator>>
   getRequests?(session: PlatformSession, query?: IMRequestQuery): Promise<IMRequestPage<TMediaLocator>>
   resolveRequest?(
@@ -892,7 +784,6 @@ export interface IMPlatform<TMediaLocator = unknown> {
     conversation: IMConversationRef,
     query?: IMPageQuery & { folderId?: string },
   ): Promise<IMGroupFilePage<TMediaLocator>>
-  /** Resolve one opaque platform message, used for reply-target backfill. */
   getMessage?(
     session: PlatformSession,
     conversation: IMConversationRef,
@@ -907,11 +798,6 @@ export interface IMPlatform<TMediaLocator = unknown> {
     session: PlatformSession,
     target: IMReadTarget,
   ): Promise<void>
-  /**
-   * Send the platform's native poke (nudge) notice. The returned message is the
-   * notice the platform recorded, and it is optional: platforms may accept the
-   * poke without exposing a confirmed notice yet.
-   */
   sendPoke?(
     session: PlatformSession,
     conversation: IMConversationRef,
@@ -919,11 +805,7 @@ export interface IMPlatform<TMediaLocator = unknown> {
     count: number,
   ): Promise<IMMessage<TMediaLocator> | undefined>
 
-  /**
-   * Reverse-sync a conversation notification mask (e.g. QQ group message mask).
-   * Platforms that lack this concept leave it undefined; the bridge only calls
-   * it when the target conversation carries platform-native mask metadata.
-   */
+  /** 反向同步会话通知屏蔽策略（如 QQ 群消息屏蔽设置）。 */
   setConversationNotificationMask?(
     session: PlatformSession,
     conversationId: string,
@@ -981,11 +863,7 @@ export interface IMPlatform<TMediaLocator = unknown> {
     media: IMMedia<TMediaLocator>,
     options?: IMDownloadOptions,
   ): AsyncIterable<Uint8Array>
-  /**
-   * Resolve a short-lived direct download URL for the exact stored media.
-   * The bridge only calls this after authorizing the media against the current
-   * MTProto session; implementations must not return local/cache-only assets.
-   */
+  /** 解析供客户端直连的短期下载 URL，不得返回仅本地可达的资源。 */
   resolveMediaUrl?(
     session: PlatformSession,
     media: IMMedia<TMediaLocator>,
@@ -1036,12 +914,8 @@ export function messagePartText(part: IMMessagePart<unknown>): string {
 }
 
 /**
- * True when the platform delivered a service notice that the relay projects as
- * a Telegram `MessageService` instead of a regular message.
- *
- * QQ gray tips are sidecars of the message they accompany: QQ keeps them on
- * that message's `msgSeq`, and a recall that names a sidecar resolves to that
- * content message. A sidecar therefore never identifies a message by itself.
+ * 判断是否为投影成 Telegram `MessageService` 的系统提示消息。
+ * QQ 灰条挂在对应正文消息的 `msgSeq` 上，撤回灰条实际会撤回该正文消息，不能作为独立消息寻址。
  */
 export function isServiceMessage(
   message: Pick<IMProjectableMessage<unknown>, 'content'>,
@@ -1049,7 +923,6 @@ export function isServiceMessage(
   return message.content.serviceAction !== undefined && message.content.serviceAction !== null
 }
 
-/** Every platform user a service notice names, the actor first. */
 export function serviceActionMembers(
   action: IMMessageServiceAction | undefined | null,
 ): IMServiceMember[] {
@@ -1057,7 +930,6 @@ export function serviceActionMembers(
   return [...(action.actor ? [action.actor] : []), ...action.members]
 }
 
-/** Wording a service notice carries; empty for notices that only act. */
 export function serviceActionText(
   action: IMMessageServiceAction | undefined | null,
 ): string {

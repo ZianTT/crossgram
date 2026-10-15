@@ -11,19 +11,15 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 
 export interface ServerRsaKey {
-  /** PKCS#1 PEM ("BEGIN RSA PUBLIC KEY") — this is what clients are patched with. */
+  /** 客户端 patch 所用的 PKCS#1 PEM 公钥 */
   publicKeyPem: string
-  /** PKCS#8 PEM private key. */
+  /** PKCS#8 PEM 私钥 */
   privateKeyPem: string
-  /** Telegram key fingerprint: low 64 bits of SHA1(TL bytes(n) ++ TL bytes(e)), hex. */
+  /** Telegram 公钥指纹：SHA1(TL_bytes(n) ++ TL_bytes(e)) 低 64 位的 hex */
   fingerprint: string
-  /** Modulus n, hex. */
   modulus: string
-  /** Public exponent e, hex. */
   exponent: string
 }
-
-// ── bigint / byte helpers ───────────────────────────────────────────────────
 
 function bytesToBigIntBE(bytes: Uint8Array): bigint {
   let v = 0n
@@ -46,7 +42,7 @@ function bigIntToBytesN(v: bigint, n: number): Uint8Array {
   return out
 }
 
-/** TL `bytes` serialization: length prefix + data + padding to a 4-byte boundary. */
+/** TL bytes 编码：长度前缀 + 数据 + 4 字节对齐填充 */
 function tlBytes(data: Uint8Array): Uint8Array {
   let head: number[]
   let total: number
@@ -64,11 +60,7 @@ function tlBytes(data: Uint8Array): Uint8Array {
   return out
 }
 
-/**
- * Telegram RSA fingerprint = the low 64 bits of
- * SHA1( TL_bytes(modulus_BE) ++ TL_bytes(exponent_BE) ), formatted exactly as
- * mtcute does: `hex(reverse(sha1[-8]))` — a zero-padded 16-char hex string.
- */
+/** 计算 Telegram RSA 指纹：取 SHA1(TL_bytes(n) ++ TL_bytes(e)) 末尾 8 字节逆序后的 16 位 hex */
 function computeFingerprint(n: bigint, e: bigint): string {
   const serialized = new Uint8Array([...tlBytes(bigIntToBytesBE(n)), ...tlBytes(bigIntToBytesBE(e))])
   const sha = createHash('sha1').update(serialized).digest()
@@ -78,9 +70,6 @@ function computeFingerprint(n: bigint, e: bigint): string {
   return fp
 }
 
-// ── public API ──────────────────────────────────────────────────────────────
-
-/** Generate a fresh RSA-2048 key pair with its Telegram fingerprint. */
 export function generateRsaKeyPair(): ServerRsaKey {
   const { publicKey, privateKey } = generateKeyPairSync('rsa', {
     modulusLength: 2048,
@@ -101,7 +90,7 @@ export function generateRsaKeyPair(): ServerRsaKey {
   }
 }
 
-/** Load the key pair from `path` (JSON), or generate + persist it (and `<path>.pem`). */
+/** 从 JSON 路径加载密钥对；若不存在则生成并写入 JSON 与 `<path>.pem` */
 export function loadOrCreateRsaKeyPair(path: string): ServerRsaKey {
   if (existsSync(path)) {
     return JSON.parse(readFileSync(path, 'utf8')) as ServerRsaKey
@@ -113,11 +102,7 @@ export function loadOrCreateRsaKeyPair(path: string): ServerRsaKey {
   return key
 }
 
-/**
- * Raw RSA decryption (no padding): returns `ciphertext^d mod n` as a 256-byte
- * big-endian buffer. The MTProto DH handshake's `p_q_inner_data` is unpadded by
- * the caller (`server-authorization.ts`).
- */
+/** 裸 RSA 解密（无 padding），返回 256 字节大端 `ciphertext^d mod n`，外层负责去除 MTProto 填充 */
 export function rsaRawDecrypt(ciphertext: bigint, privateKeyPem: string): Uint8Array {
   const key = createPrivateKey(privateKeyPem)
   const input = Buffer.from(bigIntToBytesN(ciphertext, 256))
@@ -125,7 +110,7 @@ export function rsaRawDecrypt(ciphertext: bigint, privateKeyPem: string): Uint8A
   return new Uint8Array(out)
 }
 
-/** Generate a pq value: the product of two ~31-bit primes (pq < 2^63, factorizable). */
+/** 生成两个 31 位素数之积 pq（pq < 2^63，供客户端分解） */
 export function generatePq(): { pq: bigint, p: bigint, q: bigint } {
   let p = generatePrimeSync(31, { bigint: true }) as bigint
   let q = generatePrimeSync(31, { bigint: true }) as bigint

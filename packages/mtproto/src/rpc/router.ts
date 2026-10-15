@@ -15,7 +15,7 @@ async function rpcInvocationFiber(ctx: Context, config: RpcInvocationFiberConfig
   config.result = await dispatchRpcRoute(ctx as CordisServerRpcContext, config.request)
 }
 
-/** Register one method route as an effect owned by the calling Cordis fiber. */
+/** 在当前 Cordis fiber 上注册单个 RPC 方法路由 */
 export function registerRpcRoute(ctx: Context, method: string, handler: RpcHandler): () => boolean {
   return ctx.on('mtproto/rpc/method', function (this: CordisServerRpcContext, current, request) {
     if (current !== method) return
@@ -23,10 +23,9 @@ export function registerRpcRoute(ctx: Context, method: string, handler: RpcHandl
   }, { prepend: true })
 }
 
-/** Methods already reported as unimplemented, so each logs only once. */
+// 记录已告警的未实现方法，避免重复打印日志
 const warnedNotImplemented = new Set<string>()
 
-/** Run the Cordis middleware and method-route events for one normalized request. */
 export async function dispatchRpcRoute(
   ctx: CordisServerRpcContext,
   request: tl.RpcMethod,
@@ -51,10 +50,7 @@ export async function dispatchRpcRoute(
   }
 }
 
-/**
- * Normalize a decoded request and execute it inside a short-lived child fiber.
- * This is the only RPC invocation path used by the MTProto service and tests.
- */
+/** 解包请求并在临时子 fiber 中执行 RPC 调用 */
 export async function invokeRpc(
   owner: Context,
   source: ServerRpcContext,

@@ -2,7 +2,7 @@ import { createHash, pbkdf2 as nodePbkdf2, randomBytes, timingSafeEqual } from '
 import Long from 'long'
 import { bigint, u8 } from '@fuman/utils'
 
-/** Telegram's 2048-bit SRP prime (same safe prime as the MTProto DH exchange). */
+/** Telegram 2048 位 SRP 安全素数（与 MTProto DH 交换相同）。 */
 // eslint-disable-next-line style/max-len
 export const SRP_PRIME_HEX = 'C71CAEB9C6B1C9048E6C522F70F13F73980D40238E3E21C14934D037563D930F48198A0AA7C14058229493D22530F4DBFA336F6E0AC925139543AED44CCE7C3720FD51F69458705AC68CD4FE6B6B13ABDC9746512969328454F18FAF8C595F642477FE96BB2A941D5BCD1D4AC8CC49880708FA9B378E3C4F3A9060BEE67CF9A4A4A695811051907E162753B56B0F6B410DBA74D8A84B2A14B3144E0EF1284754FD17ED950D5965B4B9DD46582DB1178D169C6BC465B0D6FF9CA3928FEF5B9AE4E418FC15E83EBEA0F87FA9FF5EED70050DED2849F47BF959D956850CE929851F0D8115F635B105EE2E4E15D04B2454BF6F4FADF034B10403119CD8E3B92FCC5B'
 
@@ -12,25 +12,20 @@ const SRP_G_BYTES = (() => {
   const bytes = u8.alloc(256)
   bytes[255] = Number(SRP_G)
   return bytes
-})() // g serialized like the client serializes it: 256 bytes big-endian
+})() // 与客户端一致：g 按 256 字节大端序编码
 const SRP_P_BYTES = Buffer.from(SRP_PRIME_HEX, 'hex')
 const K = BigInt(`0x${createHash('sha256').update(SRP_P_BYTES).update(SRP_G_BYTES).digest('hex')}`)
 
 const sha256 = (data: Uint8Array) => createHash('sha256').update(data).digest()
 
-/** Verifier material stored on `mtproto_auth_session.passwordSrp`. */
 export interface SrpVerifier {
-  /** g^x mod p, 256-byte hex. */
+  /** g^x mod p，256 字节十六进制字符串。 */
   v: string
   salt1: string
   salt2: string
 }
 
-/**
- * Whether a stored `passwordSrp` value carries a usable verifier. Rows migrated
- * before the column existed hold the column default `'{}'`, which is truthy —
- * treat anything without all three hex fields as "no password configured".
- */
+/** 校验 `passwordSrp` 字段是否包含完整的验证子（旧记录迁移后的默认空对象 `{}` 视为未设置密码）。 */
 export function isValidSrpVerifier(value: unknown): value is SrpVerifier {
   if (value === null || typeof value !== 'object') return false
   const candidate = value as Record<string, unknown>
@@ -47,7 +42,7 @@ function fromU8(value: Uint8Array): bigint {
   return bigint.fromBytes(value)
 }
 
-// Mirrors mtcute's computePasswordHash (password.js) byte for byte:
+// 与 mtcute computePasswordHash 一致：
 // SH(d, s) = SHA256(s || d || s); x = SH(PBKDF2(SH(SH(pwd, s1), s2), s1, 100k, 64), s2)
 async function computePasswordHash(password: string, salt1: Uint8Array, salt2: Uint8Array): Promise<bigint> {
   const SH = (data: Uint8Array, salt: Uint8Array) => sha256(u8.concat3(salt, data, salt))
@@ -58,7 +53,6 @@ async function computePasswordHash(password: string, salt1: Uint8Array, salt2: U
   return fromU8(SH(stretched, salt2))
 }
 
-/** Generate the SRP verifier for a newly set (or replaced) login password. */
 export async function generateSrpVerifier(password: string): Promise<SrpVerifier> {
   const salt1 = randomBytes(32)
   const salt2 = randomBytes(16)
@@ -67,19 +61,16 @@ export async function generateSrpVerifier(password: string): Promise<SrpVerifier
   return { v: Buffer.from(to256(v)).toString('hex'), salt1: salt1.toString('hex'), salt2: salt2.toString('hex') }
 }
 
-/** In-flight server side of one SRP exchange, keyed by auth key id. */
 export interface SrpChallenge {
   srpId: Long
-  /** Server's private exponent for this exchange. */
   b: bigint
-  /** Server's public value `B = (k·v + g^b) mod p`. */
+  /** 服务端公钥 `B = (k·v + g^b) mod p`。 */
   B: bigint
   verifier: SrpVerifier
 }
 
 const CHALLENGE_TTL_MS = 5 * 60_000
 
-/** Bounded in-memory store of pending SRP challenges, one per auth key. */
 export class SrpChallengeStore {
   private readonly _entries = new Map<string, { challenge: SrpChallenge, expiresAt: number }>()
 
@@ -87,7 +78,6 @@ export class SrpChallengeStore {
 
   begin(authKeyId: string, verifier: SrpVerifier): SrpChallenge {
     this._prune()
-    // Random 256-byte private exponent, matching the client's `a` range.
     const b = fromU8(randomBytes(256))
     const B = (K * fromU8(Buffer.from(verifier.v, 'hex')) + bigint.modPowBinary(SRP_G, b, SRP_PRIME)) % SRP_PRIME
     const random = randomBytes(8)
@@ -123,16 +113,15 @@ export class SrpChallengeStore {
 
 export interface SrpCheckRequest {
   srpId: Long
-  /** Client's public value `A`, 256 bytes. */
+  /** 客户端公钥 `A`（256 字节）。 */
   A: Uint8Array
-  /** Client's proof `M1`, 32 bytes. */
+  /** 客户端证明 `M1`（32 字节）。 */
   M1: Uint8Array
 }
 
 /**
- * Verify the client's SRP proof for a challenge we issued. Consumes nothing:
- * callers delete the challenge on success so a retry after failure reuses the
- * same B (the client retries with the same getPassword data).
+ * 校验客户端 SRP 证明。
+ * 不主动清理 challenge，由调用方在验证通过后删除，确保验证失败后客户端重试可继续复用同一个 `B`。
  */
 export function verifySrpChallenge(challenge: SrpChallenge, request: SrpCheckRequest): boolean {
   if (!request.srpId.eq(challenge.srpId)) return false

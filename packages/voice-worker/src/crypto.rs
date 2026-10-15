@@ -1,4 +1,4 @@
-//! Telegram call cryptographic primitives. Secret values never implement `Debug`.
+//! Telegram 通话加密原语（密钥类型均不实现 `Debug`）。
 
 use std::fs::File;
 use std::io::Read;
@@ -43,7 +43,6 @@ impl Drop for SecretBytes {
 pub struct DhPrivate(SecretBytes);
 
 impl DhPrivate {
-    /// Generates a full-width private exponent from the operating system CSPRNG.
     pub fn generate() -> Result<Self, CryptoError> {
         let mut bytes = [0; DH_PUBLIC_BYTES];
         if File::open("/dev/urandom")
@@ -75,11 +74,7 @@ pub enum CryptoError {
     HashMismatch,
 }
 
-/// Returns Telegram's fixed, audited 2048-bit safe prime.
-///
-/// The protocol only accepts this exact standard safe-prime group. Equality to the
-/// published Telegram constant is the safe-prime validation; accepting arbitrary
-/// probable primes would permit an unaudited group.
+/// Telegram 固定的 2048 位安全素数（协议只接受该常量子群，直接做常量相等校验）。
 #[must_use]
 pub fn telegram_dh_prime() -> U2048 {
     TELEGRAM_DH_PRIME.get_copy()
@@ -171,8 +166,7 @@ pub fn derive_shared_key(
     Ok(secret)
 }
 
-/// Telegram's key fingerprint is transmitted as a TL `long`: the final eight
-/// SHA-1 bytes are raw little-endian bytes and may represent a negative `i64`.
+/// Telegram 密钥指纹：取 SHA-1 末尾 8 字节作为小端序 `long`（`i64`）。
 #[must_use]
 pub fn key_fingerprint_bytes(auth_key: &[u8]) -> [u8; 8] {
     let mut digest = Sha1::digest(auth_key);
@@ -221,8 +215,6 @@ impl KdfRole {
     }
 }
 
-/// Derives call AES-256 key/IV material from a 16-byte message key and the
-/// 256-byte call auth key for a protocol-defined traffic direction.
 pub fn derive_call_kdf(
     message_key: &[u8; 16],
     auth_key: &SecretBytes,

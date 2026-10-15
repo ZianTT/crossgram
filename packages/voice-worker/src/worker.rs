@@ -1,4 +1,4 @@
-//! Single-call coordinator. No media backend receives key material.
+//! 单路通话协调器。
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -18,8 +18,7 @@ use crate::ipc::{
 pub const AUTH_KEY_BYTES: usize = 256;
 pub const MAX_OUTBOUND_EVENTS: usize = 16;
 
-/// Worker-private configuration consumed by a backend only after a successful
-/// Telegram DH completion. The key is never serialized back to the bridge.
+/// Telegram DH 握手完成后传给媒体后端的配置（`auth_key` 仅保留在 worker 进程内）。
 pub struct MediaStartConfig {
     pub call_id: u64,
     pub server: IpcMediaStartConfig,
@@ -81,8 +80,6 @@ pub trait MediaBackend {
     type Pcm;
 
     fn start(&mut self, config: MediaStartConfig) -> Result<Self::Handle, MediaError>;
-    /// Returns one copied native event. Implementations must retain no secret
-    /// callback memory after this call returns.
     fn poll_event(&mut self) -> Result<Option<MediaEvent>, MediaError> {
         Ok(None)
     }
@@ -91,7 +88,6 @@ pub trait MediaBackend {
         handle: &mut Self::Handle,
         signal: &[u8],
     ) -> Result<(), MediaError>;
-    /// Opens both fixed-format PCM directions for an already-active call.
     fn attach_pcm(&mut self, handle: &mut Self::Handle) -> Result<Self::Pcm, MediaError>;
     fn send_pcm(
         &mut self,
@@ -109,8 +105,6 @@ pub trait MediaBackend {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MediaError;
 
-/// Production placeholder until a real media backend is linked. It deliberately
-/// refuses to start media, so no completed handshake can become active by accident.
 pub struct UnavailableMediaBackend;
 
 impl MediaBackend for UnavailableMediaBackend {
@@ -228,11 +222,8 @@ impl<B: MediaBackend> VoiceWorker<B> {
         }
     }
 
-    /// Handles one local IPC request. All returned variants are public-only.
     pub fn handle(&mut self, request: Request) -> Response {
-        // Active calls use the same TTL as an inactivity guard, not as an
-        // absolute call-duration limit. PCM and signaling requests arrive
-        // continuously while a call is healthy and refresh this timestamp.
+        // 活跃通话将 TTL 作为空闲超时：正常通话期间持续到达的 PCM 与信令请求会不断刷新时间戳。
         self.refresh_active(request.call_id());
         self.expire();
         self.collect_native_events();
@@ -345,7 +336,6 @@ impl<B: MediaBackend> VoiceWorker<B> {
         }
     }
 
-    /// Stops the active backend handle exactly once and drops all call secrets.
     pub fn teardown(&mut self) {
         self.events.clear();
         self.last_acked_event = None;
@@ -636,12 +626,10 @@ impl<B: MediaBackend> VoiceWorker<B> {
         };
         let is_error = matches!(&event, MediaEvent::NativeError);
         if is_error {
-            // A terminal native failure must not be lost behind queued signaling.
-            // Clearing the queue drops and zeroizes every evicted signal.
+            // 原生致命错误优先于排队的信令事件，直接清空队列（各条目 drop 时清零）。
             self.events.clear();
             self.last_acked_event = None;
         } else if self.events.len() == MAX_OUTBOUND_EVENTS {
-            // Dropping `event` zeroizes the rejected native signal.
             return;
         }
         let event_id = self.next_event_id;
@@ -652,7 +640,6 @@ impl<B: MediaBackend> VoiceWorker<B> {
             event,
         });
         if is_error {
-            // Preserve only the terminal error until its explicit acknowledgement.
             self.teardown_media();
         }
     }

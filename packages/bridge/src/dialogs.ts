@@ -49,7 +49,7 @@ type GetPeerDialogsRequest = tl.messages.RawGetPeerDialogsRequest
 type GetHistoryRequest = tl.messages.RawGetHistoryRequest
 type GetMessagesRequest = tl.messages.RawGetMessagesRequest
 type GetChannelMessagesRequest = Omit<tl.channels.RawGetMessagesRequest, 'id'> & {
-  /** Official Telegram Android's #93d7b347 request uses Vector<int>. */
+  /** 官方 Telegram Android 的 `#93d7b347` 请求使用 `Vector<int>`。 */
   id: Array<tl.TypeInputMessage | number>
 }
 type SendMessageRequest = tl.messages.RawSendMessageRequest
@@ -87,19 +87,10 @@ type MentionReadPublisher = (
   excludeConnection?: ServerConnection,
 ) => Promise<{ pts: number, ptsCount: number }>
 
-// Crossgram clients consume updateMessageID(id=0) as an explicit acknowledgement
-// that the local message for this random ID was intentionally cancelled. Telegram
-// message IDs are strictly positive, so zero is a wire-compatible sentinel that
-// does not require a private TL constructor.
+// 客户端将 `updateMessageID(id=0)` 视为取消对应 `randomId` 占位消息的确认信号（合法消息 ID 均大于 0）。
 export const CANCELLED_MESSAGE_ID = 0
 
-/**
- * Entry ceiling for the per-device message id indexes. One message can occupy
- * up to three `_messageToTl` keys (primary, source alias, QQ sequence) plus one
- * `_tlToMessage` and one `_messageOutgoingByTl` entry, so this bounds the three
- * maps at roughly 60-70 MiB together instead of the gigabytes an unbounded
- * device accumulated over a week.
- */
+/** 单设备消息 ID 索引上限（每条消息最多占 3 个 `_messageToTl` 键及各 1 个反向索引项，总内存约 60–70 MiB）。 */
 const MAX_CACHED_MESSAGE_INDEX_ENTRIES = 200_000
 
 
@@ -108,7 +99,7 @@ interface MessageRef {
   platformMessageId: string
   ordinal: number
   nativeSequence?: string
-  /** True for service notices: reply targets that QQ resolves through the message they accompany. */
+  /** 标记系统提示（QQ 回复灰条时需重解析到同序号的正文消息）。 */
   service?: boolean
 }
 
@@ -116,7 +107,7 @@ interface MaterializedMessage {
   source: IMMessage
   tlId: number
   ordinal: number
-  /** Durable `mtproto_im_message` row id when the source is stored. */
+  /** 持久化 `mtproto_im_message` 行 ID。 */
   storedMessageId?: number
   groupedId?: string
   media?: IMMediaRow
@@ -146,7 +137,7 @@ interface QQGroupMsgMaskPolicy {
   folderId: 0 | 1
 }
 
-/** Preserve system-peer metadata so direct bridge bots retain bot/usernames after hydration. */
+/** 保留 `metadata` 使内置系统 bot 在加载后仍具备 `bot` 标记与用户名。 */
 function directConversationUser(conversation: IMConversation): IMUser {
   return {
     id: conversation.id,
@@ -169,11 +160,7 @@ const QQ_GROUP_MSG_MASK = {
   RECEIVE: 4,
 } as const
 
-/**
- * QQ is authoritative for group masks: NOTIFY stays in the main list, ASSISTANT
- * moves to Archive, and RECEIVE stays in the main list without notification.
- * UNSPECIFIED and SHIELD deliberately leave local Telegram state untouched.
- */
+/** QQ 群消息提醒策略映射：`NOTIFY` 留主列表，`ASSISTANT` 进归档，`RECEIVE` 留主列表且静音；其余保持本地状态。 */
 const QQ_GROUP_MSG_MASK_POLICIES: Readonly<Record<number, QQGroupMsgMaskPolicy>> = {
   [QQ_GROUP_MSG_MASK.NOTIFY]: { muteUntil: 0, folderId: 0 },
   [QQ_GROUP_MSG_MASK.ASSISTANT]: { muteUntil: MUTE_FOREVER, folderId: 1 },
@@ -208,35 +195,24 @@ export interface BlockedPeerRpcChange extends BlockedPeerChange {
   userId: number
 }
 
-/** `crossgram.getFeatures` request for one conversation. */
 export interface GetFeaturesRequest {
   peer: tl.TypeInputPeer
 }
 
-/** `crossgram.sendPoke` request. */
 export interface SendPokeRequest {
   peer: tl.TypeInputPeer
   userId: tl.TypeInputUser
   count: number
 }
 
-/** Feature payload of `crossgram.getFeatures`, serialized as a `dataJSON` string. */
 export interface CrossgramFeatures {
-  /**
-   * Native poke support for the requested peer. Absent on official Telegram
-   * servers, on platforms without pokes, and for peers that cannot be poked,
-   * which is exactly what keeps the client entry hidden there.
-   */
+  /** 当前会话若支持原生戳一戳则返回该字段，缺省时客户端隐藏入口。 */
   poke?: {
-    /** Largest burst one `crossgram.sendPoke` call may send. */
     maxCount: number
   }
 }
 
-/**
- * Per-authorized-session bridge for dialog/history RPCs. Telegram's numeric
- * peer/message IDs are allocated here and reverse-mapped to opaque platform IDs.
- */
+/** 单个授权会话的对话与历史消息 RPC 处理器，负责 Telegram 数字 ID 与平台字符串 ID 的双向映射。 */
 export class DialogRpc {
   private static readonly PEER_HYDRATION_TTL_MS = 5_000
   private static readonly REACTION_REFRESH_FAILURE_COOLDOWN_MS = 30_000
@@ -270,9 +246,7 @@ export class DialogRpc {
   private readonly _storedUsers = new Map<string, IMUser<any>>()
   private readonly _platformUsers = new Map<string, IMUser<any>>()
   private readonly _pendingPlatformUsers = new Map<string, Promise<IMUser<any> | null>>()
-  /** Platform user IDs from the latest authoritative contacts snapshot. */
   private readonly _contactUserIds = new Set<string>()
-  /** Whether the address book has been loaded for this RPC instance. */
   private _contactsHydrated = false
   private _contactsHydration?: Promise<void>
   private readonly _topicToConversation = new Map<number, string>()
@@ -282,7 +256,6 @@ export class DialogRpc {
   private readonly _pendingMemberPages = new Map<string, Promise<void>>()
   private readonly _searchCursors = new Map<string, SearchCursorState>()
   private readonly _reactionRefreshFailures = new Map<string, number>()
-  // ponytail: session-wide queue; use per-peer queues only if folder edit throughput matters.
   private _folderEditQueue = Promise.resolve()
   private readonly _actions: PlatformMessageActions
   private _peersHydratedAt = 0
@@ -314,7 +287,6 @@ export class DialogRpc {
       excludeAuthKeyId?: string,
     ) => Promise<void>,
     private readonly _notificationSettings?: NotificationSettingsStore,
-    /** Canonical persisted Telegram ID for this authorized platform user. */
     private readonly _authenticatedSelfId?: number,
     private readonly _blockedPeers?: BlockedPeerStore,
     private readonly _dialogFolders?: DialogFolderStore,
@@ -322,15 +294,7 @@ export class DialogRpc {
     private readonly _messageProjection?: MessageProjectionPipeline,
   ) {
     this._actions = new PlatformMessageActions(_platform, _session)
-    // These three maps index the messages a device has touched. They are a
-    // synchronous cache in front of the durable `mtproto_tl_message_part`
-    // table, and every read path already falls back to `MessageStore` on a
-    // miss, so a store-backed instance can drop its oldest entries: without a
-    // bound they grow with every message the device ever sees and never shrink,
-    // which is how the 7-day production run reached ~1.4 GiB of anonymous
-    // memory. A storeless instance keeps them complete — it has no durable
-    // table to fall back to, and `_messageId` must not hand out an id it has
-    // already used earlier in the same process.
+    // 有 `MessageStore` 时淘汰旧条目并由数据库兜底；无存储模式不可淘汰，避免重用已分配的 ID。
     const messageIndexLimit = store ? MAX_CACHED_MESSAGE_INDEX_ENTRIES : Number.POSITIVE_INFINITY
     this._messageToTl = new BoundedMap(messageIndexLimit)
     this._tlToMessage = new BoundedMap(messageIndexLimit)
@@ -347,10 +311,7 @@ export class DialogRpc {
   async getDialogs(req: GetDialogsRequest): Promise<tl.messages.TypeDialogs> {
     const startedAt = performance.now()
     await this._hydrateUsers()
-    // Telegram evaluates the `contacts` flag of dialog filters from the user
-    // objects returned alongside dialogs.  Do not rely on the client calling
-    // contacts.getContacts first: Android commonly requests dialogs while
-    // constructing folders, before it has refreshed the address book.
+    // 客户端按随对话返回的 `user.contact` 评估分组过滤规则，且 Android 构建分组时未必先调 `contacts.getContacts`。
     await this._ensureContactsHydrated()
     const hydrateMs = performance.now() - startedAt
     const requestedOffsetPeer = req.offsetPeer._ === 'inputPeerEmpty'
@@ -369,17 +330,12 @@ export class DialogRpc {
       limit: clampLimit(req.limit) + 1,
       afterId: requestedOffsetPeer,
     }
-    // Android omits folder_id for its global dialog feed and expects archived
-    // rows to remain in that page (with dialog.folder_id=1). Removing them makes
-    // a short page look like end-of-list, so the client never requests page 2.
-    // Explicit folder 0/1 requests are folder-scoped and still need filtering.
+    // Android 拉取全局对话列表时不传 `folder_id`，并期望归档会话带 `dialog.folder_id=1` 一并返回；
+    // 若过滤掉会导致单页不满，被客户端误判为已到底而不再翻页。显式传 0/1 时才按文件夹过滤。
     const unscoped = folderId === undefined
       ? await this._loadDialogPage(query)
       : undefined
-    // QQ masks can move an assistant group outside the first native page, so
-    // QQ always scans its effective folder before returning a scoped request.
-    // Other platforms retain the native main-list pagination fast path unless
-    // a page-level override or a durable archive row requires filtering.
+    // QQ 群消息屏蔽可将群移入归档，需始终按实际文件夹扫描；其他平台在无归档覆盖时直接走原生分页。
     const initialMain = !unscoped && this._platform.platformKind !== 'qq' && folderId === 0 && !archivedPeerIds.size
       ? await this._loadDialogPage(query)
       : undefined
@@ -389,12 +345,7 @@ export class DialogRpc {
       ? initialMain
       : await this._loadDialogFolderPage(query, folderId as 0 | 1, archivedPeerIds))
     const loadMs = performance.now() - loadAt
-    // Preserve the platform's authoritative order. Re-sorting each page makes
-    // Telegram's last offset peer point into the middle of the upstream page,
-    // causing the next request to overlap or repeat the first page.
-    // Pinned dialogs never appear in the paginated stream: clients either load
-    // them through getPinnedDialogs (exclude_pinned) or receive them ahead of
-    // the first page, as Telegram does.
+    // 保持上游顺序以免末尾 offsetPeer 错位；置顶会话不混入分页流（在首屏前置返回或由 getPinnedDialogs 单独拉取）
     const pinnedPeerIds = new Set(await this._dialogFolders?.pinnedPeerIds(
       this._session.platformSessionId,
     ) ?? [])
@@ -421,11 +372,7 @@ export class DialogRpc {
       this._peerId(dialog.conversation.id)
     }
 
-    // PlatformDataService has already persisted any previews exposed by
-    // getDialogs. Never fan a stored dialog-list request out into upstream
-    // history calls, including for rows whose platform preview is temporarily
-    // absent during cold start. The no-store path still allocates Telegram IDs
-    // oldest-first from history.
+    // 有存储时 `PlatformDataService` 已持久化会话预览，不可再向上游并发拉取历史消息；无存储模式仍需从历史按序分配 ID。
     if (!this._store) await Promise.all(all.map((dialog) => this._loadHistory(dialog.conversation.id)))
     const projectionsAt = performance.now()
     const dialogProjections = new Map<string, MaterializedMessage[]>()
@@ -438,12 +385,7 @@ export class DialogRpc {
       const projected = await this._store.readProjectedByPlatformIds(
         this._session.platformSessionId, targets,
       )
-      // A dialog preview can point at a persisted message whose sender is not
-      // the sender from the current upstream preview (for example after a
-      // recovery or duplicate dialog row was reconciled). Load every sender
-      // referenced by the actual projected source before materialization;
-      // otherwise projectTlMessage() can call _userId() for an unmapped user
-      // even though its durable row already exists.
+      // 数据库中的消息发送者可能与上游最新预览不同，需在投影前同步其持久化的用户映射。
       await this._syncStoredUsers(projected.flatMap(({ source }) => messageReferencedUserIds(source)))
       for (const stored of projected) {
         const materialized = stored.parts.map((part): MaterializedMessage => ({
@@ -512,11 +454,6 @@ export class DialogRpc {
     return result as unknown as tl.messages.TypeDialogs
   }
 
-  /**
-   * Source of one durable message row of this session.  Virtual features that
-   * address their peers by stored message use it to rebuild those peers after
-   * a restart instead of keeping a process-local registry.
-   */
   async readStoredMessage(storedMessageId: number): Promise<IMMessage | undefined> {
     return this._store?.readMessageByRowId(this._session.platformSessionId, storedMessageId)
   }
@@ -717,9 +654,7 @@ export class DialogRpc {
       let entities = req.entities
       let richMessage: tl.RawRichMessage | undefined
       if (req.richMessage) {
-        // An article draft keeps the article itself: the client reopens it in
-        // its editor. Its media is materialised now and pruned again on read if
-        // the relay can no longer serve the bytes.
+        // 图文草稿保留结构供编辑器重新打开；读取时若暂存媒体已失效会自动剔除。
         const conversion = await convertRichMessage(
           req.richMessage,
           (reference) => this._resolveDraftMedia(reference),
@@ -1011,11 +946,7 @@ export class DialogRpc {
     const requestedLimit = clampLimit(req.limit)
     const start = Math.max(0, req.addOffset)
     const target = Math.max(1, requestedLimit + start)
-    // Native QQ search already applies the text query for an unfiltered
-    // request.  Requesting a fixed 200-item page in that case makes common
-    // CJK terms fan out into hundreds of durable projections before Telegram
-    // only needs the first result.  Keep the broad page for bridge-side
-    // filters, where sparse native pages are still required for correctness.
+    // 无附加过滤条件时 QQ 原生搜索已按关键词过滤，按需请求条数即可；有 bridge 侧过滤条件时拉满 200 条以防稀疏命中漏结果。
     const upstreamPageLimit = req.filter._ === 'inputMessagesFilterEmpty' &&
       !req.fromId && req.minDate === 0 && req.maxDate === 0
       ? Math.min(200, target)
@@ -1032,8 +963,6 @@ export class DialogRpc {
       const query = {
         query: req.q,
         cursor: upstreamCursor,
-        // Broad pages prevent sparse bridge-side filters (especially links
-        // and video subtypes) from stopping at unrelated native results.
         limit: upstreamPageLimit,
         fromUserId,
         minTimestamp: req.minDate > 0 ? req.minDate : undefined,
@@ -1119,10 +1048,7 @@ export class DialogRpc {
           output.push(item)
         }
       }
-      // PlatformDataService persists search hits before this method reads their
-      // projections. A fresh DialogRpc still needs those durable user rows in
-      // its process-local ID maps before message entities and reactions can be
-      // projected. History reads already perform the same hydration step.
+      // 投影消息实体与表情回应前，先将数据库中的用户映射同步到当前实例。
       await this._syncStoredUsers([
         peerId,
         ...output.flatMap(({ source }) => messageReferencedUserIds(source)),
@@ -1361,11 +1287,7 @@ export class DialogRpc {
     }
   }
 
-  /**
-   * Stored pinned dialogs of one folder (or all folders), in pinned order.
-   * Dialogs already loaded by the caller are reused; the rest come from the
-   * message store, so a pin survives the dialog scrolling off the first page.
-   */
+  /** 按置顶顺序读取指定文件夹的置顶会话（未在当前页中的会话从 MessageStore 补齐） */
   private async _pinnedDialogs(
     folderId: 0 | 1 | undefined,
     archivedPeerIds: ReadonlySet<string>,
@@ -1411,13 +1333,10 @@ export class DialogRpc {
       this._contactUserIds.clear()
       for (const user of resolvedUsers) {
         this._contactUserIds.add(user.id)
-        // QQ dialogs are keyed by UID, but legacy/resolved conversations can
-        // still be keyed by numeric UIN. Keep both forms contact-aware.
+        // 兼容以 UID 或数字 UIN 作为会话键的 QQ 联系人识别。
         const numericId = user.metadata?.qq
         if (typeof numericId === 'string' && numericId) this._contactUserIds.add(numericId)
       }
-      // A previous projection may have cached the same user as a non-contact,
-      // or a removed friend as a contact. Rebuild it from this snapshot.
       this._peerUsers.clear()
       users = resolvedUsers.map((user) => {
         this._conversations.set(user.id, { id: user.id, kind: 'direct', title: user.firstName })
@@ -1454,8 +1373,6 @@ export class DialogRpc {
     try {
       await pending
     } catch (error) {
-      // Contact metadata is advisory for dialog projection.  A transient QQ
-      // buddy-list failure must not make the entire dialogs RPC unavailable.
       this._onTrace?.('contacts hydration failed: %s', String(error))
     } finally {
       if (this._contactsHydration === pending) this._contactsHydration = undefined
@@ -1614,8 +1531,6 @@ export class DialogRpc {
       try {
         profile = await this._getPlatformUser(peerId) ?? undefined
       } catch {
-        // Extended profile data is optional. A transient profile lookup must
-        // not make an otherwise resolvable users.getFullUser request fail.
       }
     }
     const about = profile?.about
@@ -1630,15 +1545,7 @@ export class DialogRpc {
         ...(about !== undefined ? { about } : {}),
         settings: { _: 'peerSettings' },
         notifySettings: await this._peerNotifySettings(peerId ?? this._session.userId),
-        // Bots share the `bot_info_version` flag slot with `bot` in the `user`
-        // object, and clients only treat a bot's info as loaded once
-        // `userFull.bot_info` arrives: Telegram Desktop's
-        // `HistoryInner::refreshAboutView` re-requests the whole full user on
-        // every `FullInfo` update while `BotInfo::inited` is false, which loops
-        // at round-trip speed for as long as the bot chat stays open. Each of
-        // those replies also re-applies `userFull.notify_settings`, so a mute
-        // the client has not flushed yet is reverted before
-        // `account.updateNotifySettings` is sent.
+        // 缺少 `userFull.bot_info` 会使 Telegram Desktop 将 `BotInfo::inited` 保持为 false，在聊天打开期间死循环请求 `users.getFullUser` 并回滚未提交的静音设置。
         ...(user._ === 'user' && user.bot === true ? { botInfo: makeBotInfo(about) } : {}),
         commonChatsCount: 0,
       },
@@ -1851,10 +1758,7 @@ export class DialogRpc {
         users: page.members.map((member) => this._makeMemberUser(member)),
       }
     }
-    // Telegram applies offset/limit after filtering. Since the platform API is
-    // cursor-paged and has no filtered-list primitive, scan the bounded member
-    // snapshot before slicing so Android can find mention/search candidates
-    // beyond QQNT's first native page.
+    // 平台接口不支持服务端过滤，需先扫描有界成员快照再按 `offset`/`limit` 切片。
     let members = await this._allMembers(conversation.id)
     if (req.filter._ === 'channelParticipantsAdmins') {
       members = members.filter((member) => member.role === 'owner' || member.role === 'administrator')
@@ -1982,9 +1886,7 @@ export class DialogRpc {
       const button = projected.source.content.inlineKeyboard?.rows
         .flatMap((row) => row.buttons)
         .find((candidate) => candidate.type === 'callback' && candidate.data === data)
-      // Terminal provider messages deliberately remove buttons. Clients may
-      // retry the original callback, so providers validate their terminal
-      // state while pending rows must still have rendered callback data.
+      // 已完结的系统会话消息会移除按钮，允许客户端重试交给 provider 校验终态；仍有键盘的消息则必须匹配按钮。
       if (!button && projected.source.content.inlineKeyboard) throw new RpcError(400, 'DATA_INVALID')
       try {
         const answer = await this._systemPeers!.callback(this._session, systemPeer, {
@@ -2027,8 +1929,7 @@ export class DialogRpc {
       }
     }
     if (!this._platform.clickInlineButton) throw new RpcError(400, 'BOT_RESPONSE_TIMEOUT')
-    // Channel message ids are only unique per channel: the same TL id names
-    // unrelated messages in other groups, so resolve it inside this peer.
+    // 频道消息 ID 仅在频道内唯一，需限定在当前会话中解析。
     const remembered = this._tlToMessage.get(req.msgId)
     const peerProjection = remembered && this._belongsToDisplayPeer(remembered.peerId, conversationId)
       ? undefined
@@ -2128,15 +2029,10 @@ export class DialogRpc {
     channel?: tl.TypeInputChannel,
   ): Promise<tl.messages.RawAffectedMessages> {
     if (!this._store) throw new RpcError(500, 'MESSAGE_STORE_UNAVAILABLE')
-    // Telegram Android periodically sends empty channel deletions as a cleanup
-    // probe. Treating them like real deletes refreshes every dialog and then
-    // tries to reserve zero PTS, causing a retry storm that competes with user
-    // sends. An empty vector is a successful no-op and must not touch upstream.
+    // Telegram Android 会定期发送空 `id` 列表的删除探测；直接返回空结果，避免全量刷新对话或预留 0 个 pts。
     if (!req.id.length) {
       return this._emptyDeleteResult(channel)
     }
-    // Message ownership and action policy must be evaluated against a fresh
-    // upstream preview rather than the short-lived read-side peer cache.
     await this._hydratePeers(true)
     const expectedConversation = channel ? this._resolveChannel(channel).id : undefined
     const grouped = new Map<string, Array<{
@@ -2164,20 +2060,13 @@ export class DialogRpc {
       const conversation = this._conversation(conversationId)
       const policy = this._platform.capabilities.messageActions?.delete
       const now = Math.floor(Date.now() / 1000)
-      // A service notice is a relay-side rendering of an upstream sidecar: QQ
-      // keeps it on the msgSeq of the message it accompanies and resolves a
-      // recall that names the sidecar to that content message, so forwarding one
-      // upstream would delete an unrelated message. Notices are therefore removed
-      // from this relay only, and they are always removable because they are not
-      // the platform's messages.
+      // QQ 灰条与所依附的正文消息共用 `msgSeq`，向上游转发撤回会误删正文消息，因此仅在本地移除。
       const notices = targets.filter(({ source }) => isServiceMessage(source))
       const messages = targets.filter(({ source }) => !isServiceMessage(source))
       const canDeleteAny = messages.length ? await this._canDeleteAnyMessage(conversationId) : false
       const allowed = messages.every(({ source }) => {
         const own = source.outgoing || source.senderId === this._session.userId
-        // QQ administrators can recall older messages from other members. The
-        // adapter still controls whether deletion is supported at all, while
-        // the regular-member age limit remains in force.
+        // 群管理员撤回他人消息不受普通成员撤回时限约束。
         const rule = own || !canDeleteAny ? (own ? policy?.own : policy?.others) : {
           supported: policy?.others?.supported ?? false,
         }
@@ -2201,9 +2090,7 @@ export class DialogRpc {
       }
       if (notices.length) {
         const messageIds = [...new Set(notices.map((target) => target.source.id))]
-        // Publishing through the durable update pipeline removes the notices for
-        // every session and journals the deletion, which a relay-local removal
-        // could not do on its own.
+        // 经 update 管道删除并记入日志，确保同一账号的所有会话同步移除该提示。
         const published = this._onLocalEvent
           ? await this._onLocalEvent(this._session, {
               type: 'message-delete',
@@ -2223,9 +2110,6 @@ export class DialogRpc {
       }
     }
     const ptsCount = affected.size
-    // Deleting stale or already-deleted Telegram ids is idempotent. No rows
-    // changed, so keep the current PTS instead of attempting to reserve zero
-    // entries (which is invalid and previously triggered a client retry storm).
     if (!ptsCount) return this._emptyDeleteResult(channel)
     const pts = await this._reservePts(
       ptsCount,
@@ -2275,10 +2159,7 @@ export class DialogRpc {
     const editUploads: UploadedFile[] = []
     let content: IMMessageInput
     if (req.richMessage) {
-      // An edit that replaces an article is relayed as a replacement message,
-      // and only one physical upstream message can be replaced: refuse an
-      // article whose target upstream split into several messages rather than
-      // leaving the extras behind.
+      // 撤回重发一次只能替换一条上游物理消息，禁止编辑已被拆分为多条的消息。
       if ((projected.source.sourceIds?.length ?? 1) > 1) {
         throw new RpcError(400, 'MESSAGE_EDIT_UNSUPPORTED')
       }
@@ -2315,7 +2196,6 @@ export class DialogRpc {
     } catch (error) {
       this._throwMessageAction(error, 'MESSAGE_EDIT_FORBIDDEN')
     }
-    // The replacement message consumed the staged uploads of a rich edit.
     await Promise.all(editUploads.map((upload) => this._uploads?.complete(upload)))
     const conversation = this._conversation(conversationId)
     const source: IMMessage<any> = {
@@ -2348,8 +2228,6 @@ export class DialogRpc {
         { type: 'message', conversation, message: source },
         delivery,
       )
-      // The requester receives the same durable PTS-bearing updates as the
-      // observer sockets, but in the edit RPC response instead of as a push.
       const payloads = [deleted, replacement]
         .map((published) => published as tl.RawUpdates | undefined)
         .filter((payload): payload is tl.RawUpdates => payload?._ === 'updates')
@@ -2497,9 +2375,7 @@ export class DialogRpc {
     const projectedCount = payload.updates.filter((update) =>
       update._ === 'updateNewMessage' || update._ === 'updateNewChannelMessage').length
     const confirmed = this._withMessageIds(payload, req.randomId.slice(0, projectedCount))
-    // Native platforms may coalesce several forwarded inputs into fewer outputs.
-    // Confirm every unpaired random ID as cancelled so patched Telegram clients
-    // remove their local placeholders instead of converting them to send errors.
+    // 平台可能将多条转发合并为更少的消息；未配对的 `randomId` 标记为已取消，让客户端移除本地占位消息。
     for (const randomId of req.randomId.slice(projectedCount)) {
       confirmed.updates.push({ _: 'updateMessageID', id: CANCELLED_MESSAGE_ID, randomId })
     }
@@ -2632,9 +2508,7 @@ export class DialogRpc {
       }
     }
     if (req.location._ === 'inputPeerPhotoFileLocation') {
-      // Persisted avatar locators can outlive QQ CDN credentials or predate
-      // newer locator fields (for example avatarUin). Refresh the peer first,
-      // then fall back to the cached projection when upstream is unavailable.
+      // 持久化的头像 locator 可能已过期，优先向上游刷新 peer，失败再回退到本地缓存。
       const media = await this._resolveAvatarMedia(req.location.peer, req.location.photoId)
         ?? this._avatarMedia.get(req.location.photoId.toString())
       if (!media || !this._platform.downloadMedia) throw new RpcError(400, 'LOCATION_INVALID')
@@ -2764,13 +2638,6 @@ export class DialogRpc {
     return directDownloadJSON(resolved)
   }
 
-  /**
-   * Advertise what this account's platform supports for one peer.
-   *
-   * Clients ask before rendering a platform-specific action. An official
-   * Telegram server rejects the unknown method, so the caller keeps the action
-   * hidden instead of sending one that cannot work.
-   */
   async getFeatures(req: GetFeaturesRequest): Promise<tl.RawDataJSON> {
     const features: CrossgramFeatures = {}
     const poke = this._platform.capabilities.poke
@@ -2784,12 +2651,6 @@ export class DialogRpc {
     return featuresJSON(features)
   }
 
-  /**
-   * Send a native poke (nudge) notice through the platform.
-   *
-   * The poke is a platform action, so the notice it produces is published to
-   * every session instead of being an optimistic local message.
-   */
   async sendPoke(req: SendPokeRequest): Promise<tl.TlObject> {
     const poke = this._platform.capabilities.poke
     if (!poke || poke.maxCount <= 0 || !this._platform.sendPoke) {
@@ -2919,8 +2780,6 @@ export class DialogRpc {
           try {
             media = (await this._backfillConversation(conversationId))?.avatar
           } catch {
-            // A missing or temporarily unavailable upstream avatar remains a
-            // normal LOCATION_INVALID response and may be retried later.
           }
         }
       }
@@ -3264,10 +3123,7 @@ export class DialogRpc {
         const pageActors = new Map<string, IMReactionActor[]>()
         for (const item of page.actors) {
           const actors = pageActors.get(item.reactionKey) ?? []
-          // Keep every actor returned by the explicit list request. The
-          // Telegram message payload still exposes a three-user preview, but
-          // truncating this cache would make the full reaction list regress to
-          // three users whenever a later refresh falls back to stored data.
+          // 完整保留拉到的回应用户列表，避免后续刷新回退到持久化数据时被截断为 3 人预览。
           actors.push(item.actor)
           pageActors.set(item.reactionKey, actors)
         }
@@ -3422,11 +3278,7 @@ export class DialogRpc {
         | tl.RawUpdateNewChannelMessage
         | undefined
       if (!update) throw new RpcError(500, 'MESSAGE_UPDATE_NOT_FOUND')
-      // Always carry random_id on the wire instead of relying on the implicit
-      // updateShortSentMessage request context. Desktop forks can apply the
-      // returned Updates without forwarding that out-of-band random ID, which
-      // leaves their optimistic local item pending and inserts this message as
-      // a second item. updateMessageID makes reconciliation self-contained.
+      // 始终附带 `updateMessageID`，避免桌面端分支忽略请求上下文而将回包当作第二条新消息插入。
       return this._withMessageIds(published, [req.randomId], replyTopMessageId(req.replyTo))
     }
     let persisted: Awaited<ReturnType<MessageStore['ingest']>> | undefined
@@ -3461,13 +3313,6 @@ export class DialogRpc {
     }
   }
 
-  /**
-   * Relay one article as a single ordered platform message.
-   *
-   * Telegram clients post articles with an empty `message` field, so the body
-   * of the article is the message: its blocks become ordered text and media
-   * parts and the platform decides how much of the structure it can show.
-   */
   private async _sendRichMessage(
     req: SendMessageRequest,
     excludeConnection?: ServerConnection,
@@ -3479,13 +3324,6 @@ export class DialogRpc {
     return this._sendRichContent(req.peer, content, uploads, [req.randomId], req.replyTo, excludeConnection)
   }
 
-  /**
-   * Turn an article into relay content.
-   *
-   * Media the request declares is resolved through the same path as `sendMedia`
-   * so an article may carry anything a normal send can, including its staged
-   * uploads.
-   */
   private async _richMessageContent(
     input: tl.TypeInputRichMessage,
     uploads: UploadedFile[],
@@ -3510,13 +3348,6 @@ export class DialogRpc {
     }
   }
 
-  /**
-   * Resolve one article media reference.
-   *
-   * `onResolved` receives the staged upload a caller must release after a
-   * successful send. A reference the relay cannot resolve is reported to the
-   * caller as `MEDIA_INVALID`, exactly like an unresolvable `sendMedia`.
-   */
   private async _resolveRichMedia(
     reference: RichMediaReference,
     onResolved?: (resolved: ResolvedMediaUpload) => void,
@@ -3531,13 +3362,7 @@ export class DialogRpc {
     return { media: resolved.media }
   }
 
-  /**
-   * Materialise one draft media reference.
-   *
-   * A draft has no platform message to download from, so only media whose bytes
-   * this relay still has staged is worth keeping; anything else is dropped so
-   * the client never reopens an article with a picture it cannot load.
-   */
+  /** 解析草稿媒体引用；仅保留当前仍在暂存中的上传，避免客户端重开草稿时出现无法加载的图片。 */
   private async _resolveDraftMedia(reference: RichMediaReference): Promise<ResolvedRichMedia | undefined> {
     if (!reference.input || !this._uploads) return undefined
     let resolved: ResolvedMediaUpload | ResolvedStickerInput
@@ -3560,14 +3385,7 @@ export class DialogRpc {
     }
   }
 
-  /**
-   * A stored draft as the client should see it.
-   *
-   * A draft holds the uploads of the article it waits to send, so media whose
-   * bytes the relay no longer has — an upload that was swept, or a relay that
-   * restarted before the draft was sent — is removed instead of advertised as a
-   * picture that will never load.
-   */
+  /** 剔除草稿中已过期的暂存媒体。 */
   private _servableDraft(draft: tl.RawDraftMessage): tl.RawDraftMessage {
     if (!draft.richMessage) return draft
     const rich = draft.richMessage
@@ -3745,7 +3563,6 @@ export class DialogRpc {
     }
   }
 
-  /** A content body this platform is able to store, whatever RPC produced it. */
   private _assertSendableContent(content: IMMessageInput): void {
     const text = content.parts.flatMap((part) => part.type === 'text' ? [part.text] : []).join('\n')
     if (Array.from(text).length > this._platform.capabilities.send.maxTextLength) {
@@ -3753,7 +3570,6 @@ export class DialogRpc {
     }
   }
 
-  /** Per-platform limits on the media a body carries. */
   private _assertSendableMedia(
     media: readonly IMMediaInput[],
     stickers: readonly import('./sticker-provider.js').IMStickerSendPlan[],
@@ -3905,17 +3721,11 @@ export class DialogRpc {
     replyToTopId?: number,
   ): Promise<tl.RawUpdates | undefined> {
     if (!this._store || !this._onLocalEvent) return
-    // The target was hydrated and validated before the platform send. Event
-    // ingestion persists it again atomically with the message, so reading the
-    // same conversation back from the database here only adds a serialized
-    // round trip to the send RPC's critical path.
     const conversation = this._conversation(conversationId)
     const published = await this._onLocalEvent(
       this._session,
       { type: 'message', conversation, message },
-      // Every live auth key may observe this update before the RPC result. Carry
-      // random_id on those pushes so the sending client can reconcile its local
-      // item instead of inserting the echoed server message separately.
+      // 实时连接可能在 RPC 返回前先收到推送，推送中也需携带 `random_id` 供发送端对账本地占位消息。
       {
         ...this._localDelivery(excludeConnection, true),
         forceDelivery: true,
@@ -3948,10 +3758,7 @@ export class DialogRpc {
     return {
       ...payload,
       updates,
-      // This payload is returned by the send RPC, not a second sequenced push.
-      // If an unavoidable platform echo reached the client first, reusing its
-      // positive seq makes Telegram Desktop discard the whole RPC result before
-      // it can apply updateMessageID and replace the optimistic local message.
+      // RPC 响应必须置 `seq=0`；若平台回显先到达客户端，复用正数 `seq` 会导致 Telegram Desktop 丢弃整个响应而无法完成 `updateMessageID` 对账。
       seq: 0,
     }
   }
@@ -4019,7 +3826,6 @@ export class DialogRpc {
     return this._pts
   }
 
-  /** Return the durable PTS baseline clients must use for this Telegram channel. */
   private async _channelPts(conversation: import('./platform.js').IMConversation): Promise<number> {
     const target = this._isSubchannel(conversation)
       ? this._conversation(conversation.parentId!)
@@ -4031,26 +3837,12 @@ export class DialogRpc {
     )).pts
   }
 
-  /**
-   * Resolve a dialog preview message to its durable projection, persisting the
-   * message first when the store has never seen it.
-   *
-   * A dialog page is often the first place a client learns about a preview
-   * message. Before this ran, the only remaining source of an id for an
-   * unprojected preview was the process-local counter in `_messageId`, and that
-   * address is not the id the message receives when it is finally ingested: the
-   * client cached one identity while every later request resolved the other, and
-   * the abandoned entry stayed in `_tlToMessage`/`_messageOutgoingByTl` for the
-   * life of the device state. Ingesting here keeps the published preview address
-   * equal to the one `messages.getMessages` and later dialog pages resolve.
-   */
+  /** 将会话预览消息落库并解析为持久化投影，确保 `topMessage` 与后续 `messages.getMessages` 解析出相同的 ID。 */
   private async _projectDialogPreview(
     platformPeerId: string,
     conversation: IMConversation,
     message: IMMessage,
   ): Promise<MaterializedMessage[]> {
-    // Without a store there is no durable id to publish, so the caller keeps
-    // falling back to the process-local address.
     if (!this._store) return []
     const read = async (): Promise<MaterializedMessage[]> => {
       const stored = await this._store!.findProjectedByPlatformId(
@@ -4071,8 +3863,6 @@ export class DialogRpc {
       try {
         await this._store.ingest(this._session, conversation, message)
       } catch (error) {
-        // Keep the dialog list available; the caller falls back to the
-        // process-local address exactly as it did before this helper existed.
         this._onTrace?.(
           'dialog preview ingestion failed conversation=%s message=%s error=%s',
           platformPeerId, message.id, error instanceof Error ? error.message : String(error),
@@ -4120,17 +3910,8 @@ export class DialogRpc {
       projected = await this._projectDialogPreview(platformPeerId, source.conversation, source.lastMessage)
     }
     const top = projected?.[0]
-    // A store-backed dialog page must never anchor a peer to a process-local
-    // id. The client caches `topMessage` as the peer's preview address, and
-    // nothing resolves a counter value there — `messages.getMessages` answers
-    // messageEmpty for it, the next dialog page assigns the message its durable
-    // timestamp-bucketed id instead, and a restart loses it. Publish an empty
-    // preview and let the client load history, exactly as the merged-forward
-    // transcript dialogs do. A storeless process has no durable id space at
-    // all, so its process-local bootstrap id remains the only address it can
-    // offer and still resolves within that process.
-    // Evaluated only when no durable projection supplied `top`, so the common
-    // preloaded-preview path keeps its original cost.
+    // 有存储时绝不可向客户端返回进程内临时分配的 `topMessage`，否则客户端缓存的预览 ID 与后续入库分配的持久化 ID 不一致；
+    // 若尚无持久化投影则返回 0，让客户端自行拉取历史消息。
     const topMessage = top?.tlId ?? (source.lastMessage
       ? this._sourceMessageId(source.lastMessage)
         ?? this._storelessMessageId(platformPeerId, source.lastMessage)
@@ -4511,7 +4292,6 @@ export class DialogRpc {
     return { ...page, dialogs: dialogs.filter((dialog) => !this._isSubchannel(dialog.conversation)) }
   }
 
-  /** QQ mask folder placement is transient; durable rows remain fallback state. */
   private _effectiveFolderId(
     conversation: import('./platform.js').IMConversation,
     archivedPeerIds: ReadonlySet<string>,
@@ -4566,8 +4346,7 @@ export class DialogRpc {
     }
   }
 
-  // Desktop discovers Archive through dialogFolder, then requests folder_id=1.
-  // Returning only its children leaves a fresh client unaware of the folder.
+  // 桌面端依赖 `dialogFolder` 发现归档夹并进一步请求 `folder_id=1`。
   private async _archiveFolderDialog(loaded?: readonly IMDialog[], includeEmpty = false) {
     await this._hydrateUsers()
     const archivedPeerIds = await this._dialogFolders?.archivedPeerIds(
@@ -4749,8 +4528,7 @@ export class DialogRpc {
       source,
       chats: [] as tl.TypeChat[],
     }
-    // A join service message names members the conversation may never have
-    // seen. Persist them first so the Telegram projection can reference them.
+    // 入群系统消息涉及的成员可能从未发过言，需先落库分配 Telegram 用户 ID。
     await this._resolveServiceMembers(source)
     const fallback = () => {
       const projectedSource = draft.source as IMMessage
@@ -4848,10 +4626,7 @@ export class DialogRpc {
   ): Promise<void> {
     if (!this._store) return
     const targets = new Map<string, { conversationId: string, key: string, message: IMMessage }>()
-    // QQ reports a reply to a gray-tip sidecar with the sidecar's own id while
-    // the sidecar shares its QQ sequence with the content message it accompanies.
-    // The reply still belongs to that content message, so a target that resolves
-    // to a service notice is re-resolved instead of being trusted.
+    // QQ 回复灰条时 `replyToId` 指向灰条自身，但灰条与正文消息共用 `msgSeq`；命中系统提示时需重解析到对应正文消息。
     const sidecars: Array<{ key: string, message: IMMessage }> = []
     for (const message of messages) {
       if (message.replyToId) {
@@ -4902,12 +4677,7 @@ export class DialogRpc {
     }))
   }
 
-  /**
-   * Remember a resolved projection, optionally pinning the reply key that
-   * referenced it. A gray-tip target resolves to the content message that owns
-   * the same QQ sequence, so the reply key must point at that message even
-   * though the reply named the sidecar.
-   */
+  /** 缓存已解析的消息投影，并将回复键绑定到目标正文消息（含灰条重解析后的目标）。 */
   private _rememberProjection(projected: ProjectedMessage, key?: string): void {
     for (const part of projected.parts) this._rememberMessage({
       source: projected.source,
@@ -5115,9 +4885,7 @@ export class DialogRpc {
           output.push({ _: 'messageEntityBlockquote', offset: base + entity.offset, length: entity.length })
         } else if (entity.type === 'custom-emoji'
           && entity.definition.presentation.type === 'custom' && this._reactions) {
-          // Resolve through the shared identity and keep the legacy
-          // per-conversation id resolvable for clients that cached this
-          // message while the update path still published it.
+          // 统一按全局 key 解析，同时保留旧版按会话分配的 ID 兼容已缓存该消息的客户端。
           const documentId = this._reactions.registerInlineCustomEmoji(
             source.conversationId, entity.definition,
           )
@@ -5196,8 +4964,7 @@ export class DialogRpc {
   }
 
   private _rememberUsername(peerId: string, username: string | undefined): void {
-    // Partial projections such as direct-dialog titles omit usernames. Keep
-    // the last authoritative value instead of erasing the reverse lookup.
+    // 仅含标题的部分投影（如私聊会话项）不带用户名，忽略空值以免清空已有的反向索引。
     if (!username) return
     const previous = this._usernameByPeer.get(peerId)
     if (previous) {
@@ -5281,10 +5048,7 @@ export class DialogRpc {
             this._registerUser(row)
             return toUser(row)
           })
-        // Message ingestion can create a sender row whose only name is the
-        // opaque platform ID. Treat that as a placeholder so a later profile
-        // lookup can still replace it, while complete persisted identities
-        // remain available without a network request.
+        // 消息入库时可能先写入以平台 ID 为名称的占位用户，需继续向平台拉取完整资料替换。
         const stored = local && !isPlaceholderUser(local) ? local : undefined
         const upstream = stored ? undefined : await this._getPlatformUser(peerId)
         const user = stored ?? upstream ?? local ?? { id: peerId, firstName: fallbackName ?? peerId }
@@ -5349,7 +5113,6 @@ export class DialogRpc {
     ]
   }
 
-  /** Members a service notice names, excluding ids already covered elsewhere. */
   private _serviceMemberUsers(
     message: IMMessage<any>,
     exclude: Iterable<string> = [],
@@ -5363,12 +5126,6 @@ export class DialogRpc {
     return [...members.values()]
   }
 
-  /**
-   * Persist every member a service notice names.
-   *
-   * Join notices reference members who may never have sent a message, so the
-   * projection cannot allocate their Telegram ids until a profile row exists.
-   */
   private async _resolveServiceMembers(message: IMMessage<any>): Promise<void> {
     const members = this._serviceMemberUsers(message)
     if (!members.length) return
@@ -5469,9 +5226,7 @@ export class DialogRpc {
     requestedEnd: number,
   ): Promise<void> {
     const cursor = state.nextCursor
-    // QQNT currently emits native member chunks of about 30 even when
-    // Telegram asks for 100-200. Request at least 100 and retain any spill so
-    // a short upstream page cannot make Android treat page one as terminal.
+    // QQNT 每次原生只返回约 30 名成员；每次至少请求 100 条并缓存多出部分，防止单页过短被 Android 误判为最后一页。
     const requestLimit = Math.min(500, Math.max(100, requestedEnd - state.members.length))
     const page = await this._platform.getConversationMembers(
       this._session, { id: conversationId }, { cursor, limit: requestLimit },
@@ -5877,11 +5632,7 @@ export class DialogRpc {
   private _peerId(peerId: string): number {
     const existing = this._peerToTl.get(peerId)
     if (existing !== undefined) return existing
-    // Scope synthetic peer IDs to the platform session: two accounts of the
-    // same platform sitting in the same native conversation (e.g. two QQ
-    // logins in one group) must project to two separate Telegram chats.
-    // Without the session prefix both hash to one channel whose message IDs
-    // then interleave along two non-monotonic allocation tracks.
+    // 按 `platformSessionId` 隔离合成 peer ID，避免同平台多账号处于同一群聊时共用同一个频道 ID 导致消息序号交错。
     const id = this._allocate(peerTlSeed(this._session.platformSessionId, peerId), this._tlToPeer)
     this._peerToTl.set(peerId, id)
     this._tlToPeer.set(id, peerId)
@@ -5910,10 +5661,7 @@ export class DialogRpc {
     await this._notificationSettings?.update(
       this._session.platformSessionId, target, req.settings,
     )
-    // Reverse-sync Telegram mute state into the QQ group message mask. Only QQ
-    // groups carry a `qqGroupMsgMask` metadata field; other conversations keep
-    // Telegram-local notification settings. Mask 2 (ASSISTANT) and 3 (SHIELD)
-    // have no Telegram-side equivalent and are never written back here.
+    // 将静音状态反向同步为 QQ 群消息提醒策略（仅写回 `NOTIFY`/`RECEIVE`，不写回 `ASSISTANT`/`SHIELD`）。
     if (target.type === 'peer') {
       await this._syncQqGroupMsgMask(target.peerId, req.settings.muteUntil)
     }
@@ -5925,8 +5673,6 @@ export class DialogRpc {
     if (conversation?.kind !== 'group') return
     if (typeof conversation.metadata?.qqGroupMsgMask !== 'number') return
     if (!this._platform.setConversationNotificationMask) return
-    // Telegram mute → QQ mask: forever/future timestamps map to mask 4 (receive
-    // without notification); 0/undefined (unmute) maps to mask 1 (notify).
     const isMuted = muteUntil !== undefined && muteUntil !== 0
     const mask = isMuted ? QQ_GROUP_MSG_MASK.RECEIVE : QQ_GROUP_MSG_MASK.NOTIFY
     try {
@@ -6016,12 +5762,7 @@ export class DialogRpc {
     return requested.type === 'broadcasts' ? broadcast : conversation.kind !== 'direct' && !broadcast
   }
 
-  /**
-   * Notification settings are muteable for every peer a client knows, not only
-   * for peers with a materialized conversation: Telegram clients mute group
-   * members, message senders and bot contacts that never became dialogs.
-   * Resolve those from the persisted user rows instead of rejecting them.
-   */
+  /** 允许对尚未生成对话的群成员、消息发送者或联系人设置静音，从持久化用户表兜底解析。 */
   private async _resolveNotificationPeer(peer: tl.TypeInputPeer): Promise<string> {
     if (peer._ === 'inputPeerSelf') return this._session.userId
     if (peer._ !== 'inputPeerUser') return this._resolvePeer(peer)
@@ -6037,7 +5778,6 @@ export class DialogRpc {
     return row.platformUserId
   }
 
-  /** Category defaults a peer or topic inherits when it has no full override. */
   private _defaultNotifyTarget(peerId: string): NotificationTarget {
     const conversation = this._conversation(peerId)
     if (conversation.kind === 'direct') return { type: 'users' }
@@ -6058,16 +5798,12 @@ export class DialogRpc {
     const persisted = await this._notificationSettings?.get(
       this._session.platformSessionId, target,
     ) ?? { _: 'peerNotifySettings' as const }
-    // Only peer settings mirror QQ. Topic and category targets remain Telegram-local.
     const policy = target.type === 'peer'
       ? qqGroupMsgMaskPolicy(this._conversations.get(target.peerId))
       : undefined
     const merged = policy ? { ...persisted, muteUntil: policy.muteUntil } : persisted
     if (target.type !== 'peer' || !this._notificationSettings) return merged
-    // Telegram answers with the *effective* settings of a peer. Clients treat
-    // fields that are missing from the answer as unknown: they then re-request
-    // the settings, drop locally cached mute state or defer notifications, so
-    // fill the inherited category defaults before returning the override.
+    // 客户端会将缺省字段视为未知并反复重拉设置，需合并所属分类的默认通知配置后返回。
     const defaults = await this._notificationSettings.get(
       this._session.platformSessionId, this._defaultNotifyTarget(target.peerId),
     )
@@ -6096,23 +5832,11 @@ export class DialogRpc {
     return id
   }
 
-  /**
-   * Process-local bootstrap id for a preview message, only for a process that
-   * has no durable id space. A store-backed process returns `undefined`: the
-   * message receives a timestamp-bucketed id when it is ingested, so a counter
-   * value would anchor the client to an address no later request resolves.
-   */
+  /** 仅在无存储模式下为预览消息分配进程内临时 ID；有存储时返回 `undefined` 以免污染客户端缓存。 */
   private _storelessMessageId(peerId: string, message: IMMessage): number | undefined {
     return this._store ? undefined : this._messageId(peerId, message.id)
   }
 
-  /**
-   * Telegram-native id of a preview message, remembered so a later
-   * `messages.readHistory`/`getMessages` can map the id back.
-   *
-   * Returns `undefined` when the message only carries a platform id, which the
-   * caller answers with an empty preview instead of a process-local value.
-   */
   private _sourceMessageId(message: IMMessage): number | undefined {
     const native = telegramMessageId(message)
     if (native === undefined) return undefined
@@ -6257,12 +5981,10 @@ export class DialogRpc {
     if (!this._store) return
     const scoped = await this._findPeerProjection(displayConversationId, tlMessageId)
     if (scoped) return scoped
-    // Preserve compatibility with partially hydrated parent-channel views;
-    // the caller still validates that this result belongs to the display peer.
+    // 兼容仅部分加载的父频道视图，调用方会二次校验结果是否属于当前展示会话。
     return this._store.findProjectedByTlId(this._session.platformSessionId, tlMessageId)
   }
 
-  /** Finds a TL message id inside one display peer or its topics, never elsewhere. */
   private async _findPeerProjection(
     displayConversationId: string,
     tlMessageId: number,
@@ -6310,11 +6032,7 @@ export function makeAdminRights(
   }
 }
 
-/**
- * Modern Telegram clients require default_banned_rights to decide whether a
- * regular channel member may send. Omitting it is interpreted as no granted
- * bannable actions rather than as an unrestricted default member.
- */
+/** 现代 Telegram 客户端要求携带 `default_banned_rights`，缺省会被视为禁止普通成员执行任何可封禁操作（含发言）。 */
 export function makeDefaultBannedRights(readOnly = false): tl.RawChatBannedRights {
   return {
     _: 'chatBannedRights',
@@ -6389,8 +6107,7 @@ function plainUsernameMentions(text: string): Array<{ offset: number, length: nu
     const length = match[0].length
     const before = text[offset - 1]
     const after = text[offset + length]
-    // Avoid email addresses and partial matches inside a longer Telegram
-    // username. Non-ASCII prose may directly precede an @mention.
+    // 排除邮箱地址与长用户名内部的截断匹配（非 ASCII 字符可直接紧挨 `@`）。
     if (before && /[A-Za-z0-9_@]/.test(before)) continue
     if (after && /[A-Za-z0-9_]/.test(after)) continue
     mentions.push({ offset, length })
@@ -6464,12 +6181,11 @@ function messageHasLink(message: IMMessage): boolean {
   })
 }
 
-/** Seed for a synthetic Telegram peer/user ID, scoped to one platform session. */
 export function peerTlSeed(platformSessionId: string, platformPeerId: string): string {
   return `peer:${platformSessionId}:${platformPeerId}`
 }
 
-/** Stable positive signed-int ID used for synthetic Telegram entities. */
+/** 生成 `[1, 0x7fffffff - 1]` 范围内的稳定正有符号 32 位整型 ID（FNV-1a）。 */
 export function stableId(value: string): number {
   let hash = 0x811c9dc5
   for (let i = 0; i < value.length; i++) {
@@ -6479,7 +6195,6 @@ export function stableId(value: string): number {
   return (hash >>> 0) % 0x7ffffffe + 1
 }
 
-/** Builds a self-contained Telegram preview without asking Telegram to scrape QQ URLs. */
 export function makeTlCardPreview(
   card: import('./platform.js').IMMessageCard,
   dcId = 1,
@@ -6489,8 +6204,6 @@ export function makeTlCardPreview(
   try {
     displayUrl = new URL(url).hostname || displayUrl
   } catch {
-    // The fallback above is always valid; keep a useful display label if a
-    // future adapter supplies a non-standard URL.
   }
   return {
     _: 'messageMediaWebPage', manual: true, safe: true,
@@ -6526,7 +6239,6 @@ export function projectTlMessage(options: {
   topicId?: number
   mentioned?: boolean
   unreadMention?: boolean
-  /** Maps a platform user id to its Telegram id for service notices. */
   userId?: (platformUserId: string) => number | undefined
 }): tl.TypeMessage {
   const {
@@ -6582,13 +6294,7 @@ export function projectTlMessage(options: {
   } as tl.RawMessage
 }
 
-/**
- * Telegram action a platform service notice maps to.
- *
- * A join notice becomes Telegram's own join service message so clients link the
- * joined member; anything the notice cannot name keeps platform's wording as a
- * custom action instead of losing the notice.
- */
+/** 将入群系统通知映射为原生入群 Action 以支持点击成员跳转；若无法解析全部成员 ID 则回退为自定义文本提示。 */
 function makeTlServiceAction(
   service: IMMessageServiceAction,
   messageId: string,
@@ -6644,13 +6350,6 @@ function uniqueProjectedMessages(messages: ProjectedMessage[]): ProjectedMessage
   return [...new Map(messages.map((message) => [message.source.id, message])).values()]
 }
 
-/**
- * The `userFull.bot_info` payload for a bot peer.
- *
- * Telegram always reports a description slot for bots (empty when the bot has
- * none) and omits `user_id` unless the bot is managed by another user; the
- * bridge only ever has a description to report.
- */
 function makeBotInfo(description: string | undefined): tl.RawBotInfo {
   return {
     _: 'botInfo',
@@ -6706,7 +6405,6 @@ function withReplyToTopId(update: tl.TypeUpdate, replyToTopId: number | undefine
   }
 }
 
-/** Media id a stored article block refers to, when it refers to one at all. */
 function mediaBlockId(block: tl.TypePageBlock): string | undefined {
   if (block._ === 'pageBlockPhoto') return block.photoId.toString()
   if (block._ === 'pageBlockVideo') return block.videoId.toString()
@@ -6751,10 +6449,7 @@ function selectHistoryWindow(
   const maxId = request.maxId ?? 0
   const minId = request.minId ?? 0
   const filtered = all.filter((item) => {
-    // A negative add_offset asks for a window which starts before (newer
-    // than) offset_id. Keep both sides of the anchor until the window has
-    // been selected below; filtering here used to make every unread-window
-    // request empty.
+    // `add_offset < 0` 表示从 `offset_id` 往更新方向取窗口，需保留锚点两侧消息供下方切片。
     if (addOffset >= 0 && offsetId > 0 && item.tlId >= offsetId) return false
     if (offsetDate > 0 && item.source.timestamp >= offsetDate) return false
     if (maxId > 0 && item.tlId >= maxId) return false
@@ -6927,10 +6622,7 @@ function makeTlRichText(
 
 function makeTlPhoto(media: IMMediaRow, timestamp: number, dcId = 1): tl.RawPhoto {
   const id = Long.fromNumber(media.id)
-  // Real Telegram media always carries a non-zero access hash. The bridge
-  // resolves downloads from its durable media row, so this synthetic hash is
-  // only for clients (notably Desktop) that disable the download action when
-  // access_hash is zero.
+  // 桌面端在 `access_hash` 为 0 时会禁用下载操作，需填充非零值。
   const accessHash = Long.fromNumber(media.id)
   const fileReference = new TextEncoder().encode(`bridge-media:${media.id}`)
   const dimensions = media.width && media.height
@@ -6938,12 +6630,7 @@ function makeTlPhoto(media: IMMediaRow, timestamp: number, dcId = 1): tl.RawPhot
     : media.preview
       ? { width: media.preview.width, height: media.preview.height }
       : { width: 1, height: 1 }
-  // QQ exposes a 720-spec URL even when a small image is already below the
-  // preview bound. In that case the "preview" and original have identical
-  // dimensions. Advertising both makes Telegram's send reconciliation match
-  // the local full-size cache entry to the preview tier first, so the final
-  // photo has to be inserted and downloaded again. Keep native previews only
-  // when they are a genuinely distinct rendition.
+  // 小图小于 720p 时 QQ 预览图与原图尺寸相同；仅在尺寸不同时下发预览规格，避免客户端对账时把本地原图缓存误匹配到预览档位导致重新下载。
   const nativePreviewSize = projectedPhotoPreviewSize(media)
   const nativePreview = nativePreviewSize === undefined ? undefined : media.preview!
   const preview = nativePreview
@@ -6971,9 +6658,7 @@ export function makeTlMessageMedia(media: IMMediaRow, timestamp: number, dcId = 
   }
   const id = Long.fromNumber(media.id)
   const accessHash = Long.fromNumber(media.id)
-  // QQ voice notes have no client-reachable direct URL. Give them a distinct
-  // reference so patched clients skip crossgram.getFileUrl and immediately
-  // use the reliable upload.getFile relay path.
+  // QQ 语音无客户端可直连的 URL，使用专用前缀让打补丁客户端跳过 `crossgram.getFileUrl` 直接走 `upload.getFile`。
   const fileReference = new TextEncoder().encode(
     `${media.voice ? 'bridge-voice-media' : 'bridge-media'}:${media.id}`,
   )
@@ -7022,7 +6707,6 @@ export function makeTlMessageMedia(media: IMMediaRow, timestamp: number, dcId = 
   }
 }
 
-/** Project adapter media without persisting an IM message/media row. */
 export function makeTlTransientMessageMedia(
   media: IMMedia,
   id: number,
@@ -7068,12 +6752,7 @@ function shouldServeMediaPreview(
   return isDownloadablePreview(media.preview)
 }
 
-/**
- * QQ's native 720-tier image is remotely downloadable even when QQNT reports
- * thumbFileSize=0. Telegram refuses a zero-byte PhotoSize, so use the original
- * byte count as a conservative upper bound until the preview stream reaches
- * EOF. File loaders already accept an early short/empty chunk as completion.
- */
+/** QQNT 报告 `thumbFileSize=0` 时 720p 预览仍可下载；回退使用原图大小作为上限，避免 Telegram 拒绝 0 字节 `PhotoSize`。 */
 function projectedPhotoPreviewSize<T extends {
   size?: number | null
   preview?: { size: number, width: number, height: number } | null
@@ -7121,7 +6800,6 @@ function decodeFileReference(bytes: Uint8Array): string | undefined {
   }
 }
 
-/** Serialize the feature payload the patched clients parse. */
 function featuresJSON(features: CrossgramFeatures): tl.RawDataJSON {
   return { _: 'dataJSON', data: JSON.stringify(features) }
 }
@@ -7212,7 +6890,7 @@ const TELEGRAM_DISPLAY_PHOTO_SIDE = 1280
 const TELEGRAM_HIGH_QUALITY_PHOTO_SIDE = 2560
 const TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024
 
-/** Preserve very large originals as documents instead of pretending they are Telegram photos. */
+/** 超过 10 MiB 的静态图片按文件（`document`）下发。 */
 function requiresImageDocument(media: Pick<IMMediaRow, 'kind' | 'mimeType' | 'size'>): boolean {
   return media.kind === 'image' && !isAnimatedImageMime(media.mimeType)
     && Number.isSafeInteger(media.size) && media.size! > TELEGRAM_PHOTO_MAX_BYTES
@@ -7247,10 +6925,7 @@ function originalPhotoSizes(
   }
 
   const scale = TELEGRAM_DISPLAY_PHOTO_SIDE / maxSide
-  // Android chooses the largest photo size whose side is at most 1280. With
-  // only a stripped thumbnail plus an oversized original it keeps the 50px
-  // stripped image forever. Advertise a display-sized alias backed by the
-  // same original bytes, then retain the true dimensions as the `w` size.
+  // Android 选取边长不超过 1280 的最大规格展示；若仅有微缩图与超尺寸原图会一直停留在模糊微缩图，需额外提供指向同一原图字节的 `y` 档位。
   return [
     {
       _: 'photoSize', type: 'y',
@@ -7294,7 +6969,6 @@ function qqSequenceKey(conversationId: string, sequence: number): string {
   return `${conversationId}\u0000qq-sequence:${sequence}`
 }
 
-/** Telegram ids the published deletion update removed, so the RPC can report them. */
 function publishedDeletedTlMessageIds(payload: PlatformEventPublishResult): number[] {
   if (!payload || (payload._ !== 'updates' && payload._ !== 'updatesCombined')) return []
   return payload.updates.flatMap((update) => update._ === 'updateDeleteMessages'

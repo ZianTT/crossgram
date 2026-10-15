@@ -19,53 +19,30 @@ export const name = 'group-auto-kick'
 
 export const inject = ['imPlatform', 'database']
 
-/**
- * One group to watch. `conversationId` accepts either the platform
- * conversation id (the QQ group code, for example `1002974327`) or the
- * Telegram chat id the group is projected as (`-1000371852035`).
- */
+/** 单群监控规则。`conversationId` 支持平台会话 ID（QQ 群号）或投影后的 Telegram 群 `chatId`（`-100…`）。 */
 export interface GroupRule {
   conversationId: string | number
-  /** Free-form name used in logs; defaults to the resolved conversation title. */
   label?: string
-  /** Restrict the rule to one platform session; defaults to every active session. */
   platformSessionId?: string
-  /** Member count that starts a kick round. */
   maxMembers?: number
-  /** Member count a kick round reduces the group to. */
   targetMembers?: number
-  /** Safety cap on removals per round. */
   maxKicksPerRound?: number
-  /** Protect administrators as well as the owner. */
   protectAdministrators?: boolean
-  /**
-   * Ranking of members the relay never saw speak: `oldest` (default) removes
-   * them first, `newest` removes only members whose silence was measured.
-   */
+  /** 从未发言成员的排序策略：`oldest`（默认）优先踢出，`newest` 排在已测得沉默时长的成员之后。 */
   unknownLastSpoke?: UnknownLastSpoke
-  /** Ask the platform to refuse future join requests from a removed member. */
   rejectAddRequest?: boolean
 }
 
 export interface Config {
   groups?: GroupRule[]
-  /** Plan and log removals without performing them. */
   dryRun?: boolean
-  /** Spacing between periodic rounds. */
   intervalMs?: number
-  /** Delay before the first round, and after a platform session activates. */
   startupDelayMs?: number
-  /** Pause between two removals in one round. */
   kickIntervalMs?: number
-  /** How long the per-conversation last-spoke ranking is reused. */
   rankingTtlMs?: number
-  /** Members requested per platform page while scanning a member list. */
   memberPageSize?: number
-  /** Stop scanning a member list beyond this many members. */
   maxMemberScan?: number
-  /** Give up scanning one member list after this long. */
   scanDeadlineMs?: number
-  /** Cap on message rows read by the ranking fallback scan. */
   maxRankingScan?: number
 }
 
@@ -108,10 +85,7 @@ export const Config: z<Config> = z.object({
     .description('回退扫描消息时的行数上限。'),
 })
 
-/**
- * How many candidates beyond the round's plan stay eligible when the ranking
- * snapshot turns out to be stale for the members at the front of the queue.
- */
+/** 队首候选人在排行快照之后又有新发言时，向后多预留的替补候选人数。 */
 const STALE_LOOKAHEAD = 20
 
 const DEFAULTS = {
@@ -131,43 +105,32 @@ const DEFAULTS = {
 } as const
 
 export interface GroupAutoKickResult {
-  /** Configured selector, echoed back for correlation. */
   rule: string
-  /** Platform session the round ran through. */
   platformSessionId: string
-  /** Platform conversation id of the resolved group. */
   conversationId: string
   title: string
   total: number
   scanned: number
-  /** True when the member list could not be read in full. */
   partial: boolean
   dryRun: boolean
-  /** Members the round selected, oldest silence first. */
   planned: KickCandidate[]
   kicked: KickCandidate[]
-  /**
-   * Members dropped from the round because they spoke after the cached ranking
-   * was built: their silence was measured from stale data.
-   */
+  /** 在排行快照生成后又有新发言而被跳过的候选人。 */
   skippedStale: KickCandidate[]
   failures: Array<{ userId: string, error: string }>
   skipped?: 'no-session' | 'unresolved' | 'invalid' | 'below-threshold' | 'scan-failed'
   reason: string
 }
 
-/** Cordis service facade so operators and debug scripts can trigger a round. */
 export class GroupAutoKickService extends Service {
   constructor(ctx: Context, readonly runner: GroupAutoKickRunner) {
     super(ctx, 'groupAutoKick')
   }
 
-  /** Run one round over every configured group. */
   run(reason = 'manual'): Promise<GroupAutoKickResult[]> {
     return this.runner.run(reason)
   }
 
-  /** Forget the cached last-spoke rankings. */
   invalidate(): void {
     this.runner.invalidate()
   }
@@ -242,7 +205,6 @@ export class GroupAutoKickRunner {
     this.unresolved.clear()
   }
 
-  /** One round over every configured group; concurrent calls are ignored. */
   async run(reason = 'manual'): Promise<GroupAutoKickResult[]> {
     if (this.running || this.disposed) return []
     const rules = normalizeRules(this.config, (message) => this.logger.error('%s', message))
@@ -301,9 +263,6 @@ export class GroupAutoKickRunner {
     const maxMembers = rule.maxMembers ?? DEFAULTS.maxMembers
     const targetMembers = rule.targetMembers ?? DEFAULTS.targetMembers
     const maxKicksPerRound = rule.maxKicksPerRound ?? DEFAULTS.maxKicksPerRound
-    // `targetMembers == maxMembers` is the "hold the group at this size" shape:
-    // the round trims exactly what joined past the threshold instead of keeping
-    // a slack band below it that only fills up again.
     if (targetMembers > maxMembers) {
       this.logger.error(
         '群 %s 的配置无效：targetMembers(%d) 不得大于 maxMembers(%d)',
@@ -328,9 +287,7 @@ export class GroupAutoKickRunner {
     }
 
     const ranking = await this.ranking(binding, conversation.id)
-    // Joining counts as one act of speech: an invite notice names the members it
-    // added but is stored with the inviter as its sender, so those members would
-    // otherwise keep ranking by whatever they last said before they were removed.
+    // 入群视为一次活跃：邀请入群通知的 `sender` 是邀请人，需额外从通知内的 `members` 提取被邀请成员的入群时间。
     const joins = await this.joined(conversation.id)
     const ranked = rankSilentMembers(scan.members, mergeRanking(ranking, joins), {
       selfUserId: session.userId,
@@ -347,11 +304,7 @@ export class GroupAutoKickRunner {
     const skippedStale: KickCandidate[] = []
     const failures: Array<{ userId: string, error: string }> = []
     const kickIntervalMs = this.config.kickIntervalMs ?? DEFAULTS.kickIntervalMs
-    // The ranking is reused for `rankingTtlMs`, so it can predate a member's
-    // newest message. Every candidate is therefore re-read right before the
-    // removal, and a member who spoke after the snapshot hands the round to the
-    // next-longest silence instead of being kicked right after talking (the
-    // usual shape of it: they rejoined and greeted the group).
+    // 排行快照会缓存 `rankingTtlMs`，每次踢人前重新查询该候选人是否有新发言，避免误踢刚回群发言的成员。
     const candidates = context.dryRun
       ? planned
       : ranked.slice(0, Math.min(ranked.length, planned.length + STALE_LOOKAHEAD))
@@ -383,8 +336,7 @@ export class GroupAutoKickRunner {
         this.logger.info('已踢出 %s（最后活跃：%s）', label, lastSpoke)
       } catch (error) {
         failures.push({ userId: candidate.userId, error: errorText(error) })
-        // The production console exporter drops `warn`, so a removal that the
-        // platform rejected has to be reported at error level to be visible.
+        // 生产环境控制台日志过滤了 `warn`，踢人失败需用 `error` 级别输出。
         this.logger.error('踢出 %s 失败：%s', label, errorText(error))
       }
       if (kickIntervalMs > 0 && kicked.length < planned.length) await delay(kickIntervalMs)
@@ -412,7 +364,6 @@ export class GroupAutoKickRunner {
     }
   }
 
-  /** Resolve a configured selector to a stored group conversation. */
   private async resolve(rule: GroupRule, binding: ActivePlatformSession): Promise<{
     id: number
     platformConversationId: string
@@ -428,7 +379,6 @@ export class GroupAutoKickRunner {
     }
   }
 
-  /** Authoritative member count, read without walking the whole member list. */
   private async memberCount(
     platform: IMPlatform,
     session: PlatformSession,
@@ -444,7 +394,6 @@ export class GroupAutoKickRunner {
     }
   }
 
-  /** Walk the whole member list; the platform pages are small, so this is bounded. */
   private async scanMembers(
     platform: IMPlatform,
     session: PlatformSession,
@@ -491,18 +440,7 @@ export class GroupAutoKickRunner {
     return { members, partial }
   }
 
-  /**
-   * Newest join notice that named each member, keyed by platform user id.
-   *
-   * Joining counts as one act of speech, so a member who was removed for silence
-   * and came back is ranked by the moment they returned instead of by whatever
-   * they last said before leaving.
-   *
-   * QQ reports two shapes: a scan or invite-link join whose notice is stored with
-   * the joining member as its sender (already counted by the message ranking), and
-   * an invite (`A邀请B加入了群聊`) stored with the *inviter* as its sender, where
-   * the members the notice added have to be read out of the notice itself.
-   */
+  /** 提取每个成员最新的入群通知时间戳，使重新加群的成员按最新入群时间参与排序。 */
   private async joined(conversationRowId: number): Promise<Map<string, number>> {
     const rows = await this.ctx.database.get('mtproto_im_message', {
       conversationId: conversationRowId,
@@ -524,17 +462,7 @@ export class GroupAutoKickRunner {
     return joins
   }
 
-  /**
-   * Newest relayed message of one member in the conversation, when it is newer
-   * than the time the ranking snapshot recorded for them.
-   *
-   * The ranking is cached for `rankingTtlMs`, so a plan can be built from data
-   * that is many minutes old. Re-reading the candidate right before the removal
-   * keeps the round honest: a member who has spoken since the snapshot — most
-   * often somebody who just rejoined and greeted the group — is never removed
-   * for silence that no longer holds. Joins need no such re-check: they are read
-   * fresh for every round and folded into the ranking before it is sorted.
-   */
+  /** 检查候选人在排行快照的 `lastSpokeAt` 之后是否有更新的发言记录。 */
   private async spokeSince(
     conversationRowId: number,
     platformId: string,
@@ -557,7 +485,6 @@ export class GroupAutoKickRunner {
     return Number.isFinite(newest) ? newest : undefined
   }
 
-  /** platformUserId -> newest relayed message time, cached per conversation. */
   private async ranking(binding: ActivePlatformSession, conversationRowId: number): Promise<Map<string, number>> {
     const key = rankKey(binding, conversationRowId)
     const ttl = this.config.rankingTtlMs ?? DEFAULTS.rankingTtlMs
@@ -593,7 +520,6 @@ export class GroupAutoKickRunner {
     return ranking
   }
 
-  /** One aggregation query per conversation; the index on (conversationId, timestamp) carries it. */
   private async aggregateLastSpoke(conversationRowId: number): Promise<Map<number, number>> {
     const rows = await this.ctx.database
       .select('mtproto_im_message', {
@@ -611,7 +537,6 @@ export class GroupAutoKickRunner {
     return result
   }
 
-  /** Driver-agnostic fallback: read messages newest first and keep the first hit per sender. */
   private async scanLastSpoke(conversationRowId: number): Promise<Map<number, number>> {
     const pageSize = 5000
     const maxRows = this.config.maxRankingScan ?? DEFAULTS.maxRankingScan
@@ -670,13 +595,7 @@ function rankKey(binding: ActivePlatformSession, conversationRowId: number): str
   return `${binding.session.platformSessionId}\0${conversationRowId}`
 }
 
-/**
- * The last-activity map the round ranks by: cached message times with the join
- * notices folded in, so a member who joined is as active as their join notice.
- *
- * The cached map is copied, never mutated: join notices are re-read every round
- * and must not leak into the ranking cache of a later round.
- */
+/** 合并缓存的发言时间与最新入群通知时间（返回新 Map，不修改缓存）。 */
 function mergeRanking(
   ranking: ReadonlyMap<string, number>,
   joins: ReadonlyMap<string, number>,

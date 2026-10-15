@@ -18,20 +18,16 @@ export class VoiceCallError extends Error {
   }
 }
 
-/** Public-only call metadata exchanged with the native voice worker. */
 export interface VoiceWorkerCall {
   readonly callId: string
   readonly callerId: number
   readonly participantId: number
   readonly telegramRole: TelegramCallRole
   readonly protocol: tl.TypePhoneCallProtocol
-  /** Exact source-platform reference, retained only for this live call. */
   readonly platformCallRef?: string
-  /** Call-scoped public relay settings supplied only by an explicit provider. */
   readonly mediaStartConfig?: VoiceWorkerMediaStartConfig
 }
 
-/** Supplies real per-call relay and server settings; no fallback is permitted. */
 export interface VoiceMediaStartProvider {
   get(call: VoiceWorkerCall, session: PlatformSession): Promise<VoiceWorkerMediaStartConfig | undefined>
 }
@@ -54,17 +50,12 @@ export interface VoiceWorkerRecipientPreparation {
 
 export interface VoiceWorkerRecipientCompletion {
   readonly state: VoiceWorkerState
-  /** Signed i64 fingerprint computed by the worker from the shared key. */
+  /** 由 worker 根据共享密钥计算的带符号 i64 指纹。 */
   readonly keyFingerprint: Long
 }
 
-/**
- * The bridge deliberately cannot receive private DH material, shared keys, or
- * relay credentials. Worker methods identify the Telegram call role rather
- * than relying on an ambiguous MTProto RPC direction.
- */
+/** 原生语音 worker 接口（DH 私钥与共享密钥保留在 worker 内部，方法按 Telegram 端角色区分）。 */
 export interface VoiceWorkerClient {
-  /** Public protocol capability supported by this configured worker. */
   readonly protocol: tl.TypePhoneCallProtocol
   prepareTelegramCaller(call: VoiceWorkerCall): Promise<VoiceWorkerCallerPreparation>
   completeTelegramCaller(call: VoiceWorkerCall, gB: Uint8Array): Promise<VoiceWorkerCallerCompletion>
@@ -75,13 +66,11 @@ export interface VoiceWorkerClient {
     keyFingerprint: Long,
   ): Promise<VoiceWorkerRecipientCompletion>
   discardCall(call: VoiceWorkerCall): Promise<void>
-  /** Returns only after the worker confirms a call-local PCM endpoint is ready. */
   attachMedia?(call: VoiceWorkerCall): Promise<VoiceWorkerMediaEndpoint>
   sendSignalingData(call: VoiceWorkerCall, data: Uint8Array): Promise<void>
   saveCallDebug?(call: VoiceWorkerCall, debug: VoiceCallDebugSummary): Promise<void>
 }
 
-/** Redacted metadata only; debug payload values never leave the registry. */
 export interface VoiceCallDebugSummary {
   readonly bytes: number
   readonly topLevelKeys: string[]
@@ -98,17 +87,11 @@ export interface CallRegistryOptions {
   readonly now?: () => number
   readonly randomBytes?: (size: number) => Uint8Array
   readonly timeoutMs?: number
-  /** Returns the number of live authorized connections that accepted the update. */
   readonly publish?: (update: VoiceCallUpdate) => number | Promise<number>
-  /** Publishes one ephemeral call-scoped signaling update. */
   readonly publishSignaling?: (session: PlatformSession, update: tl.RawUpdatePhoneCallSignalingData) => number | Promise<number>
-  /** Replays one ephemeral update to a specific authorized binding. */
   readonly replay?: (session: PlatformSession, update: tl.RawUpdatePhoneCall, authKeyId: string) => number | Promise<number>
-  /** Optional platform composition seam used only after worker media confirmation. */
   readonly media?: VoiceCallMediaProvider
-  /** Required to make a call media-active; absent providers fail closed. */
   readonly mediaStartProvider?: VoiceMediaStartProvider
-  /** Redacted lifecycle diagnostics; never includes call IDs or media. */
   readonly onMediaDiagnostic?: (phase: VoiceMediaTerminalPhase, code: string) => void
 }
 
@@ -126,9 +109,8 @@ export interface IncomingCall {
   readonly session: PlatformSession
   readonly selfId: number
   readonly callerId: number
-  /** Opaque source correlation retained only for in-memory retry deduplication. */
+  /** 用于内存重试去重的上游关联 ID。 */
   readonly correlationId: string
-  /** Exact source call reference used for controls and media authorization. */
   readonly platformCallRef?: string
   readonly platformControl?: PlatformCallControl
 }
@@ -177,13 +159,11 @@ interface StoredCall {
 interface CallTombstone {
   readonly id: Long
   readonly accessHash: Long
-  /** Minimal authorization key; never retain the PlatformSession or credentials. */
   readonly sessionId: string
   readonly adminId: number
   readonly participantId: number
   readonly telegramRole: TelegramCallRole
   readonly randomId?: number
-  /** HMAC digest only; the source correlation is never retained. */
   readonly incomingCorrelationDigest?: string
   readonly phoneCall: tl.RawPhoneCallDiscarded
   pendingDelivery: boolean
@@ -202,7 +182,7 @@ const DEFAULT_TIMEOUT_MS = 60_000
 const TOMBSTONE_TTL_MS = 5 * 60_000
 const MAX_TOMBSTONES = 256
 
-/** Compares i64 values as opaque TL wire patterns, regardless of signed decoding. */
+/** 按底层 64 位位模式比较，忽略有符号/无符号标记差异。 */
 function sameWireLong(left: Long, right: Long): boolean {
   return left.low === right.low && left.high === right.high
 }
@@ -211,17 +191,14 @@ function cloneLong(value: Long): Long {
   return Long.fromBits(value.low, value.high, value.unsigned)
 }
 
-/**
- * An intentionally transient one-to-one audio-call coordinator. It neither
- * knows private key material nor writes call data to a database or journal.
- */
+/** 单对单语音通话的纯内存状态机（不落库、不记入 update 日志）。 */
 export class CallRegistry {
   private readonly _calls = new Map<string, StoredCall>()
   private readonly _sessionCalls = new Map<string, StoredCall>()
   private readonly _incomingCalls = new Map<string, StoredCall>()
   private readonly _tombstones = new Map<string, CallTombstone>()
   private readonly _incomingTombstones = new Map<string, CallTombstone>()
-  /** HMAC-indexed source calls rejected while their Telegram session was occupied. */
+  /** 会话占线时已拒接的上游来电摘要，用于重试去重。 */
   private readonly _occupiedIncomingReceipts = new Map<string, number>()
   private readonly _sessionOperations = new Map<string, Promise<void>>()
   private readonly _signalTimes = new Map<string, number[]>()
@@ -301,7 +278,6 @@ export class CallRegistry {
     })
   }
 
-  /** Seam for a QQ/native worker to surface an incoming audio call. */
   async receiveIncoming(input: IncomingCall): Promise<tl.RawPhoneCallRequested | tl.RawPhoneCallDiscarded | undefined> {
     if (!input.correlationId) throw new VoiceCallError('CALL_CORRELATION_INVALID')
     return this._serialize(input.session.platformSessionId, async () => {
@@ -412,9 +388,7 @@ export class CallRegistry {
         await this._finishAcceptAfterResponse(call, afterResponse)
         return this._wrapPhoneCall(this._waiting(call))
       }
-      // phone.receivedCall is only a delivery/ringing acknowledgement. Some
-      // Telegram clients accept directly from phoneCallRequested without
-      // sending that optional acknowledgement first.
+      // phone.receivedCall 是可选的振铃回执，部分客户端会从 phoneCallRequested 直接发起 acceptCall。
       if (call.state !== 'requested' && call.state !== 'received') {
         throw new VoiceCallError('CALL_STATE_INVALID')
       }
@@ -446,9 +420,7 @@ export class CallRegistry {
       call.state = 'accepted'
       await this._publishTransition(call, excludeAuthKeyId)
       await this._finishAcceptAfterResponse(call, afterResponse)
-      // Telegram Desktop requires phone.acceptCall to return phoneCallWaiting;
-      // phoneCallAccepted is the caller-side update, while the recipient moves
-      // forward on the subsequent active phoneCall update.
+      // Telegram Desktop 要求 phone.acceptCall 返回 phoneCallWaiting（phoneCallAccepted 是给主叫方的推送），被叫方通过后续推送的 phoneCall 进入通话。
       return this._wrapPhoneCall(this._waiting(call))
     })
   }
@@ -535,7 +507,6 @@ export class CallRegistry {
     })
   }
 
-  /** Retires a Telegram call when the source platform reports its terminal state. */
   async platformEnded(session: PlatformSession, correlationId: string): Promise<void> {
     if (!correlationId) throw new VoiceCallError('CALL_CORRELATION_INVALID')
     await this._serialize(session.platformSessionId, async () => {
@@ -562,7 +533,6 @@ export class CallRegistry {
     })
   }
 
-  /** Delivers one acknowledged worker event into Telegram's call update stream. */
   async handleWorkerEvent(workerCall: VoiceWorkerCall, event: VoiceWorkerEvent): Promise<void> {
     const call = this._calls.get(workerCall.callId)
     if (!call || call.state === 'discarded') return
@@ -632,7 +602,6 @@ export class CallRegistry {
     })
   }
 
-  /** Expires unanswered calls without using timers that outlive plugin disposal. */
   async expire(): Promise<void> {
     this._pruneTombstones()
     const now = this._now()
@@ -647,7 +616,6 @@ export class CallRegistry {
     }
   }
 
-  /** Returns the current transient call update for an authorized reconnecting binding. */
   snapshot(session: PlatformSession): tl.RawUpdatePhoneCall | undefined {
     this._pruneTombstones()
     const call = this._sessionCalls.get(session.platformSessionId)
@@ -657,7 +625,6 @@ export class CallRegistry {
     return tombstone ? { _: 'updatePhoneCall', phoneCall: this._discarded(tombstone) } : undefined
   }
 
-  /** Replays a call update to one verified binding without retaining that binding's credentials. */
   async replay(session: PlatformSession, authKeyId: string): Promise<void> {
     await this._serialize(session.platformSessionId, async () => {
       const call = this._sessionCalls.get(session.platformSessionId)
@@ -862,7 +829,6 @@ export class CallRegistry {
     try {
       pendingDelivery = await this._publishCall(call.session, discarded, excludeAuthKeyId) <= 0
     } catch {
-      // Retire secrets even when the terminal update must be retried later.
     } finally {
       this._retire(call, discarded, pendingDelivery)
     }
@@ -918,10 +884,7 @@ export class CallRegistry {
     await this._deliverPending(call)
     call.state = 'active'
     call.startDate = Math.floor(this._now() / 1_000)
-    // The worker is the synthetic Telegram caller, so no second Telegram auth
-    // key will ever confirm this incoming call. The accepting recipient gets
-    // phoneCallAccepted in its RPC response, then must also receive the active
-    // update that a real caller's phone.confirmCall would normally produce.
+    // 来电中 worker 充当虚拟主叫，不会有第二个客户端发来 phone.confirmCall，因此接听后需直接由服务端推送 active 状态的 phoneCall。
     await this._publishTransition(call)
   }
 

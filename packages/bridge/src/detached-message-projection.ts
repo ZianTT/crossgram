@@ -27,11 +27,7 @@ export interface DetachedMessageProjectionResult {
   chats: tl.TypeChat[]
 }
 
-/**
- * Shared non-durable message -> Telegram projection used by finite virtual
- * content features. Every rendered part still traverses the Cordis plan and
- * project waterfalls; no conversation or MessageStore row is manufactured.
- */
+/** 将非落库消息（如合并转发详情等虚拟内容）通过投影管线转换为 Telegram 消息。 */
 export async function projectDetachedMessage(
   input: DetachedMessageProjectionInput,
 ): Promise<DetachedMessageProjectionResult> {

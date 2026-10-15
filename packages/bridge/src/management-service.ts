@@ -100,11 +100,6 @@ export interface BridgeManagementSource {
   ): Promise<void>
 }
 
-/**
- * Stable, provider-neutral management seam shared by the WebUI and optional
- * in-client administration surfaces. Secrets such as platform credentials,
- * TOTP seeds and raw auth keys never leave this service.
- */
 export class BridgeManagementService extends Service {
   private _source?: BridgeManagementSource
 
@@ -113,7 +108,6 @@ export class BridgeManagementService extends Service {
     this._source = source
   }
 
-  /** Attach bridge-owned state after every declared service has been provided. */
   attach(source: BridgeManagementSource): void {
     this._source = source
   }

@@ -121,9 +121,7 @@ export interface BridgeConfig {
   serverHost?: string
   serverPort?: number
   altEndpoints?: string[]
-  /** HTTP prefix for platform account assets (default: /api). */
   apiPrefix?: string
-  /** Telegram attachment-menu Mini App for browsing platform-native group files. */
   groupFilesMiniApp?: {
     enabled?: boolean
     path?: string
@@ -132,26 +130,20 @@ export interface BridgeConfig {
     tokenTtlSeconds?: number
   }
   uploadPath?: string
-  /** Mute group chats by default unless the Telegram user explicitly enables them. */
   autoMuteGroupChats?: boolean
-  /** Visibility policy for users blocked through Telegram. */
   blockedContentMode?: BlockedContentMode
-  /** Whether QQ recalled messages remain visible as marked messages or are hidden. */
   recalledMessageMode?: 'hide' | 'show'
-  /** Optional native worker; it must expose public status/material only. */
   voiceWorker?: VoiceWorkerClient
-  /** Local Rust voice-worker Unix socket; an empty path leaves calls unavailable. */
+  /** 本地 Rust voice-worker Unix socket 路径；为空则禁用语音通话。 */
   voiceWorkerSocketPath?: string
-  /** Per-request Unix socket timeout for the voice worker. */
   voiceWorkerTimeoutMs?: number
-  /** Call-scoped real relay config source; without it voice media fails closed. */
+  /** 通话级媒体中继配置源；未配置时拒绝启动语音媒体。 */
   voiceMediaStartProvider?: VoiceMediaStartProvider
-  /** Allow direct ICE only when the configured MTProto host is loopback or private LAN. */
+  /** 仅当 MTProto 主机为回环或内网地址时允许直连 ICE。 */
   voiceDirectIce?: boolean
-  /** Public TURN host advertised to both Telegram and the native worker. */
   voiceTurnHost?: string
   voiceTurnPort?: number
-  /** Coturn REST-auth shared secret; only derived call-scoped credentials leave this process. */
+  /** Coturn REST 鉴权共享密钥，仅向外派生单次通话的临时凭据。 */
   voiceTurnSharedSecret?: string
   voiceTurnTtlSeconds?: number
   onTransferProgress?: (session: PlatformSession, progress: import('./platform.js').IMTransferProgress) => void | Promise<void>
@@ -203,11 +195,6 @@ export const Config = z.object({
   'zh-CN': zhCN,
 })
 
-/**
- * Bridge backend — a native cordis plugin. Translates MTProto RPC to an IM
- * platform. Each adapter supplies its own current-user profile; bridge assigns
- * one stable virtual phone and a 30-second login code to the Cordis entry.
- */
 export function apply(ctx: Context, config: BridgeConfig = {}): void {
   const generation = {}
   const platforms = new IMPlatformService(ctx)
@@ -232,8 +219,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     if (format.startsWith('slow local event profile')) bridgeLogger.info(format, ...args)
     else bridgeLogger.debug(format, ...args)
   }
-  // Dropping or releasing a reservation breaks a client's pts cursor on
-  // purpose, so it must stay visible outside verbose tracing.
+  // 放弃投递会破坏客户端 pts 连续性，非 debug 级别也必须记录告警。
   const updateTrace = (format: string, ...args: unknown[]) => {
     if (format.startsWith('abandoned update delivery')) bridgeLogger.warn(format, ...args)
     else bridgeLogger.debug(format, ...args)
@@ -354,12 +340,8 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
       socketWorker?.close()
     }
   }, 'mtproto-bridge.voice-calls')
-  // Only a send reaches UploadManager.complete(), and nothing calls remove() on
-  // the abandonment paths, so staged media, prepared sinks, and legacy part
-  // directories that a client walked away from are released here instead of
-  // accumulating for the life of the installation. An article draft is the one
-  // holder that never sends its media on its own, so the uploads it waits on
-  // stay until the draft is gone.
+  // 仅真正发出的消息会调用 `UploadManager.complete()`，客户端放弃的上传需定时清理；
+  // 图文草稿引用的上传在草稿删除前需保留。
   ctx.effect(() => {
     const timer = setInterval(() => {
       void drafts.pinnedUploadIds().then((pinned) => uploads.sweep(
@@ -423,7 +405,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
       await subscriptions.ingestLocalEvent(session, { type: 'request', request, delivery: 'recovery' })
     },
     (message, error) => {
-      // Cordis drops warn lines under the default INFO level, so use error to keep these visible.
+      // Cordis 默认 INFO 级别会丢弃 warn 日志，这里用 error 保证可见。
       if (error === undefined) bridgeLogger.error(message)
       else bridgeLogger.error('%s\n%s', message, error instanceof Error ? error.stack ?? `${error.name}: ${error.message}` : String(error))
     },
@@ -723,7 +705,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     return () => clearInterval(timer)
   }, 'mtproto-bridge.account-codes')
 
-  // Security: intentionally public, matching the anonymously subscribable account-list entry boundary.
+  // 与匿名可订阅的账号列表入口边界一致，无需鉴权。
   ctx.server.post(`${apiPrefix}/login-tokens/:platform/approve`, async (req, res) => {
     const declaredLength = Number(req.headers.get('content-length'))
     if (Number.isFinite(declaredLength) && declaredLength > 256) {
@@ -832,16 +814,13 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
   ctx.effect(async () => {
     await ctx.database.prepared()
     await legacyPhoneMigration
-    // Retained delivery rows are the durable difference journal. They must
-    // survive a restart so reconnecting devices can still recover the updates
-    // they missed; the store prunes them per scope on write instead.
+    // 持久化的投递记录是重连设备的 `getDifference` 日志，不能在重启时清空，由存储层在写入时按会话裁剪。
     await Promise.all(registry.ids.map(platformId => provision(platformId)))
     await publishStickerPacks()
     await subscriptions.startActiveSessions()
     return () => subscriptions.stop()
   })
 
-  // ── Synthetic / config ──
   ctx.mtproto.register('help.getConfig', async () => makeConfig(
     dcId, config.serverHost, config.serverPort, config.altEndpoints,
   ))
@@ -850,9 +829,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     _: 'nearestDc', country: 'US', thisDc: dcId, nearestDc: dcId,
   } as unknown as tl.TlObject))
 
-  // ── Auth ──
-  // Tracks which auth key last requested a login code, so the follow-up
-  // account.getPassword / auth.checkPassword calls during 2FA know the account.
+  // 记录各 authKey 最近一次请求验证码对应的账号，供后续 2FA 流程（`account.getPassword` / `auth.checkPassword`）关联。
   const pendingCodeLogins = new Map<string, { authId: string, expiresAt: number }>()
   const rememberCodeLogin = (authKeyId: Uint8Array | null, authId: string): void => {
     if (!authKeyId) return
@@ -883,9 +860,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     const { phoneNumber, phoneCode } = req as unknown as { phoneNumber: string, phoneCode: string }
     const [auth] = await ctx.database.get('mtproto_auth_session', { virtualPhone: normPhone(phoneNumber) })
     if (!auth) throw new RpcError(400, 'PHONE_NUMBER_UNOCCUPIED')
-    // An all-zero code (000000, or fewer zeros on clients that render a
-    // five-digit input) opts into the second factor: the client is told a
-    // password is required and continues with auth.checkPassword instead.
+    // 输入全 0 验证码（如 `000000`）时触发两步验证密码登录（`auth.checkPassword`）。
     if (/^0+$/.test(phoneCode) && isValidSrpVerifier(auth.passwordSrp)) throw new RpcError(400, 'SESSION_PASSWORD_NEEDED')
     if (!verifyLoginCode(auth.totpSecret, phoneCode)) throw new RpcError(400, 'PHONE_CODE_INVALID')
     return authorizePlatformSession(rpc, {
@@ -900,8 +875,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     const [auth] = authId
       ? await ctx.database.get('mtproto_auth_session', { id: authId })
       : []
-    // Passwords are managed from the dashboard, so the "set new password"
-    // algorithms are reported as unknown to keep clients out of that flow.
+    // 密码由管理后台维护，将设置新密码的算法标记为 unknown 以阻止客户端发起修改密码流程。
     const newAlgo = { _: 'passwordKdfAlgoUnknown' } as const
     const newSecureAlgo = { _: 'securePasswordKdfAlgoUnknown' } as const
     if (auth && isValidSrpVerifier(auth.passwordSrp) && authKeyId) {
@@ -979,7 +953,6 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     return authorizePlatformSession(rpc, identity)
   })
 
-  // ── Messages ──
   rpc.register('messages.getDialogs', async (rpc, req) =>
     (await requireBridgeSession(rpc)).dialogs.getDialogs(req as tl.messages.RawGetDialogsRequest))
   rpc.register('messages.getPeerDialogs', async (rpc, req) =>
@@ -1185,7 +1158,6 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
       req as tl.messages.RawGetMessageReactionsListRequest,
     ))
 
-  // ── Contacts / users ──
   rpc.register('contacts.block', async (rpc, req) => {
     const state = await requireBridgeSession(rpc)
     const change = await state.dialogs.blockPeer(req as tl.contacts.RawBlockRequest)
@@ -1262,7 +1234,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     _: 'updates', updates: [], users: [], chats: [], date: Math.floor(Date.now() / 1000), seq: 0,
   } as tl.RawUpdates))
 
-  // ── Voice calls (transient; never journaled) ──
+  // 语音通话状态为纯内存瞬态，不写入 update 日志。
   rpc.register('messages.getDhConfig', async (rpc, req) => {
     await requireBridgeSession(rpc)
     return voice.getDhConfig(req as tl.messages.RawGetDhConfigRequest)
@@ -1314,7 +1286,6 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
   rpc.register('phone.saveCallDebug', async (rpc, req) =>
     voice.saveCallDebug((await requireBridgeSession(rpc)).session, req as tl.phone.RawSaveCallDebugRequest))
 
-  // ── Updates ──
   rpc.register('updates.getState', async (rpc) =>
     updates.getState((await requireBridgeSession(rpc)).session.platformSessionId))
 
@@ -1329,13 +1300,9 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
       req as tl.updates.RawGetChannelDifferenceRequest,
     ))
 
-  // ── Post-login misc (keep the client's initial sync from stalling) ──
-  // Official Telegram Android still sends the parameterless #800fd57d form.
-  // An empty remote list preserves the app's bundled language packs.
+  // 官方 Telegram Android 仍会发送无参 `#800fd57d` 形式的 `langpack.getLanguages`，返回空列表可保留客户端内置语言包。
   rpc.register('langpack.getLanguages', async () => bareVector([]))
-  // Both the public and Android-internal registerDevice forms are advisory for
-  // this bridge; accepting them prevents push registration probes from stalling
-  // the rest of an Android msg_container.
+  // 接受 `registerDevice` 避免推送注册探测阻塞 Android `msg_container` 内的后续请求。
   rpc.register('account.registerDevice', async (rpc) => {
     await requireBridgeSession(rpc)
     return { _: 'boolTrue' }
@@ -1414,8 +1381,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
       phoneCodeHash: `hash_${auth.id}`,
     } as unknown as tl.TlObject
   })
-  // A QR token belongs to the permanent auth key that requested it. An SSO
-  // account-list user can approve it once; the Desktop poll then receives login success.
+  // 扫码登录 token 绑定到发起请求的永久 authKey；管理端确认后，客户端轮询即收到登录成功结果。
   rpc.register('auth.exportLoginToken', async (rpc) => {
     if (!rpc.authKeyId) throw new RpcError(401, 'AUTH_KEY_UNREGISTERED')
     const claim = loginTokens.claimApprovedForAuthKey(rpc.authKeyId)
@@ -1475,12 +1441,12 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
   ctx.logger('bridge').info('bridge backend registered (platforms: %s)', registry.ids.join(', '))
 }
 
-/** Normalize a phone to digits only — clients send '+' for sendCode but not for signIn. */
+/** 只保留数字（客户端在 `sendCode` 时带 `+`，`signIn` 时不带）。 */
 function normPhone(p: string): string {
   return p.replace(/\D/g, '')
 }
 
-/** Completes a new authorization only after its binding can receive transient replays. */
+/** 先持久化绑定并挂载平台状态，确保后续能接收瞬态重放后再完成会话初始化。 */
 export async function finalizeAuthorizedSession(
   rpc: ServerRpcContext,
   state: BridgeSessionState,

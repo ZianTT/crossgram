@@ -17,24 +17,16 @@ interface CustomEntry {
 interface RecentReaction {
   reactionType: 'emoji' | 'custom'
   reactionValue: string
-  /** Platform key of a custom reaction; survives the document id changing with the asset version. */
+  /** 自定义表情的平台 key；资源版本升级导致 documentId 变更时用于关联到当前版本。 */
   definitionKey?: string | null
   lastUsedAt: Date
 }
 
 export class ReactionRpc {
   private readonly _custom = new Map<number, CustomEntry>()
-  /**
-   * Documents published under a retired identity.
-   *
-   * The live update path keyed an inline custom emoji document by the
-   * conversation as well, so every cached message carried a per-conversation
-   * id. Keep those ids resolvable next to the canonical one, otherwise a client
-   * that already rendered such a message can never fetch its document or bytes.
-   */
+  /** 兼容旧版按会话维度生成的行内自定义表情 documentId，确保客户端已缓存的旧消息仍能拉取资源。 */
   private readonly _aliases = new Map<number, CustomEntry>()
   private readonly _memoryRecent = new Map<string, RecentReaction>()
-  /** Current published document id of every custom key seen in a platform catalog. */
   private readonly _currentByKey = new Map<string, number>()
   private _recentWrite = Promise.resolve()
 
@@ -96,14 +88,8 @@ export class ReactionRpc {
   }
 
   /**
-   * Recent reactions the client can still render.
-   *
-   * A custom reaction is stored by document id, and that id changes whenever
-   * the platform re-versions the asset. Telegram Desktop keeps a placeholder
-   * forever for a recent custom emoji that `getCustomEmojiDocuments` cannot
-   * resolve, so once this session knows its platform catalog, replace an id
-   * that is no longer published with its key's current document and drop the
-   * entry when the key itself left the catalog.
+   * 获取客户端可渲染的最近使用回应。
+   * 自定义回应的 documentId 会随资源版本变化；若原 ID 已失效，则替换为该 key 当前版本的 documentId，已下架的则跳过。
    */
   private async _recentReactions(limit: number): Promise<tl.TypeReaction[]> {
     if (limit <= 0) return []
@@ -131,7 +117,6 @@ export class ReactionRpc {
     return reactions
   }
 
-  /** The published document for a recent id, following a retired id to its key's current version. */
   private _currentDocumentId(id: number, definitionKey?: string | null): number | undefined {
     const key = definitionKey ?? this._entry(id)?.definition.key
     if (key !== undefined) return this._currentByKey.get(key)
@@ -160,12 +145,6 @@ export class ReactionRpc {
     }
   }
 
-  /**
-   * Record the platform's current catalog of a conversation.
-   *
-   * Only a catalog decides which version of a key is current: a message may
-   * still carry the definition it was reacted with before a re-version.
-   */
   private _registerCatalog(conversationId: string, context?: IMReactionContext): void {
     this.registerContext(conversationId, context)
     for (const definition of context?.available ?? []) {
@@ -174,14 +153,7 @@ export class ReactionRpc {
     }
   }
 
-  /**
-   * Register the document an inline custom emoji entity points at and return
-   * its canonical id.
-   *
-   * Both identities stay resolvable: the canonical id is what every projection
-   * and lookup uses, and the legacy per-conversation id keeps messages a client
-   * cached while the update path still emitted it renderable.
-   */
+  /** 注册行内自定义表情并返回规范 documentId，同时保留旧版按会话计算的别名 ID。 */
   registerInlineCustomEmoji(
     conversationId: string,
     definition: IMReactionDefinition,
@@ -197,7 +169,6 @@ export class ReactionRpc {
     return id
   }
 
-  /** A document this session published, by canonical or retired id. */
   private _entry(id: number): CustomEntry | undefined {
     return this._custom.get(id) ?? this._aliases.get(id)
   }
@@ -278,10 +249,7 @@ export class ReactionRpc {
       return false
     })
     if (found) return found
-    // A client keeps handing back the document id of a definition it cached
-    // before the relay re-keyed it (a changed asset version). Translate that
-    // retired id into the key it belonged to and use the current definition,
-    // so a recent reaction keeps working instead of failing as invalid.
+    // 客户端可能传入旧版本资源的 documentId，通过平台 key 映射回当前版本的定义。
     if (reaction._ === 'reactionCustomEmoji') {
       const retired = this._entry(reaction.documentId.toNumber())?.definition
       const current = retired && context.available.find((definition) => definition.key === retired.key)
@@ -417,12 +385,7 @@ export function customReactionDocumentId(
   ].join(':'))
 }
 
-/**
- * Document id the live update path used to publish for an inline custom emoji
- * before it shared the canonical identity with the history path: it mixed the
- * conversation id into the key and used the first catalog version. Clients keep
- * asking for it for messages they cached back then.
- */
+/** 旧版实时推送路径生成的行内自定义表情 documentId（含 conversationId，使用 v1 版本号）。 */
 export function legacyInlineCustomEmojiDocumentId(
   platformSessionId: string,
   conversationId: string,

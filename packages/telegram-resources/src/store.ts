@@ -6,23 +6,15 @@ import { readFileSync, statSync } from 'node:fs'
 import { URL } from 'node:url'
 
 /**
- * 加载由 `telegram-tgs-assets` 抓取并生成的官方 Telegram 资源（reactions / 大 emoji /
- * 特效的 TGS 字节 + index.json 元数据），以「对官方 MTProto 响应做忠实回放」的方式对外提供：
- *
- * - `availableReactions()`    -> `messages.availableReactions`
- * - `stickerSet(kind)`        -> `messages.stickerSet`（AnimatedEmoji / Animations / Generic）
- * - `availableEffects()`      -> `messages.availableEffects`
- * - `getFile(docId)`          -> 按真实 doc id 从本地返回 TGS 字节
- *
- * 所有 Document 元数据都来自 Telegram 真实返回（id / access_hash / file_reference / dc_id /
- * mime / attributes / thumbs），客户端按 doc id 缓存、通过 `upload.getFile` 取字节，与我们无关。
+ * 加载预生成的官方 Telegram 资源（reactions / 大 emoji / 特效的 TGS 文件与 `index.json` 元数据），
+ * 原样回放官方 `Document` 元数据并按真实 doc id 提供本地 TGS 字节。
  */
 
 interface DocMeta {
   _: 'document'
   id: string
   accessHash: string
-  fileReference: string // hex
+  fileReference: string
   date: number
   mimeType: string
   size: number
@@ -117,12 +109,7 @@ export class TelegramResources implements TelegramResourceProvider {
       fileReference: Buffer.from(meta.fileReference, 'hex'),
       date: meta.date,
       mimeType: meta.mimeType,
-      // Telegram clients use Document.size to decide whether another
-      // upload.getFile part is required. Some captured metadata differs from
-      // the bundled file by one or two bytes; advertising that stale size
-      // leaves FileLoadOperation waiting forever at EOF and blocks the rest of
-      // Android's small-media queue. Always describe the exact bytes served by
-      // getFile(), including when the same document id appears in several feeds.
+      // 以磁盘实际文件大小为准：抓取元数据偶有 1~2 字节偏差，会导致客户端在 EOF 处一直等待下一分片并阻塞下载队列。
       size: this._idToSize.get(meta.id) ?? meta.size,
       dcId: meta.dcId,
       attributes: meta.attributes.map(reviveTlValue) as tl.TypeDocumentAttribute[],
@@ -220,7 +207,7 @@ export class TelegramResources implements TelegramResourceProvider {
     return this.availableEffects()
   }
 
-  /** 按 doc id 取本地字节；返回 undefined 表示这不是官方资源（交给 bridge 其它逻辑处理）。 */
+  /** 按 doc id 读取本地资源字节；非官方资源返回 `undefined`。 */
   getFile(docId: string | number | Long): { bytes: Uint8Array; mimeType: string } | undefined {
     const key = docId instanceof Long ? docId.toString() : String(docId)
     const file = this._idToFile.get(key)
@@ -271,7 +258,6 @@ function reviveTlValue(value: unknown): unknown {
   return output
 }
 
-/** 直接创建资源 provider；通常应通过本包的 Cordis 插件完成注册。 */
 export function createTelegramResources(assetsBase?: URL): TelegramResources {
   return new TelegramResources(assetsBase)
 }
