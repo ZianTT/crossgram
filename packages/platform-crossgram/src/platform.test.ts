@@ -1257,6 +1257,45 @@ describe('QQNTPlatform mapping', () => {
     ])
   })
 
+  it('derives the dialog read boundary from the first unread cursor and caches it per cursor', async () => {
+    const platform = new QQNTPlatform()
+    const conversation = (msgSeq: string) => ({
+      id: '2:group', kind: 'group' as const, title: 'Group',
+      peerUid: 'group', peerUin: 'group', chatType: 2 as const,
+      unreadCount: 3, firstUnread: { msgSeq, msgTime: '10' },
+    })
+    platform.client.getDialogs = vi.fn(async () => ({ conversations: [conversation('30')] }))
+    platform.client.getReactionCatalog = vi.fn(async () => ({ available: [], reactions: [], maxSelected: 20 }))
+    platform.client.getHistory = vi.fn(async () => ({ messages: [
+      {
+        id: 'still-unread', conversationId: '2:group', senderId: 'alice', timestamp: 31, msgSeq: '31',
+        outgoing: false, parts: [{ type: 'text' as const, text: 'unread' }],
+      },
+      {
+        id: 'read-so-far', conversationId: '2:group', senderId: 'alice', timestamp: 29, msgSeq: '29',
+        outgoing: false, parts: [{ type: 'text' as const, text: 'read' }],
+      },
+    ] }))
+
+    // QQ 只在按需拉取未读窗口时才知道已读边界，第一次列表拿不到，边界异步补上。
+    const first = await platform.getDialogs(session)
+    expect(first.dialogs[0].readInboxMaxMessage).toBeUndefined()
+
+    await vi.waitFor(() => expect(platform.client.getHistory).toHaveBeenCalledWith('2:group', expect.objectContaining({
+      aroundUnreadSeq: '30',
+    })))
+    const second = await platform.getDialogs(session)
+    expect(second.dialogs[0].readInboxMaxMessage).toMatchObject({ id: 'read-so-far' })
+
+    // 游标没变就不会重复拉取未读窗口。
+    await platform.getDialogs(session)
+    expect(platform.client.getHistory).toHaveBeenCalledTimes(1)
+
+    platform.client.getDialogs = vi.fn(async () => ({ conversations: [conversation('40')] }))
+    await platform.getDialogs(session)
+    await vi.waitFor(() => expect(platform.client.getHistory).toHaveBeenCalledTimes(2))
+  })
+
   it('filters and cleans zero-peer dialogs without hiding real QQ service messages', async () => {
     const remove = vi.fn(async () => {})
     const database = {

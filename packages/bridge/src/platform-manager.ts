@@ -703,6 +703,9 @@ export class PlatformDataService {
         ...dialog,
         conversation: { ...previous?.conversation, ...dialog.conversation },
         lastMessage: dialog.lastMessage ?? previous?.lastMessage,
+        // 上游常常报不出已读边界（QQ 只在按需拉取未读窗口时才知道），此时沿用已落库的边界，
+        // 否则会话会被当成「一条都没读」返回给客户端。
+        readInboxMaxMessage: dialog.readInboxMaxMessage ?? previous?.readInboxMaxMessage,
       }
     })
     const upstreamSlots = injectBridgeOwned ? Math.max(0, (query.limit ?? 100) - bridgeOwned.length) : undefined

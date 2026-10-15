@@ -156,3 +156,55 @@ describe('dialog preview projection', () => {
     expect(dialogs[0].topMessage % 16).toBe(0)
   })
 })
+
+// QQ only knows the read boundary once it has fetched an unread window, so the
+// platform reports an unread dialog without one. `messages.getPeerDialogs` used
+// to answer from the store, which dropped the boundary the store had already
+// learned, publishing `read_inbox_max_id = 0` ("nothing was ever read"). A
+// client then treats the whole dialog as unread: its unread separator lands at
+// the beginning and opening the dialog jumps to the oldest loaded message.
+describe('stored dialog read boundary', () => {
+  const unreadConversation = { id: 'unread-peer', kind: 'direct' as const, title: 'Unread peer' }
+  const boundary: IMMessage = {
+    id: 'unread-boundary', conversationId: unreadConversation.id, senderId: 'alice', timestamp: 1_785_100_000,
+    content: { parts: [{ type: 'text', text: 'read so far' }] },
+  }
+  const latest: IMMessage = {
+    id: 'unread-latest', conversationId: unreadConversation.id, senderId: 'bob', timestamp: 1_785_100_100,
+    content: { parts: [{ type: 'text', text: 'still unread' }] },
+  }
+  const unreadPlatform: IMPlatform = {
+    ...platform,
+    async getDialogs() {
+      return {
+        dialogs: [{ conversation: unreadConversation, unreadCount: 2, lastMessage: latest }],
+        total: 1,
+      }
+    },
+  }
+
+  it('publishes the boundary the store already learned', async () => {
+    const store = await createStore()
+    await store.ingestDialogs(session, [{
+      conversation: unreadConversation, unreadCount: 2, lastMessage: latest, readInboxMaxMessage: boundary,
+    }])
+    const rpc = new DialogRpc(unreadPlatform, session, store)
+    const [listed] = dialogsOf(await rpc.getDialogs(getDialogsRequest()))
+    const peer = listed.peer._ === 'peerUser'
+      ? { _: 'inputPeerUser' as const, userId: listed.peer.userId, accessHash: Long.ZERO }
+      : undefined
+    expect(peer).toBeTruthy()
+
+    const result = await rpc.getPeerDialogs({
+      _: 'messages.getPeerDialogs', peers: [{ _: 'inputDialogPeer', peer: peer! }],
+    })
+    const dialog = result.dialogs[0] as tl.RawDialog
+
+    expect(dialog).toMatchObject({ unreadCount: 2 })
+    expect(dialog.readInboxMaxId).toBeGreaterThan(0)
+    expect(dialog.readInboxMaxId).toBeLessThan(dialog.topMessage)
+    expect(await store.findProjectedByTlId(
+      session.platformSessionId, dialog.readInboxMaxId, unreadConversation.id,
+    )).toMatchObject({ source: { id: boundary.id } })
+  })
+})

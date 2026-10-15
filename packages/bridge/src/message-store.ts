@@ -314,26 +314,37 @@ export class MessageStore {
         const conversationRow = conversationRows.get(dialog.conversation.id)
           ?? existingConversations.get(dialog.conversation.id)
         if (!conversationRow) throw new Error('failed to persist conversation')
+        let latestMessageRow: IMMessageRow | undefined
         if (dialog.lastMessage) {
           const result = await this._ingestMessage(
             database, session, conversationRow, dialog.lastMessage, {}, now, allocationCache,
           )
+          latestMessageRow = result.message
           messages.push(result.message)
         }
-        if (
-          dialog.readInboxMaxMessage
-          && dialog.readInboxMaxMessage.id !== dialog.lastMessage?.id
-        ) {
-          const result = await this._ingestMessage(
-            database,
-            session,
-            conversationRow,
-            dialog.readInboxMaxMessage,
-            { allocation: 'history' },
-            now,
-            allocationCache,
-          )
-          messages.push(result.message)
+        // 上游（QQ）只在按需拉取未读窗口时才给出已读边界；没有新边界时沿用上次已知的边界，
+        // 否则会话会被报成「一条都没读」（`read_inbox_max_id = 0`），客户端的未读分隔线与定位都会失真。
+        let readInboxMaxMessageId = conversationRow.readInboxMaxMessageId ?? null
+        if (dialog.readInboxMaxMessage) {
+          if (dialog.readInboxMaxMessage.id === dialog.lastMessage?.id) {
+            readInboxMaxMessageId = latestMessageRow?.id ?? readInboxMaxMessageId
+          } else {
+            const result = await this._ingestMessage(
+              database,
+              session,
+              conversationRow,
+              dialog.readInboxMaxMessage,
+              { allocation: 'history' },
+              now,
+              allocationCache,
+            )
+            messages.push(result.message)
+            readInboxMaxMessageId = result.message.id
+          }
+        }
+        if ((conversationRow.readInboxMaxMessageId ?? null) !== readInboxMaxMessageId) {
+          await database.set('mtproto_im_conversation', { id: conversationRow.id }, { readInboxMaxMessageId })
+          conversationRow.readInboxMaxMessageId = readInboxMaxMessageId
         }
       }
       return messages
@@ -1986,18 +1997,36 @@ export class MessageStore {
   private async _hydrateDialogs(conversations: readonly IMConversationRow[]): Promise<IMDialog[]> {
     const latestRows = await this._latestMessagesForConversations(conversations.map((conversation) => conversation.id))
     const rows = latestRows.flatMap((row) => row ? [row] : [])
-    const hydrated = await this._hydrateMessages(rows, new Map(conversations.map((conversation) => [
+    const conversationIds = new Map(conversations.map((conversation) => [
       conversation.id, conversation.platformConversationId,
-    ])))
+    ]))
+    const hydrated = await this._hydrateMessages(rows, conversationIds)
     const hydratedById = new Map(rows.map((row, index) => [row.id, hydrated[index]]))
+    // 已读边界消息通常不是最新消息，需单独取回；行已不存在时退回 undefined，由上层按未读计数决定。
+    const boundaryRows = await this._messagesByIds(conversations
+      .map((conversation) => conversation.readInboxMaxMessageId)
+      .filter((id): id is number => typeof id === 'number' && id > 0)
+      .filter((id) => !hydratedById.has(id)))
+    const boundaries = await this._hydrateMessages(boundaryRows, conversationIds)
+    const boundaryById = new Map(boundaryRows.map((row, index) => [row.id, boundaries[index]]))
     return conversations.map((conversation, index) => {
       const latest = latestRows[index]
+      const boundaryId = conversation.readInboxMaxMessageId ?? undefined
+      const readInboxMaxMessage = boundaryId === undefined
+        ? undefined
+        : hydratedById.get(boundaryId) ?? boundaryById.get(boundaryId)
       return {
         conversation: toConversation(conversation),
         unreadCount: conversation.unreadCount,
         lastMessage: latest ? hydratedById.get(latest.id) : undefined,
+        ...(readInboxMaxMessage ? { readInboxMaxMessage } : {}),
       }
     })
+  }
+
+  private async _messagesByIds(ids: readonly number[]): Promise<IMMessageRow[]> {
+    const unique = [...new Set(ids)]
+    return unique.length ? this._database.get('mtproto_im_message', { id: { $in: unique } }) : []
   }
 
   private async _latestMessagesForConversations(

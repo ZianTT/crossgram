@@ -66,6 +66,10 @@ export const name = 'im-platform-qqnt'
 export const inject = ['imPlatform', 'imSticker', 'database', 'model']
 
 const DIALOGS_POLL_INTERVAL_MS = 15_000
+/** 补已读边界时读取的未读窗口大小：够覆盖首条未读前后即可。 */
+const READ_MARKER_WINDOW = 4
+/** 同时补多少个会话的已读边界。 */
+const READ_MARKER_CONCURRENCY = 3
 const REACTION_CATALOG_GRACE_MS = 10
 const REACTION_CATALOG_RPC_GRACE_MS = 250
 const REACTION_CATALOG_RETRY_DELAY_MS = 60_000
@@ -223,6 +227,11 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   private readonly conversations = new Map<string, IMConversation<QQMediaLocator>>()
   private readonly savedMessagesConversationIds = new Map<string, string>()
   private readonly firstUnreadSeq = new Map<string, string>()
+  /** 已读边界（首条未读之前的一条消息），按「会话 + 首条未读游标」缓存：QQ 只在按需拉取未读窗口时才给出它。 */
+  private readonly readMarkers = new Map<string, { seq: string, message?: IMMessage<QQMediaLocator> }>()
+  private readonly readMarkerLoads = new Map<string, Promise<void>>()
+  private readMarkerInFlight = 0
+  private readonly readMarkerWaiters: Array<() => void> = []
   private reactionCatalog?: IMReactionContext
   private reactionCatalogPromise?: Promise<IMReactionContext>
   private reactionCatalogRetryAt = 0
@@ -729,12 +738,82 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
             : undefined,
           readInboxMaxMessage: conversation.readInboxMaxMessage
             ? this.mapMessage(conversation.readInboxMaxMessage, mappedConversation.id)
-            : undefined,
+            : this.ensureReadMarker(session, conversation, mappedConversation.id),
         }
       }),
       nextCursor: response.nextCursor,
       total: response.total,
     }
+  }
+
+  /**
+   * QQ 的会话只给「首条未读」游标，已读边界要额外拉一次未读窗口才知道。缺边界时会话会被当成
+   * 「一条都没读」（`read_inbox_max_id = 0`），客户端的分隔线与打开会话时的定位都会错乱，
+   * 因此这里补出边界并缓存：游标不变就不再重复拉取。
+   */
+  private ensureReadMarker(
+    session: PlatformSession,
+    conversation: WireConversation,
+    conversationId: string,
+  ): IMMessage<QQMediaLocator> | undefined {
+    const seq = conversation.firstUnread?.msgSeq
+    if (!seq || !(conversation.unreadCount ?? 0)) return undefined
+    const cached = this.readMarkers.get(conversationId)
+    if (cached?.seq === seq) return cached.message
+    if (cached?.seq !== seq) this.readMarkers.set(conversationId, { seq })
+    if (!this.readMarkerLoads.has(conversationId)) {
+      const load = this.queueReadMarker(() =>
+        this.loadReadMarker(session, conversation.id, conversationId, seq))
+        .then(() => undefined, () => undefined)
+        .finally(() => {
+          if (this.readMarkerLoads.get(conversationId) === load) this.readMarkerLoads.delete(conversationId)
+        })
+      this.readMarkerLoads.set(conversationId, load)
+    }
+    return undefined
+  }
+
+  /** 一页对话可能带上几十个未读会话，补边界要限流，避免同时打满 relay。 */
+  private async queueReadMarker<T>(run: () => Promise<T>): Promise<T> {
+    while (this.readMarkerInFlight >= READ_MARKER_CONCURRENCY) {
+      await new Promise<void>((resolve) => this.readMarkerWaiters.push(resolve))
+    }
+    this.readMarkerInFlight++
+    try {
+      return await run()
+    } finally {
+      this.readMarkerInFlight--
+      this.readMarkerWaiters.shift()?.()
+    }
+  }
+
+  private async loadReadMarker(
+    session: PlatformSession,
+    wireConversationId: string,
+    conversationId: string,
+    seq: string,
+  ): Promise<void> {
+    const firstUnread = numericSequence(seq)
+    if (firstUnread === undefined) return
+    const response = await this.client.getHistory(
+      await this.wireConversationId(session, wireConversationId),
+      { aroundUnreadSeq: seq, limit: READ_MARKER_WINDOW },
+    )
+    let boundary: WireMessage | undefined
+    let boundarySequence: bigint | undefined
+    for (const message of response.messages) {
+      const sequence = numericSequence(message.msgSeq)
+      if (sequence === undefined || sequence >= firstUnread) continue
+      if (boundarySequence !== undefined && sequence <= boundarySequence) continue
+      boundary = message
+      boundarySequence = sequence
+    }
+    if (this.readMarkers.get(conversationId)?.seq !== seq) return
+    if (!boundary) return
+    this.readMarkers.set(conversationId, {
+      seq,
+      message: this.mapMessage(boundary, conversationId),
+    })
   }
 
   private async prepareDialogPage(
@@ -3219,6 +3298,12 @@ function wireMessageHasQQFace(message: WireMessage | undefined): boolean {
 
 function isFilteredConversationId(value: string): boolean {
   return isInvalidZeroPeerConversationId(value)
+}
+
+/** QQ 的 `msgSeq` 是十进制字符串，可能超出 Number 的安全范围，比较时才用 BigInt。 */
+function numericSequence(value: string | undefined): bigint | undefined {
+  if (!value || !/^\d+$/.test(value)) return undefined
+  return BigInt(value)
 }
 
 function normalizeTextPart(

@@ -64,6 +64,8 @@ export interface IMConversationRow {
   avatar: JsonValue | null
   metadata: JsonObject
   unreadCount: number
+  /** 上游报告的已读边界消息（本地消息行 ID）。缺少上游数据时保留旧值，避免把「已读到哪」退化成「一条都没读」。 */
+  readInboxMaxMessageId: number | null
   updatedAt: Date
 }
 
@@ -349,6 +351,7 @@ export function defineModels(ctx: Context): void {
     spacePlatformId: { type: 'text', nullable: true }, avatar: { type: 'json', nullable: true },
     metadata: 'json', updatedAt: 'timestamp',
     unreadCount: 'unsigned',
+    readInboxMaxMessageId: { type: 'unsigned', nullable: true },
   }, {
     primary: 'id', autoInc: true,
     unique: [['platformSessionId', 'platformConversationId']],

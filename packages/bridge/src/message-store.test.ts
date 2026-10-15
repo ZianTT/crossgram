@@ -199,6 +199,47 @@ describe('MessageStore', () => {
       ])
   })
 
+  it('persists the dialog read boundary and keeps it when the upstream stops reporting one', async () => {
+    const { store } = await createStore()
+    const conversation: IMConversation = { id: 'unread-dialog', kind: 'group', title: 'Unread' }
+    const boundary: IMMessage = {
+      id: 'read-boundary', conversationId: conversation.id, senderId: 'alice', timestamp: 20,
+      content: { parts: [{ type: 'text', text: 'read so far' }] },
+    }
+    const latest: IMMessage = {
+      id: 'latest-message', conversationId: conversation.id, senderId: 'bob', timestamp: 30,
+      content: { parts: [{ type: 'text', text: 'unread' }] },
+    }
+
+    await store.ingestDialogs(session, [{
+      conversation, unreadCount: 5, lastMessage: latest, readInboxMaxMessage: boundary,
+    }])
+    const [persisted] = await store.readDialogs(session.platformSessionId, [conversation.id])
+    expect(persisted).toMatchObject({
+      unreadCount: 5,
+      lastMessage: { id: latest.id },
+      readInboxMaxMessage: { id: boundary.id },
+    })
+
+    // QQ 只在按需拉取未读窗口时才知道已读边界：后续对话列表不带边界时不能把已知边界丢掉，
+    // 否则客户端会收到 `read_inbox_max_id = 0`（「一条都没读」）并把整个会话当成未读。
+    await store.ingestDialogs(session, [{ conversation, unreadCount: 7, lastMessage: latest }])
+    const [kept] = await store.readDialogs(session.platformSessionId, [conversation.id])
+    expect(kept).toMatchObject({
+      unreadCount: 7,
+      readInboxMaxMessage: { id: boundary.id },
+    })
+
+    await store.ingestDialogs(session, [{
+      conversation, unreadCount: 0, lastMessage: latest, readInboxMaxMessage: latest,
+    }])
+    const [advanced] = await store.readDialogs(session.platformSessionId, [conversation.id])
+    expect(advanced).toMatchObject({
+      unreadCount: 0,
+      readInboxMaxMessage: { id: latest.id },
+    })
+  })
+
   it('revalidates latest rows for a 100-dialog first screen and bulk-hydrates related data', async () => {
     const { ctx, store } = await createStore()
     const conversations = Array.from({ length: 100 }, (_, index) => ({
