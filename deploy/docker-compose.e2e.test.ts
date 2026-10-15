@@ -102,8 +102,10 @@ suite('Crossgram Docker Compose deployment E2E', () => {
   }, 300_000)
 
   it('builds the application image, starts it behind PostgreSQL and publishes a reachable MTProto port', async () => {
+    // No --wait-timeout: docker compose takes integer seconds and other compose
+    // implementations take a duration, so the timeouts below bound the wait.
     const argv = command([
-      'up', '--detach', '--build', '--wait', '--wait-timeout', '20m',
+      'up', '--detach', '--build', '--wait',
       ...(withBridge ? ['--profile', 'qqnt'] : []),
       ...services,
     ])

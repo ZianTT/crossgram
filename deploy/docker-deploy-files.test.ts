@@ -87,6 +87,13 @@ describe('Crossgram Docker Compose deployment', () => {
     for (const limit of ['768m', '2g']) expect(source).toContain(`#       memory: ${limit}`)
   })
 
+  it('passes the e2e only flags every compose implementation parses', () => {
+    // --wait-timeout is seconds in docker compose and a duration elsewhere.
+    const source = read(deployDir, 'docker-compose.e2e.test.ts')
+    expect(source).not.toContain("'--wait-timeout'")
+    expect(source).toContain("'--wait'")
+  })
+
   it('can be deployed from the compose file alone, without a checkout', () => {
     // `docker compose up -d` only pulls images and named volumes, so a lone
     // compose file works; the build override is read only with --build.
