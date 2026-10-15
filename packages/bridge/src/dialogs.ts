@@ -392,7 +392,20 @@ export class DialogRpc {
     // Preserve the platform's authoritative order. Re-sorting each page makes
     // Telegram's last offset peer point into the middle of the upstream page,
     // causing the next request to overlap or repeat the first page.
-    const all = loaded.dialogs.slice()
+    // Pinned dialogs never appear in the paginated stream: clients either load
+    // them through getPinnedDialogs (exclude_pinned) or receive them ahead of
+    // the first page, as Telegram does.
+    const pinnedPeerIds = new Set(await this._dialogFolders?.pinnedPeerIds(
+      this._session.platformSessionId,
+    ) ?? [])
+    const firstPage = req.offsetPeer._ === 'inputPeerEmpty' && !req.offsetId && !req.offsetDate
+    const leadingPinned = pinnedPeerIds.size && firstPage && !req.excludePinned
+      ? await this._pinnedDialogs(folderId, archivedPeerIds, loaded.dialogs)
+      : []
+    const all = [
+      ...leadingPinned,
+      ...loaded.dialogs.filter((dialog) => !pinnedPeerIds.has(dialog.conversation.id)),
+    ]
     const usersAt = performance.now()
     await this._persistUsers(all
       .filter((dialog) => dialog.conversation.kind === 'direct')
@@ -460,6 +473,9 @@ export class DialogRpc {
         this._effectiveFolderId(dialog.conversation, archivedPeerIds) || undefined,
         dialogProjections.get(dialog.conversation.id),
       )))
+    for (const item of materialized) {
+      if (pinnedPeerIds.has(item.source.conversation.id)) item.dialog.pinned = true
+    }
     const materializeMs = performance.now() - materializeAt
     let start = 0
     if (req.offsetPeer._ !== 'inputPeerEmpty') {
@@ -474,7 +490,7 @@ export class DialogRpc {
       if (index >= 0) start = index + 1
     }
 
-    const limit = clampLimit(req.limit)
+    const limit = clampLimit(req.limit) + leadingPinned.length
     const page = materialized.slice(start, start + limit)
     const total = loaded.total ?? (loaded.nextCursor ? all.length + 1 : all.length)
     const sliced = start > 0 || page.length < total
@@ -550,6 +566,18 @@ export class DialogRpc {
       seen.add(peerId)
     }
 
+    const pinnedPeerIds = new Set(await this._dialogFolders?.pinnedPeerIds(
+      this._session.platformSessionId,
+    ) ?? [])
+    const materialized = await this._materializePeerDialogs(selected, archivedPeerIds, pinnedPeerIds)
+    return this._peerDialogsResult(materialized, archive)
+  }
+
+  private async _materializePeerDialogs(
+    selected: readonly IMDialog[],
+    archivedPeerIds: ReadonlySet<string>,
+    pinnedPeerIds: ReadonlySet<string>,
+  ) {
     if (!this._store) await Promise.all(selected.map((dialog) => this._loadHistory(dialog.conversation.id)))
     await this._syncStoredUsers(selected.flatMap((dialog) => [
       ...(dialog.conversation.kind === 'direct' ? [dialog.conversation.id] : []),
@@ -563,6 +591,16 @@ export class DialogRpc {
         dialog, drafts.get(dialog.conversation.id),
         this._effectiveFolderId(dialog.conversation, archivedPeerIds) || undefined,
       )))
+    for (const item of materialized) {
+      if (pinnedPeerIds.has(item.source.conversation.id)) item.dialog.pinned = true
+    }
+    return materialized
+  }
+
+  private async _peerDialogsResult(
+    materialized: Awaited<ReturnType<DialogRpc['_materializePeerDialogs']>>,
+    archive?: Awaited<ReturnType<DialogRpc['_archiveFolderDialog']>>,
+  ): Promise<tl.messages.RawPeerDialogs> {
     const state = await this._store?.getUpdateState(this._session.platformSessionId)
     return {
       _: 'messages.peerDialogs',
@@ -1234,28 +1272,122 @@ export class DialogRpc {
 
   async getPinnedDialogs(folderId = 0): Promise<tl.messages.RawPeerDialogs> {
     if (folderId !== 0 && folderId !== 1) throw new RpcError(400, 'FOLDER_ID_INVALID')
+    await this._hydratePeers()
     const archive = folderId === 0 ? await this._archiveFolderDialog() : undefined
+    const archivedPeerIds = await this._dialogFolders?.archivedPeerIds(
+      this._session.platformSessionId,
+    ) ?? new Set<string>()
+    const pinned = await this._pinnedDialogs(folderId, archivedPeerIds)
+    const materialized = await this._materializePeerDialogs(
+      pinned, archivedPeerIds, new Set(pinned.map((dialog) => dialog.conversation.id)),
+    )
+    return this._peerDialogsResult(materialized, archive && {
+      ...archive, dialog: { ...archive.dialog, pinned: true },
+    })
+  }
+
+  /**
+   * Pins or unpins one dialog. Returns the update for the account's other
+   * devices, or undefined when the dialog already had the requested state.
+   */
+  async toggleDialogPin(
+    req: tl.messages.RawToggleDialogPinRequest,
+  ): Promise<tl.RawUpdateDialogPinned | undefined> {
+    const pending = this._folderEditQueue.then(() => this._toggleDialogPin(req))
+    this._folderEditQueue = pending.then(() => undefined, () => undefined)
+    return pending
+  }
+
+  private async _toggleDialogPin(
+    req: tl.messages.RawToggleDialogPinRequest,
+  ): Promise<tl.RawUpdateDialogPinned | undefined> {
+    if (!this._dialogFolders) throw new RpcError(500, 'FOLDER_STORE_UNAVAILABLE')
+    // The archive folder is always pinned at the top of the main list.
+    if (req.peer._ === 'inputDialogPeerFolder') return undefined
+    if (req.peer._ !== 'inputDialogPeer') throw new RpcError(400, 'PEER_ID_INVALID')
+    await this._hydratePeers()
+    const peerId = this._resolvePeer(req.peer.peer)
+    const pinned = req.pinned === true
+    const changed = await this._dialogFolders.setPeerPinned(this._session.platformSessionId, peerId, pinned)
+    if (!changed) return undefined
+    const archivedPeerIds = await this._dialogFolders.archivedPeerIds(this._session.platformSessionId)
+    const folderId = this._effectiveFolderId(this._conversation(peerId), archivedPeerIds)
     return {
-      _: 'messages.peerDialogs',
-      dialogs: archive ? [{ ...archive.dialog, pinned: true }] : [],
-      messages: archive?.messages ?? [], chats: archive?.chats ?? [], users: archive?.users ?? [],
-      state: {
-        _: 'updates.state', pts: this._pts, qts: 0,
-        date: Math.floor(Date.now() / 1000), seq: 0, unreadCount: 0,
-      },
+      _: 'updateDialogPinned', pinned, folderId: folderId || undefined,
+      peer: { _: 'dialogPeer', peer: this._conversationPeer(this._conversation(peerId)) },
+    }
+  }
+
+  /** Replaces one folder's pinned order and returns the update for the account's other devices. */
+  async reorderPinnedDialogs(
+    req: tl.messages.RawReorderPinnedDialogsRequest,
+  ): Promise<tl.RawUpdatePinnedDialogs> {
+    const pending = this._folderEditQueue.then(() => this._reorderPinnedDialogs(req))
+    this._folderEditQueue = pending.then(() => undefined, () => undefined)
+    return pending
+  }
+
+  private async _reorderPinnedDialogs(
+    req: tl.messages.RawReorderPinnedDialogsRequest,
+  ): Promise<tl.RawUpdatePinnedDialogs> {
+    if (req.folderId !== 0 && req.folderId !== 1) throw new RpcError(400, 'FOLDER_ID_INVALID')
+    const folderId = req.folderId as 0 | 1
+    // Clients send this during dialog synchronization. Without a store there
+    // are no pins to reorder, and an error makes Android retry forever.
+    if (!this._dialogFolders) return { _: 'updatePinnedDialogs', folderId: folderId || undefined, order: [] }
+    await this._hydratePeers()
+    const order = req.order.flatMap((entry) => {
+      // The archive folder is implicitly pinned; it never occupies a stored slot.
+      if (entry._ === 'inputDialogPeerFolder') return []
+      if (entry._ !== 'inputDialogPeer') throw new RpcError(400, 'PEER_ID_INVALID')
+      return [this._resolvePeer(entry.peer)]
+    })
+    const archivedPeerIds = await this._dialogFolders.archivedPeerIds(this._session.platformSessionId)
+    const previous = (await this._dialogFolders.pinnedPeerIds(this._session.platformSessionId))
+      .filter((peerId) => this._effectiveFolderId(this._conversation(peerId), archivedPeerIds) === folderId)
+    const next = await this._dialogFolders.reorderPinnedPeers(
+      this._session.platformSessionId, order, previous, req.force === true,
+    )
+    return {
+      _: 'updatePinnedDialogs', folderId: folderId || undefined,
+      order: [
+        ...(folderId === 0 && req.order.some((entry) => entry._ === 'inputDialogPeerFolder')
+          ? [{ _: 'dialogPeerFolder' as const, folderId: 1 }]
+          : []),
+        ...next.map((peerId) => ({
+          _: 'dialogPeer' as const, peer: this._conversationPeer(this._conversation(peerId)),
+        })),
+      ],
     }
   }
 
   /**
-   * The bridge does not expose pinned ordinary peers, but Telegram clients send this
-   * housekeeping RPC during dialog synchronization. A successful no-op is
-   * preferable to METHOD_NOT_IMPLEMENTED, which Android keeps retrying.
+   * Stored pinned dialogs of one folder (or all folders), in pinned order.
+   * Dialogs already loaded by the caller are reused; the rest come from the
+   * message store, so a pin survives the dialog scrolling off the first page.
    */
-  async reorderPinnedDialogs(
-    req: tl.messages.RawReorderPinnedDialogsRequest,
-  ): Promise<tl.TlObject> {
-    if (req.folderId !== 0 && req.folderId !== 1) throw new RpcError(400, 'FOLDER_ID_INVALID')
-    return { _: 'boolTrue' } as unknown as tl.TlObject
+  private async _pinnedDialogs(
+    folderId: 0 | 1 | undefined,
+    archivedPeerIds: ReadonlySet<string>,
+    loaded: readonly IMDialog[] = [],
+  ): Promise<IMDialog[]> {
+    const pinnedPeerIds = await this._dialogFolders?.pinnedPeerIds(this._session.platformSessionId) ?? []
+    if (!pinnedPeerIds.length) return []
+    const byId = new Map(loaded.map((dialog) => [dialog.conversation.id, dialog]))
+    const missing = pinnedPeerIds.filter((peerId) => !byId.has(peerId))
+    if (missing.length && this._store) {
+      for (const dialog of await this._store.readDialogs(this._session.platformSessionId, missing)) {
+        byId.set(dialog.conversation.id, dialog)
+      }
+    }
+    return pinnedPeerIds.flatMap((peerId) => {
+      const dialog = byId.get(peerId)
+      if (!dialog) return []
+      if (folderId !== undefined && this._effectiveFolderId(dialog.conversation, archivedPeerIds) !== folderId) return []
+      this._conversations.set(peerId, dialog.conversation)
+      this._peerId(peerId)
+      return [dialog]
+    })
   }
 
   async getContacts(): Promise<tl.contacts.RawContacts> {

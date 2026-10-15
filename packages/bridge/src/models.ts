@@ -283,6 +283,8 @@ export interface DialogFolderPeerRow {
   platformSessionId: string
   platformConversationId: string
   folderId: number
+  /** Position among pinned dialogs (ascending); null when the dialog is not pinned. */
+  pinnedOrder: number | null
   updatedAt: Date
 }
 
@@ -543,10 +545,10 @@ export function defineModels(ctx: Context): void {
 
   ctx.model.extend('mtproto_dialog_folder_peer', {
     id: 'string', platformSessionId: 'string', platformConversationId: 'text',
-    folderId: 'unsigned', updatedAt: 'timestamp',
+    folderId: 'unsigned', pinnedOrder: { type: 'integer', nullable: true }, updatedAt: 'timestamp',
   }, {
     primary: 'id',
     unique: [['platformSessionId', 'platformConversationId']],
-    indexes: [['platformSessionId', 'folderId']],
+    indexes: [['platformSessionId', 'folderId'], ['platformSessionId', 'pinnedOrder']],
   })
 }

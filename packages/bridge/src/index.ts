@@ -1023,10 +1023,26 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     (await requireBridgeSession(rpc)).dialogs.getScheduledHistory(req as tl.messages.RawGetScheduledHistoryRequest))
   rpc.register('messages.getPinnedDialogs', async (rpc, req) =>
     (await requireBridgeSession(rpc)).dialogs.getPinnedDialogs((req as tl.messages.RawGetPinnedDialogsRequest).folderId))
-  rpc.register('messages.reorderPinnedDialogs', async (rpc, req) =>
-    (await requireBridgeSession(rpc)).dialogs.reorderPinnedDialogs(
+  rpc.register('messages.toggleDialogPin', async (rpc, req) => {
+    const state = await requireBridgeSession(rpc)
+    const update = await state.dialogs.toggleDialogPin(req as tl.messages.RawToggleDialogPinRequest)
+    if (update) {
+      await updates.publishAccountUpdates(
+        state.session, [update], rpc.authKeyId ? authKeyHex(rpc.authKeyId) : undefined,
+      )
+    }
+    return { _: 'boolTrue' }
+  })
+  rpc.register('messages.reorderPinnedDialogs', async (rpc, req) => {
+    const state = await requireBridgeSession(rpc)
+    const update = await state.dialogs.reorderPinnedDialogs(
       req as tl.messages.RawReorderPinnedDialogsRequest,
-    ))
+    )
+    await updates.publishAccountUpdates(
+      state.session, [update], rpc.authKeyId ? authKeyHex(rpc.authKeyId) : undefined,
+    )
+    return { _: 'boolTrue' }
+  })
   rpc.register('messages.sendMessage', async (rpc, req) =>
     (await requireBridgeSession(rpc)).dialogs.sendMessage(
       req as tl.messages.RawSendMessageRequest, rpc.connection,

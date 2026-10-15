@@ -914,7 +914,7 @@ describe('DialogRpc', () => {
     const rpc = new DialogRpc(new DialogTestPlatform(), session)
     await expect(rpc.reorderPinnedDialogs({
       _: 'messages.reorderPinnedDialogs', force: true, folderId: 0, order: [],
-    })).resolves.toEqual({ _: 'boolTrue' })
+    })).resolves.toEqual({ _: 'updatePinnedDialogs', folderId: undefined, order: [] })
   })
 
   it('returns only requested peer dialogs in request order and deduplicates peers', async () => {

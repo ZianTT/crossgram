@@ -11,11 +11,16 @@ import {
 } from '@mtproto-relay/mtproto'
 import { getServerReaderMap } from '../../mtproto/src/rpc/server-reader-map.js'
 import { DialogFolderStore } from './dialog-folders.js'
-import { DialogRpc, stableId } from './dialogs.js'
+import { DialogRpc, peerTlSeed, stableId } from './dialogs.js'
 import { defineModels } from './models.js'
 import { MessageStore } from './message-store.js'
 import type { IMDialog, IMPlatform, PlatformSession } from './platform.js'
 import { createCordisRpcTestHarness, type CordisRpcTestHarness } from './rpc-test-harness.js'
+
+/** Telegram ids are scoped to the platform session (see `peerTlSeed`). */
+function peerChannelId(platformPeerId: string): number {
+  return stableId(peerTlSeed(session.platformSessionId, platformPeerId))
+}
 
 const RPC_RESULT_ID = 0xf35c6d01
 const VECTOR_ID = 0x1cb5c415
@@ -91,6 +96,14 @@ function rpcHarnessFor(dialogs: DialogRpc): CordisRpcTestHarness {
   })
   rpcHarness.register('folders.editPeerFolders', async (_context, request) =>
     dialogs.editPeerFolders(request as tl.folders.RawEditPeerFoldersRequest))
+  rpcHarness.register('messages.toggleDialogPin', async (_context, request) => {
+    await dialogs.toggleDialogPin(request as tl.messages.RawToggleDialogPinRequest)
+    return { _: 'boolTrue' }
+  })
+  rpcHarness.register('messages.reorderPinnedDialogs', async (_context, request) => {
+    await dialogs.reorderPinnedDialogs(request as tl.messages.RawReorderPinnedDialogsRequest)
+    return { _: 'boolTrue' }
+  })
   return rpcHarness
 }
 
@@ -286,10 +299,10 @@ describe('dialog folders RPC e2e', () => {
     const folders = new DialogFolderStore(ctx.database)
     const rpcHarness = rpcHarnessFor(createDialog(folders))
     const groupPeer = {
-      _: 'inputPeerChannel' as const, channelId: stableId('peer:group-a'), accessHash: Long.ONE,
+      _: 'inputPeerChannel' as const, channelId: peerChannelId('group-a'), accessHash: Long.ONE,
     }
     const channelPeer = {
-      _: 'inputPeerChannel' as const, channelId: stableId('peer:channel-a'), accessHash: Long.ONE,
+      _: 'inputPeerChannel' as const, channelId: peerChannelId('channel-a'), accessHash: Long.ONE,
     }
     await roundTripRpc(rpcHarness, getDialogs())
 
@@ -343,8 +356,8 @@ describe('dialog folders RPC e2e', () => {
 
     const main = await roundTripRpc(resumedHarness, getDialogs(0))
     expect(main.dialogs.map((dialog: tl.RawDialog) => dialog.peer)).toEqual([
-      { _: 'peerUser', userId: stableId('peer:alice') },
-      { _: 'peerChannel', channelId: stableId('peer:channel-a') },
+      { _: 'peerUser', userId: peerChannelId('alice') },
+      { _: 'peerChannel', channelId: peerChannelId('channel-a') },
     ])
     const pinnedArchive = await roundTripRpc(resumedHarness, { _: 'messages.getPinnedDialogs', folderId: 0 })
     expect(pinnedArchive.dialogs).toMatchObject([{
@@ -355,14 +368,14 @@ describe('dialog folders RPC e2e', () => {
     expect(pinnedArchive.messages).toEqual([])
     const archive = await roundTripRpc(resumedHarness, getDialogs(1))
     expect(archive.dialogs).toMatchObject([{
-      _: 'dialog', peer: { _: 'peerChannel', channelId: stableId('peer:group-a') }, folderId: 1,
+      _: 'dialog', peer: { _: 'peerChannel', channelId: peerChannelId('group-a') }, folderId: 1,
     }])
     const peerArchive = await roundTripRpc(resumedHarness, {
       _: 'messages.getPeerDialogs', peers: [{ _: 'inputDialogPeerFolder', folderId: 1 }],
     })
     expect(peerArchive.dialogs).toMatchObject([{
       _: 'dialogFolder', folder: { _: 'folder', id: 1 },
-      peer: { _: 'peerChannel', channelId: stableId('peer:group-a') },
+      peer: { _: 'peerChannel', channelId: peerChannelId('group-a') },
     }])
 
     const secondRestart = rpcHarnessFor(createDialog(new DialogFolderStore(ctx.database)))
@@ -430,7 +443,7 @@ describe('dialog folders RPC e2e', () => {
 
     const second = await roundTripRpc(rpcHarness, getDialogs(undefined, {
       offsetPeer: {
-        _: 'inputPeerChannel', channelId: stableId('peer:android-dialog-099'), accessHash: Long.ONE,
+        _: 'inputPeerChannel', channelId: peerChannelId('android-dialog-099'), accessHash: Long.ONE,
       },
       offsetId: last.topMessage,
       offsetDate: lastMessage.date,
@@ -438,8 +451,8 @@ describe('dialog folders RPC e2e', () => {
     expect(second.dialogs).toHaveLength(30)
     expect(second.dialogs.map((dialog: tl.RawDialog) =>
       (dialog.peer as tl.RawPeerChannel).channelId)).toEqual(
-      Array.from({ length: 30 }, (_, index) => stableId(
-        `peer:android-dialog-${String(index + 100).padStart(3, '0')}`,
+      Array.from({ length: 30 }, (_, index) => peerChannelId(
+        `android-dialog-${String(index + 100).padStart(3, '0')}`,
       )),
     )
 
@@ -481,7 +494,7 @@ describe('dialog folders RPC e2e', () => {
     const folders = new DialogFolderStore(ctx.database)
     const rpcHarness = rpcHarnessFor(createDialog(folders, targetPlatform))
     const peer = (id: string) => ({
-      _: 'inputPeerChannel' as const, channelId: stableId(`peer:${id}`), accessHash: Long.ONE,
+      _: 'inputPeerChannel' as const, channelId: peerChannelId(id), accessHash: Long.ONE,
     })
     await roundTripRpc(rpcHarness, getDialogs())
 
@@ -546,7 +559,7 @@ describe('dialog folders RPC e2e', () => {
     const folders = new DialogFolderStore(ctx.database)
     const rpcHarness = rpcHarnessFor(createDialog(folders, targetPlatform))
     const groupPeer = {
-      _: 'inputPeerChannel' as const, channelId: stableId('peer:retry-group'), accessHash: Long.ONE,
+      _: 'inputPeerChannel' as const, channelId: peerChannelId('retry-group'), accessHash: Long.ONE,
     }
     const archiveRequest = {
       _: 'folders.editPeerFolders' as const,
@@ -575,7 +588,7 @@ describe('dialog folders RPC e2e', () => {
     expect(main.dialogs).toEqual([])
     const archive = await roundTripRpc(resumedHarness, getDialogs(1))
     expect(archive.dialogs).toMatchObject([{
-      _: 'dialog', peer: { _: 'peerChannel', channelId: stableId('peer:retry-group') }, folderId: 1,
+      _: 'dialog', peer: { _: 'peerChannel', channelId: peerChannelId('retry-group') }, folderId: 1,
     }])
   })
 
@@ -608,7 +621,7 @@ describe('dialog folders RPC e2e', () => {
     const dialogs = createDialog(folders, targetPlatform)
     const rpcHarness = rpcHarnessFor(dialogs)
     const groupPeer = {
-      _: 'inputPeerChannel' as const, channelId: stableId('peer:queue-recovery-group'), accessHash: Long.ONE,
+      _: 'inputPeerChannel' as const, channelId: peerChannelId('queue-recovery-group'), accessHash: Long.ONE,
     }
 
     await expect(dialogs.editPeerFolders({
@@ -651,7 +664,7 @@ describe('dialog folders RPC e2e', () => {
     const folders = new DialogFolderStore(ctx.database)
     const rpcHarness = rpcHarnessFor(createDialog(folders, targetPlatform))
     const groupPeer = {
-      _: 'inputPeerChannel' as const, channelId: stableId('peer:metadata-group'), accessHash: Long.ONE,
+      _: 'inputPeerChannel' as const, channelId: peerChannelId('metadata-group'), accessHash: Long.ONE,
     }
     await roundTripRpc(rpcHarness, getDialogs())
 
@@ -697,7 +710,7 @@ describe('dialog folders RPC e2e', () => {
     const folders = new DialogFolderStore(ctx.database)
     const rpcHarness = rpcHarnessFor(createDialog(folders, targetPlatform))
     const groupPeer = {
-      _: 'inputPeerChannel' as const, channelId: stableId('peer:queued-group'), accessHash: Long.ONE,
+      _: 'inputPeerChannel' as const, channelId: peerChannelId('queued-group'), accessHash: Long.ONE,
     }
     await roundTripRpc(rpcHarness, getDialogs())
 
@@ -723,7 +736,7 @@ describe('dialog folders RPC e2e', () => {
 
     const main = await roundTripRpc(rpcHarness, getDialogs())
     expect(main.dialogs).toMatchObject([{
-      peer: { _: 'peerChannel', channelId: stableId('peer:queued-group') },
+      peer: { _: 'peerChannel', channelId: peerChannelId('queued-group') },
     }])
     const archiveDialogs = await roundTripRpc(rpcHarness, getDialogs(1))
     expect(archiveDialogs.dialogs).toEqual([])
@@ -761,19 +774,19 @@ describe('dialog folders RPC e2e', () => {
     const folders = new DialogFolderStore(ctx.database)
     const rpcHarness = rpcHarnessFor(createDialog(folders, targetPlatform))
     const peer = (id: string) => ({
-      _: 'inputPeerChannel' as const, channelId: stableId(`peer:${id}`), accessHash: Long.ONE,
+      _: 'inputPeerChannel' as const, channelId: peerChannelId(id), accessHash: Long.ONE,
     })
     const ids = (result: any) => result.dialogs.map((dialog: tl.RawDialog) =>
       (dialog.peer as tl.RawPeerChannel).channelId)
 
     const initialMain = await roundTripRpc(rpcHarness, getDialogs(0))
     expect(ids(initialMain)).toEqual([
-      stableId('peer:mask-notify'), stableId('peer:mask-receive'),
-      stableId('peer:mask-unspecified'), stableId('peer:mask-shield'),
+      peerChannelId('mask-notify'), peerChannelId('mask-receive'),
+      peerChannelId('mask-unspecified'), peerChannelId('mask-shield'),
     ])
     const initialArchive = await roundTripRpc(rpcHarness, getDialogs(1))
     expect(initialArchive.dialogs).toMatchObject([{
-      peer: { _: 'peerChannel', channelId: stableId('peer:mask-assistant') }, folderId: 1,
+      peer: { _: 'peerChannel', channelId: peerChannelId('mask-assistant') }, folderId: 1,
     }])
 
     await roundTripRpc(rpcHarness, {
@@ -787,21 +800,174 @@ describe('dialog folders RPC e2e', () => {
       ],
     })
     const main = await roundTripRpc(rpcHarness, getDialogs(0))
-    expect(ids(main)).toEqual([stableId('peer:mask-notify'), stableId('peer:mask-receive')])
+    expect(ids(main)).toEqual([peerChannelId('mask-notify'), peerChannelId('mask-receive')])
     const archive = await roundTripRpc(rpcHarness, getDialogs(1))
     expect(ids(archive)).toEqual([
-      stableId('peer:mask-assistant'), stableId('peer:mask-unspecified'), stableId('peer:mask-shield'),
+      peerChannelId('mask-assistant'), peerChannelId('mask-unspecified'), peerChannelId('mask-shield'),
     ])
     expect(archive.dialogs[0]).toMatchObject({ folderId: 1 })
 
     const peerMain = await roundTripRpc(rpcHarness, {
       _: 'messages.getPeerDialogs', peers: [{ _: 'inputDialogPeerFolder', folderId: 0 }],
     })
-    expect(ids(peerMain)).toEqual([stableId('peer:mask-notify'), stableId('peer:mask-receive')])
+    expect(ids(peerMain)).toEqual([peerChannelId('mask-notify'), peerChannelId('mask-receive')])
     const peerArchive = await roundTripRpc(rpcHarness, {
       _: 'messages.getPeerDialogs', peers: [{ _: 'inputDialogPeerFolder', folderId: 1 }],
     })
     expect(peerArchive.dialogs).toHaveLength(1)
     expect(peerArchive.dialogs[0]).toMatchObject({ _: 'dialogFolder', folder: { id: 1 } })
+  })
+
+  it('pins dialogs through TL, keeps them out of paginated pages, and survives restarts', async () => {
+    const ctx = new Context()
+    const fibers = [ctx.plugin(Database), ctx.plugin(SQLiteDriver, { path: ':memory:' })]
+    await Promise.all(fibers)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    defineModels(ctx)
+    await ctx.database.prepared()
+    disposals.push(async () => {
+      for (const fiber of fibers.reverse()) await Promise.resolve((fiber as any).dispose?.())
+    })
+    const source: IMDialog[] = Array.from({ length: 30 }, (_, index) => {
+      const id = 'pin-' + String(index).padStart(2, '0')
+      return {
+        conversation: { id, kind: 'group', title: id },
+        unreadCount: 0,
+        lastMessage: { id: 'preview-' + index, conversationId: id, senderId: 'self',
+          timestamp: 1_700_000_000 - index, content: { parts: [{ type: 'text', text: id }] } },
+      }
+    })
+    const target: IMPlatform = {
+      ...platform,
+      async getDialogs(_session, query) {
+        const start = query?.afterId ? source.findIndex(item => item.conversation.id === query.afterId) + 1 : 0
+        return { dialogs: source.slice(start, start + (query?.limit ?? 100)), total: source.length }
+      },
+      async getUser(_session, id) { return { id, firstName: 'Self' } },
+    }
+    const open = () => {
+      const dialogs = createDialog(new DialogFolderStore(ctx.database), target, new MessageStore(ctx.database))
+      return { dialogs, harness: rpcHarnessFor(dialogs) }
+    }
+    const peer = (id: string) => ({
+      _: 'inputPeerChannel' as const, channelId: peerChannelId(id), accessHash: Long.ONE,
+    })
+    const channelIds = (dialogs: tl.TypeDialog[]) =>
+      dialogs.map((dialog) => ((dialog as tl.RawDialog).peer as tl.RawPeerChannel).channelId)
+
+    const { dialogs, harness } = open()
+    await roundTripRpc(harness, getDialogs(0, { limit: 100 }))
+    // pin-25 sits far beyond the first page; pin-03 is pinned last, so it leads.
+    for (const id of ['pin-25', 'pin-03']) {
+      await expect(roundTripRpc(harness, {
+        _: 'messages.toggleDialogPin', pinned: true, peer: { _: 'inputDialogPeer', peer: peer(id) },
+      })).resolves.toEqual({ _: 'boolTrue' })
+    }
+    // A repeated pin is idempotent and produces no update for other devices.
+    await expect(dialogs.toggleDialogPin({
+      _: 'messages.toggleDialogPin', pinned: true, peer: { _: 'inputDialogPeer', peer: peer('pin-03') },
+    })).resolves.toBeUndefined()
+
+    const restarted = open().harness
+    const pinned = await roundTripRpc(restarted, { _: 'messages.getPinnedDialogs', folderId: 0 })
+    expect(channelIds(pinned.dialogs)).toEqual([peerChannelId('pin-03'), peerChannelId('pin-25')])
+    expect(pinned.dialogs.every((dialog: tl.RawDialog) => dialog.pinned)).toBe(true)
+    expect(pinned.messages.map((message: tl.RawMessage) => message.message).sort()).toEqual(['pin-03', 'pin-25'])
+    expect(pinned.chats).toHaveLength(2)
+
+    // Desktop (exclude_pinned) pages never repeat a pinned dialog.
+    const first = await roundTripRpc(restarted, getDialogs(0, { excludePinned: true, limit: 10 }))
+    const last = first.dialogs.at(-1) as tl.RawDialog
+    const top = first.messages.find((message: tl.RawMessage) => message.id === last.topMessage)
+    const rest = await roundTripRpc(restarted, getDialogs(0, {
+      excludePinned: true, limit: 100, offsetId: last.topMessage, offsetDate: top.date,
+      offsetPeer: { _: 'inputPeerChannel', channelId: (last.peer as tl.RawPeerChannel).channelId, accessHash: Long.ONE },
+    }))
+    const paged = channelIds([...first.dialogs, ...rest.dialogs])
+    expect(paged).toHaveLength(28)
+    expect(new Set(paged).size).toBe(28)
+    expect(paged).not.toContain(peerChannelId('pin-03'))
+    expect(paged).not.toContain(peerChannelId('pin-25'))
+    expect([...first.dialogs, ...rest.dialogs].some((dialog: tl.RawDialog) => dialog.pinned)).toBe(false)
+
+    // Android loads pinned dialogs ahead of the first page instead.
+    const android = await roundTripRpc(restarted, getDialogs(undefined, { limit: 10 }))
+    expect(channelIds(android.dialogs.slice(0, 3))).toEqual([
+      peerChannelId('pin-03'), peerChannelId('pin-25'), peerChannelId('pin-00'),
+    ])
+    expect(android.dialogs.slice(0, 2).every((dialog: tl.RawDialog) => dialog.pinned)).toBe(true)
+    expect(android.dialogs[2].pinned).toBe(false)
+    const peerDialogs = await roundTripRpc(restarted, {
+      _: 'messages.getPeerDialogs', peers: [
+        { _: 'inputDialogPeer', peer: peer('pin-25') }, { _: 'inputDialogPeer', peer: peer('pin-01') },
+      ],
+    })
+    expect(peerDialogs.dialogs.map((dialog: tl.RawDialog) => dialog.pinned)).toEqual([true, false])
+
+    // A forced drag reorder replaces the folder's pinned list; the archive entry takes no slot.
+    await expect(roundTripRpc(restarted, {
+      _: 'messages.reorderPinnedDialogs', force: true, folderId: 0, order: [
+        { _: 'inputDialogPeerFolder', folderId: 1 },
+        { _: 'inputDialogPeer', peer: peer('pin-25') },
+        { _: 'inputDialogPeer', peer: peer('pin-07') },
+      ],
+    })).resolves.toEqual({ _: 'boolTrue' })
+    const reordered = await roundTripRpc(open().harness, { _: 'messages.getPinnedDialogs', folderId: 0 })
+    expect(channelIds(reordered.dialogs)).toEqual([peerChannelId('pin-25'), peerChannelId('pin-07')])
+
+    // Archiving a pinned dialog drops its pin, as Telegram does.
+    await roundTripRpc(restarted, {
+      _: 'folders.editPeerFolders',
+      folderPeers: [{ _: 'inputFolderPeer', peer: peer('pin-07'), folderId: 1 }],
+    })
+    await expect(roundTripRpc(restarted, {
+      _: 'messages.toggleDialogPin', pinned: false, peer: { _: 'inputDialogPeer', peer: peer('pin-25') },
+    })).resolves.toEqual({ _: 'boolTrue' })
+    const cleared = await roundTripRpc(restarted, { _: 'messages.getPinnedDialogs', folderId: 0 })
+    expect(cleared.dialogs.filter((dialog: tl.TypeDialog) => dialog._ === 'dialog')).toEqual([])
+  })
+
+  it('serializes pin updates for the account\'s other devices', async () => {
+    const ctx = new Context()
+    const fibers = [ctx.plugin(Database), ctx.plugin(SQLiteDriver, { path: ':memory:' })]
+    await Promise.all(fibers)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    defineModels(ctx)
+    await ctx.database.prepared()
+    disposals.push(async () => {
+      for (const fiber of fibers.reverse()) await Promise.resolve((fiber as any).dispose?.())
+    })
+    const dialogs = createDialog(new DialogFolderStore(ctx.database))
+    await dialogs.getDialogs(getDialogs())
+    const groupPeer = { _: 'inputPeerChannel' as const, channelId: peerChannelId('group-a'), accessHash: Long.ONE }
+    const aliceUser = { _: 'inputPeerUser' as const, userId: peerChannelId('alice'), accessHash: Long.ZERO }
+    const roundTrip = (update: tl.TypeUpdate) => new TlBinaryReader(
+      __tlReaderMap, TlBinaryWriter.serializeObject(__tlWriterMap, update),
+    ).object()
+
+    const pinned = await dialogs.toggleDialogPin({
+      _: 'messages.toggleDialogPin', pinned: true, peer: { _: 'inputDialogPeer', peer: groupPeer },
+    })
+    expect(roundTrip(pinned!)).toMatchObject({
+      _: 'updateDialogPinned', pinned: true,
+      peer: { _: 'dialogPeer', peer: { _: 'peerChannel', channelId: peerChannelId('group-a') } },
+    })
+    const order = await dialogs.reorderPinnedDialogs({
+      _: 'messages.reorderPinnedDialogs', force: false, folderId: 0,
+      order: [{ _: 'inputDialogPeer', peer: aliceUser }],
+    })
+    expect(roundTrip(order)).toMatchObject({
+      _: 'updatePinnedDialogs',
+      order: [
+        { _: 'dialogPeer', peer: { _: 'peerUser', userId: peerChannelId('alice') } },
+        { _: 'dialogPeer', peer: { _: 'peerChannel', channelId: peerChannelId('group-a') } },
+      ],
+    })
+    await expect(dialogs.toggleDialogPin({
+      _: 'messages.toggleDialogPin', pinned: true, peer: { _: 'inputDialogPeerFolder', folderId: 1 },
+    })).resolves.toBeUndefined()
+    await expect(dialogs.reorderPinnedDialogs({
+      _: 'messages.reorderPinnedDialogs', force: true, folderId: 2, order: [],
+    })).rejects.toMatchObject({ code: 400, text: 'FOLDER_ID_INVALID' })
   })
 })
