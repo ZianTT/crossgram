@@ -131,7 +131,7 @@ describe('QQNT group-invite accept E2E', () => {
       _: 'messages.getBotCallbackAnswer', peer, msgId: message.id,
       data: Buffer.from('group-invite:123456789:1791449541900000'),
     })
-    expect(answer).toMatchObject({ _: 'messages.botCallbackAnswer', message: '已同意，正在加入群聊' })
+    expect(answer).toMatchObject({ _: 'messages.botCallbackAnswer', message: '已接受邀请；若群开启了入群审核，还需管理员通过' })
     expect(accepted).toEqual([{ groupCode: '123456789', msgSeq: '1791449541900000' }])
     expect(edits).toEqual([{
       type: 'message-edit',

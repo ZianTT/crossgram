@@ -275,7 +275,7 @@ describe('QQNTPlatform mapping', () => {
     const button = message.content.inlineKeyboard!.rows[0].buttons[0] as any
     await expect(platform.clickInlineButton!(session, {
       conversationId: 'direct', messageId: 'invite-message',
-    }, button)).resolves.toEqual({ message: '已同意，正在加入群聊', refresh: true })
+    }, button)).resolves.toEqual({ message: '已接受邀请；若群开启了入群审核，还需管理员通过', refresh: true })
     expect(platform.client.acceptGroupInvite).toHaveBeenCalledWith({
       groupCode: '123456789', msgSeq: '1791449541900000',
     })

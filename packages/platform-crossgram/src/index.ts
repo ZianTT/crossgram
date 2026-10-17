@@ -1038,7 +1038,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       if (groupCode && msgSeq) {
         try {
           await this.client.acceptGroupInvite({ groupCode, msgSeq })
-          return { message: '已同意，正在加入群聊', refresh: true as const }
+          return { message: '已接受邀请；若群开启了入群审核，还需管理员通过', refresh: true as const }
         } catch {
           return { message: '同意失败，请稍后重试或在 QQ 客户端处理该邀请', alert: true }
         }
