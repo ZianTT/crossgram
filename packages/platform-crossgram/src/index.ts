@@ -30,7 +30,7 @@ import { extractRemoteVideoFrame, type RemoteVideoFrameExtractor } from './video
 import { migrateLegacyQQMessageMedia } from './raw-media-migration.js'
 import { migrateLegacyQQGroupAliasUsers } from './user-name-migration.js'
 import type {
-  QQMediaLocator, QQStickerReference, WireCallSignalEvent, WireConversation, WireEvent, WireGroupFilePage, WireMedia, WireMessage,
+  QQMediaLocator, QQStickerReference, WireCallSignalEvent, WireCard, WireConversation, WireEvent, WireGroupFilePage, WireMedia, WireMessage,
   WireMultiForwardLocator, WireNativeAvsdkEvent, WireReactionState, WireRequest, WireTextPart,
 } from './protocol.js'
 
@@ -1033,6 +1033,17 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     target: { conversationId: string, messageId: string, nativeSequence?: string },
     button: Extract<import('@mtproto-relay/bridge').IMInlineKeyboardButton, { type: 'callback' }>,
   ): Promise<{ message?: string, alert?: boolean, url?: string }> {
+    if (button.data.startsWith('group-invite:')) {
+      const [, groupCode, msgSeq] = button.data.split(':')
+      if (groupCode && msgSeq) {
+        try {
+          await this.client.acceptGroupInvite({ groupCode, msgSeq })
+          return { message: '已同意，正在加入群聊', refresh: true as const }
+        } catch {
+          return { message: '同意失败，请稍后重试或在 QQ 客户端处理该邀请', alert: true }
+        }
+      }
+    }
     const metadata = button.metadata?.qqnt
     if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
       throw new Error('QQNT callback button metadata is missing')
@@ -2741,7 +2752,23 @@ function mapInlineKeyboard(
   input: WireMessage,
 ): import('@mtproto-relay/bridge').IMInlineKeyboard | undefined {
   const keyboard = input.parts.find((part) => part.type === 'inline-keyboard')
-  if (!keyboard || keyboard.type !== 'inline-keyboard') return
+  if (!keyboard || keyboard.type !== 'inline-keyboard') {
+    // Official group invites carry no bot keyboard; render an accept button
+    // whose data the adapter routes back to the bridge on click.
+    const invite = input.parts.find((part): part is { type: 'card', card: WireCard } => part.type === 'card')
+      ?.card.groupInvite
+    if (!invite) return
+    return {
+      rows: [{
+        buttons: [{
+          type: 'callback',
+          text: '同意加群',
+          data: `group-invite:${invite.groupCode}:${invite.msgSeq}`,
+          style: 'success',
+        }],
+      }],
+    }
+  }
   const rows = keyboard.keyboard.rows.map((row) => {
     const buttons: import('@mtproto-relay/bridge').IMInlineKeyboardButton[] = []
     for (const button of row.buttons) {

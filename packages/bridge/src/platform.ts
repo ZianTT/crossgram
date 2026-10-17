@@ -334,6 +334,14 @@ export interface IMMessageCard {
   source?: string
   url?: string
   thumbnailUrl?: string
+  /** Official group-invite cards: the adapter turns this into an accept button. */
+  groupInvite?: IMMessageGroupInvite
+}
+
+/** Parameters of an official group-invite card, resolved by the protocol side. */
+export interface IMMessageGroupInvite {
+  groupCode: string
+  msgSeq: string
 }
 
 export type IMMessageInputPart =
@@ -793,7 +801,7 @@ export interface IMPlatform<TMediaLocator = unknown> {
     session: PlatformSession,
     target: { conversationId: string, messageId: string, nativeSequence?: string },
     button: Extract<IMInlineKeyboardButton, { type: 'callback' }>,
-  ): Promise<{ message?: string, alert?: boolean, url?: string }>
+  ): Promise<{ message?: string, alert?: boolean, url?: string, refresh?: true }>
   markRead?(
     session: PlatformSession,
     target: IMReadTarget,

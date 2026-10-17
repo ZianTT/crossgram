@@ -278,6 +278,15 @@ export interface WireCard {
   source?: string
   url?: string
   thumbnailUrl?: string
+  /** Official group-invite cards (bizsrc=qun.invite): accepts the invite server-side. */
+  groupInvite?: WireGroupInvite
+}
+
+/** Parameters of an official "邀请你加入群聊" card's mqqapi jump link. */
+export interface WireGroupInvite {
+  groupCode: string
+  /** Notify seq; the bridge resolves the invitation by it. */
+  msgSeq: string
 }
 
 export interface WireMultiForwardLocator {

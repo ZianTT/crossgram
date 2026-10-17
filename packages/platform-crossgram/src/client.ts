@@ -892,6 +892,14 @@ export class QQNTClient {
     })
   }
 
+  acceptGroupInvite(invite: { groupCode: string, msgSeq: string }): Promise<Record<string, never>> {
+    return this.json('/group-invites/accept', false, {
+      method: 'POST',
+      headers: this.headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify(invite),
+    })
+  }
+
   async transcribeVoice(locator: QQMediaLocator, signal?: AbortSignal): Promise<{ transcript: string }> {
     if (this.bridgeProtocol === undefined) await this.status()
     if (this.bridgeProtocol! < 32) throw new Error('QQNT bridge protocol 32 is required for voice transcription')

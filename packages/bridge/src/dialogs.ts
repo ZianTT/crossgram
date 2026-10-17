@@ -1962,6 +1962,16 @@ export class DialogRpc {
       messageId: target.platformMessageId,
       nativeSequence: target.nativeSequence,
     }, button)
+    if (answer.refresh && message) {
+      // The platform resolved the button server-side (a group invite accepted):
+      // republish the message without its keyboard so clients drop the button.
+      await this._onLocalEvent?.(this._session, {
+        type: 'message-edit',
+        eventId: `inline-keyboard-refresh:${encodeURIComponent(conversationId)}:${encodeURIComponent(message.id)}`,
+        conversation: this._conversation(message.conversationId),
+        message: { ...message, content: { ...message.content, inlineKeyboard: undefined } },
+      })
+    }
     return {
       _: 'messages.botCallbackAnswer',
       alert: answer.alert || undefined,

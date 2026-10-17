@@ -250,6 +250,46 @@ describe('QQNTPlatform mapping', () => {
     })
   })
 
+  it('renders an accept button for official group-invite cards', async () => {
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: [{
+        id: 'invite-message', conversationId: 'direct', senderId: 'friend', timestamp: 1, outgoing: false,
+        parts: [{ type: 'card' as const, card: {
+          kind: 'application', title: '邀请你加入群聊',
+          description: '邀请你加入群聊“测试群聊”，进入可查看详情。\n群号 123456789',
+          source: '邀请加群',
+          groupInvite: { groupCode: '123456789', msgSeq: '1791449541900000' },
+        } }],
+      }],
+    }))
+    const [message] = (await platform.getHistory(session, { id: 'direct' })).messages
+    expect(message.content.inlineKeyboard).toEqual({
+      rows: [{ buttons: [{
+        type: 'callback', text: '同意加群',
+        data: 'group-invite:123456789:1791449541900000', style: 'success',
+      }] }],
+    })
+
+    platform.client.acceptGroupInvite = vi.fn(async () => ({} as Record<string, never>))
+    const button = message.content.inlineKeyboard!.rows[0].buttons[0] as any
+    await expect(platform.clickInlineButton!(session, {
+      conversationId: 'direct', messageId: 'invite-message',
+    }, button)).resolves.toEqual({ message: '已同意，正在加入群聊', refresh: true })
+    expect(platform.client.acceptGroupInvite).toHaveBeenCalledWith({
+      groupCode: '123456789', msgSeq: '1791449541900000',
+    })
+
+    platform.client.acceptGroupInvite = vi.fn(async () => {
+      throw new Error('native rejected')
+    })
+    await expect(platform.clickInlineButton!(session, {
+      conversationId: 'direct', messageId: 'invite-message',
+    }, button)).resolves.toEqual({
+      message: '同意失败，请稍后重试或在 QQ 客户端处理该邀请', alert: true,
+    })
+  })
+
   it('drops QQ bot template metadata links, escapes and the plain-text fallback', async () => {
     expect(parseQQMarkdown('[](%7B%22version%22%3A2%7D)\n\n卫戍协议控制台\n私聊 /token 可获取设置页 JWT。\n')).toEqual({
       type: 'text', text: '卫戍协议控制台\n私聊 /token 可获取设置页 JWT。', entities: undefined,
