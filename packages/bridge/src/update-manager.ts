@@ -25,6 +25,7 @@ import type { BlockedPeerStore } from './blocked-peers.js'
 import { customReactionDocumentId } from './reaction-rpc.js'
 import { updateFromJson, updateToJson } from './update-json.js'
 import type { MessageProjectionPipeline } from './message-projection.js'
+import type { SendEchoes } from './send-echoes.js'
 
 const CHANNEL_POLL_TIMEOUT_SECONDS = 30
 const PENDING_CHANNEL_POLL_TIMEOUT_SECONDS = 1
@@ -67,6 +68,7 @@ export class UpdateManager {
       conversationId: string,
       definition: IMReactionDefinition,
     ) => number | undefined,
+    private readonly _sendEchoes?: SendEchoes,
   ) {}
 
   /** 注册行内自定义表情的 document，使渲染消息的客户端能解析对应资源。 */
@@ -452,12 +454,20 @@ export class UpdateManager {
         )
         return
       }
+      // 平台对自己刚发出的消息的回显：发送端已经/即将从 RPC 回包拿到带
+      // `updateMessageID` 的同一份数据，再推一份普通消息过去会让客户端多出服务端副本，
+      // 合并时销毁其中一条（桌面端的消息粉碎动画就是这么来的）。
+      // 用平台消息 id 精确匹配，只影响这一条消息，不按时间段屏蔽整个 auth key。
+      const echoAuthKeyId = (committed.event.type === 'message' || committed.event.type === 'message-edit')
+        && !options.excludeAuthKeyId
+        ? this._sendEchoes?.excludeFor(session, committed.event.message)
+        : undefined
       return await this._publishMessage(
         session,
         committed as Exclude<CommittedPlatformEvent, {
           event: { type: 'message-delete' | 'message-reactions' | 'read' | 'voice-call' }
         }>,
-        options,
+        echoAuthKeyId ? { ...options, excludeAuthKeyId: echoAuthKeyId } : options,
       )
     } catch (error) {
       if (eventKey) await this._releaseAbandonedDelivery(eventKey, session)

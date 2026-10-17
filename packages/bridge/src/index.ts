@@ -15,6 +15,7 @@ import {
   DialogRpc,
   type LegacyGetForumTopicsByIdRequest, type LegacyGetForumTopicsRequest,
 } from './dialogs.js'
+import { SendEchoes } from './send-echoes.js'
 import { startupRpcHandlers } from './startup.js'
 import { androidRpcHandlers } from './android-rpc.js'
 import { MessageStore } from './message-store.js'
@@ -265,6 +266,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     reactionRpcs.set(key, { platform, rpc })
     return rpc
   }
+  const sendEchoes = new SendEchoes()
   const updates = new UpdateManager(
     ctx.database, registry, store,
     (authKeyId, update, excludeConnection) =>
@@ -280,6 +282,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     config.recalledMessageMode ?? 'show',
     (session, conversationId, definition) => reactionRpcFor(registry.require(session.platformId), session)
       .registerInlineCustomEmoji(conversationId, definition),
+    sendEchoes,
   )
   const builtInMediaProvider = createBuiltInVoiceMediaProvider({
     serverHost: config.serverHost,
@@ -437,6 +440,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
       updates.requestRecovery(rpcContext)
     },
     messageProjection,
+    sendEchoes,
   )
   new MtprotoBridgeService(ctx, requireBridgeSession, dcId)
   registerGroupFilesMiniApp(ctx, platforms, requireBridgeSession, config.groupFilesMiniApp)
@@ -1487,6 +1491,7 @@ export function createSessionResolver(
     rpc: ServerRpcContext,
   ) => void | Promise<void>,
   messageProjection?: MessageProjectionPipeline,
+  sendEchoes?: SendEchoes,
 ) {
   const projection = messageProjection ?? new MessageProjectionPipeline(ctx)
   const loading = new Map<string, Promise<BridgeSessionState>>()
@@ -1570,6 +1575,7 @@ export function createSessionResolver(
         dialogFolders,
         systemPeers,
         projection,
+        sendEchoes,
       )
       return state
     }

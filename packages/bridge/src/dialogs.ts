@@ -41,6 +41,7 @@ import {
   type DialogFolderStore, type StoredDialogFilter,
 } from './dialog-folders.js'
 import type { MessageProjectionPipeline } from './message-projection.js'
+import type { SendEchoes } from './send-echoes.js'
 import type { SpeechPipeline } from './speech.js'
 import { convertRichMessage, markdownRichMessage, type RichMediaReference, type ResolvedRichMedia } from './rich-message.js'
 
@@ -292,6 +293,7 @@ export class DialogRpc {
     private readonly _dialogFolders?: DialogFolderStore,
     private readonly _systemPeers?: SystemPeerService,
     private readonly _messageProjection?: MessageProjectionPipeline,
+    private readonly _sendEchoes?: SendEchoes,
   ) {
     this._actions = new PlatformMessageActions(_platform, _session)
     // 有 `MessageStore` 时淘汰旧条目并由数据库兜底；无存储模式不可淘汰，避免重用已分配的 ID。
@@ -2358,16 +2360,18 @@ export class DialogRpc {
     const conversation = this._conversation(toId)
     const publishedPayloads: tl.RawUpdates[] = []
     const projections = []
-    for (const output of forwarded!) {
-      const source: IMMessage<any> = { ...output, conversationId: toId, outgoing: true }
-      const published = await this._publishLocalMessage(toId, source, excludeConnection)
-      if (published) {
-        publishedPayloads.push(published)
-        continue
+    await this._withSendEchoes(forwarded!, async () => {
+      for (const output of forwarded!) {
+        const source: IMMessage<any> = { ...output, conversationId: toId, outgoing: true }
+        const published = await this._publishLocalMessage(toId, source, excludeConnection)
+        if (published) {
+          publishedPayloads.push(published)
+          continue
+        }
+        const persisted = await this._store.ingest(this._session, conversation, source)
+        projections.push(...persisted.projection)
       }
-      const persisted = await this._store.ingest(this._session, conversation, source)
-      projections.push(...persisted.projection)
-    }
+    })
     if (projections.length) {
       let pts = await this._reservePts(
         projections.length,
@@ -2412,7 +2416,8 @@ export class DialogRpc {
       conversationId: resolution.peer.id,
       outgoing: true,
     }
-    const published = await this._publishLocalMessage(resolution.peer.id, source, excludeConnection)
+    const published = await this._withSendEchoes([source], () =>
+      this._publishLocalMessage(resolution.peer.id, source, excludeConnection))
     await this._systemPeers!.receive(this._session, resolution, source, input)
     if (published) return this._confirmForwardRandomIds(published, randomIds)
 
@@ -3284,9 +3289,9 @@ export class DialogRpc {
       outgoing: true,
       replyToId: sent.replyToId ?? replyToId,
     }
-    const published = await this._publishLocalMessage(
+    const published = await this._withSendEchoes([source], () => this._publishLocalMessage(
       peerId, source, excludeConnection, [req.randomId], replyTopMessageId(req.replyTo),
-    )
+    ))
     if (systemPeer) await this._systemPeers!.receive(this._session, systemPeer, source, input)
     if (published) {
       const update = published.updates.find((item) =>
@@ -3425,6 +3430,24 @@ export class DialogRpc {
           return id === undefined || servable.has(id)
         }),
       },
+    }
+  }
+
+  /**
+   * 平台返回发送结果后，把「这些平台消息是当前 auth key 发的」记下来，再投递本地副本。
+   * 平台随后回显同一条消息时，`UpdateManager` 按平台消息 id 把发送端排除掉：客户端
+   * 只从 RPC 回包里拿这一条，`updateMessageID` 能原地升级，不会多出服务端副本。
+   */
+  private async _withSendEchoes<T>(
+    sent: readonly IMMessage<any>[],
+    publish: () => Promise<T>,
+  ): Promise<T> {
+    const ids = sent.flatMap((message) => [message.id, ...(message.sourceIds ?? [])])
+    this._sendEchoes?.bind(this._session.platformSessionId, ids, this._authKeyId)
+    try {
+      return await publish()
+    } finally {
+      this._sendEchoes?.release(this._session.platformSessionId, ids)
     }
   }
 
@@ -3654,9 +3677,9 @@ export class DialogRpc {
     if (!this._store) throw new RpcError(500, 'MESSAGE_STORE_UNAVAILABLE')
     const replyToTopId = replyTopMessageId(replyTo)
     const publishAt = performance.now()
-    const published = await this._publishLocalMessage(
+    const published = await this._withSendEchoes([source], () => this._publishLocalMessage(
       peerId, source, excludeConnection, randomIds, replyToTopId,
-    )
+    ))
     const publishMs = performance.now() - publishAt
     const cleanupAt = performance.now()
     if (systemPeer) {
