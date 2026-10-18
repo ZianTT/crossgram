@@ -1914,6 +1914,20 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@mtproto-relay/history-backfill@workspace:packages/history-backfill":
+  version: 0.0.0-use.local
+  resolution: "@mtproto-relay/history-backfill@workspace:packages/history-backfill"
+  dependencies:
+    schemastery: "npm:^3.18.0"
+    solid-js: "npm:^1.9.9"
+    vitest: "npm:^4.1.10"
+  peerDependencies:
+    "@mtproto-relay/bridge": "workspace:*"
+    cordis: ^4.0.0-rc.5
+    cordis-webui-solidjs: "workspace:*"
+  languageName: unknown
+  linkType: soft
+
 "@mtproto-relay/merged-forward@workspace:*, @mtproto-relay/merged-forward@workspace:packages/merged-forward":
   version: 0.0.0-use.local
   resolution: "@mtproto-relay/merged-forward@workspace:packages/merged-forward"

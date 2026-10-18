@@ -61,6 +61,7 @@ describe('Crossgram Linux deployment', () => {
     expect(config).toContain('results: /var/lib/crossgram/debug-results')
     expect(config).toContain('verifierSecret: ${TELEGRAM_BOT_TOKEN_VERIFIER_SECRET}')
     expect(config).toContain("name: '@mtproto-relay/mtproto-statistics'")
+    expect(config).toContain("name: '@mtproto-relay/history-backfill'")
     expect(config).toContain("name: '@mtproto-relay/update-store-database'")
     expect(config).toContain("name: 'cordis-webui-solidjs'")
     expect(config).not.toContain("'@cordisjs/plugin-webui'")

@@ -114,6 +114,15 @@
     sampleIntervalMs: 1000
     slowThresholdMs: 1000
     historySeconds: 900
+- id: history-backfill
+  name: '@mtproto-relay/history-backfill'
+  config:
+    enabled: true
+    idleAfterMs: 60000
+    intervalMs: 3000
+    pageSize: 50
+    dailyRequestCap: 3000
+    maxAgeDays: 180
 - id: fa2b056a
   name: '@cordisjs/plugin-server'
   config:
