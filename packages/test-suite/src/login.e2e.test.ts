@@ -3628,8 +3628,7 @@ describe('bridge login e2e', () => {
       async getDialogs() {
         return { dialogs: [{ conversation, unreadCount: 0, lastMessage }] }
       },
-      async getHistory() { return { messages: [lastMessage] } },
-      async searchMessages() { return { messages: [searchMessage] } },
+      async getHistory() { return { messages: [lastMessage, searchMessage] } },
       async getUser(_session, id) {
         return id === 'alice' ? { id, firstName: 'Alice' }
           : id === 'carol' ? { id, firstName: 'Carol' }
@@ -3661,12 +3660,17 @@ describe('bridge login e2e', () => {
         offsetDate: 0, offsetId: 0, offsetPeer: { _: 'inputPeerEmpty' }, limit: 100, hash: Long.ZERO,
       }, 6)
       const chat = dialogs.chats.find((item: any) => item.title === conversation.title)
+      const peer = { _: 'inputPeerChannel', channelId: chat.id, accessHash: Long.ZERO }
+      // 搜索只看本地投影：先打开会话把历史拉进库里。
+      await callRpc(client, key, sid, {
+        _: 'messages.getHistory', peer, offsetId: 0, offsetDate: 0, addOffset: 0, limit: 20,
+        maxId: 0, minId: 0, hash: Long.ZERO,
+      }, 8)
       const searched = await callRpc(client, key, sid, {
-        _: 'messages.search',
-        peer: { _: 'inputPeerChannel', channelId: chat.id, accessHash: Long.ZERO },
+        _: 'messages.search', peer,
         q: 'gpt', filter: { _: 'inputMessagesFilterEmpty' }, minDate: 0, maxDate: 0,
         offsetId: 0, addOffset: 0, limit: 20, maxId: 0, minId: 0, hash: Long.ZERO,
-      }, 8)
+      }, 10)
 
       expect(searched.messages).toHaveLength(1)
       expect(searched.messages[0]).toMatchObject({
@@ -3680,7 +3684,7 @@ describe('bridge login e2e', () => {
       const users = await callRpc(client, key, sid, {
         _: 'users.getUsers',
         id: [{ _: 'inputUser', userId: mentionedUserId, accessHash: Long.ZERO }],
-      }, 10)
+      }, 12)
       expect(users).toMatchObject([{ _: 'user', id: mentionedUserId, firstName: 'Carol' }])
     } finally {
       client?.close()

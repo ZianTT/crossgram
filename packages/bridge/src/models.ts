@@ -94,6 +94,10 @@ export interface IMMessageRow {
   deleted: boolean
   platformGroupId: string | null
   metadata: JsonObject
+  /** 归一化后的可搜索文本（正文、卡片、文件名、链接），无文本索引，按会话扫描时做子串匹配。 */
+  searchText: string
+  /** 媒体类别位掩码（见 `SEARCH_KIND`）；`null` 表示旧数据尚未建立搜索字段。 */
+  searchKinds: number | null
   createdAt: Date
   updatedAt: Date
 }
@@ -372,14 +376,17 @@ export function defineModels(ctx: Context): void {
     id: 'unsigned', platformSessionId: 'string', conversationId: 'unsigned',
     primaryPlatformMessageId: 'text', senderUserId: 'unsigned', text: 'text', content: 'json', timestamp: 'integer',
     outgoing: 'boolean', deleted: 'boolean', platformGroupId: { type: 'text', nullable: true }, metadata: 'json',
+    searchText: 'text', searchKinds: { type: 'unsigned', nullable: true },
     createdAt: 'timestamp', updatedAt: 'timestamp',
   }, {
     primary: 'id', autoInc: true,
     // conversationId 是本表的全局唯一自增行号，已隐含 platformSessionId；
     // 判重键不再重复携带 32 字节的会话 id，索引键从 55 字节降到 23 字节。
     unique: [['conversationId', 'primaryPlatformMessageId']],
-    // senderUserId 只作为已取到行的字段被读取，没有任何查询以它为条件（from: 搜索在投影后过滤），无需索引。
-    indexes: [['conversationId', 'timestamp']],
+    // senderUserId 只在会话扫描中作为附加过滤条件（from: 搜索），不单独建索引。
+    // 搜索不建文本索引：会话内搜索沿 (conversationId, timestamp) 倒序扫描，
+    // 全局搜索沿 (platformSessionId, timestamp) 倒序扫描，searchText 子串匹配，凑够一页即停。
+    indexes: [['conversationId', 'timestamp'], ['platformSessionId', 'timestamp']],
   })
 
   ctx.model.extend('mtproto_im_request', {

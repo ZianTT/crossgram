@@ -29,6 +29,7 @@ import { IMStickerService } from './sticker-provider.js'
 import { StickerRpc } from './sticker-rpc.js'
 import { ReactionRpc } from './reaction-rpc.js'
 import { TelegramResourceService } from './resource-provider.js'
+import { HistorySyncService } from './history-sync.js'
 import {
   migrateLegacyVirtualPhones, PlatformAccountProvisioner, type ProvisionedPlatformAccount,
 } from './platform-account.js'
@@ -76,6 +77,8 @@ export {
   projectTlMessage, peerTlSeed, stableId,
 } from './dialogs.js'
 export * from './message-projection.js'
+export * from './history-sync.js'
+export * from './message-search.js'
 export * from './detached-message-projection.js'
 export * from './message-store.js'
 export * from './message-actions.js'
@@ -110,11 +113,14 @@ export * from './active-sessions.js'
 export * from './management-service.js'
 export * from './bot-dashboard.js'
 export * from './message-projection.js'
+export * from './history-sync.js'
+export * from './message-search.js'
 
 export const name = 'mtproto-bridge'
 export const inject = ['mtproto', 'database', 'model', 'server', 'webui', 'updateStore']
 export const provide = [
   'imPlatform', 'imSticker', 'telegramResource', 'systemPeer', 'mtprotoBridge', 'bridgeManagement', 'speech',
+  'historySync',
 ]
 
 export interface BridgeConfig {
@@ -239,6 +245,31 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     authKeyId => ctx.mtproto.finishAuthKeyRevocation(authKeyId),
   )
   const store = new MessageStore(ctx.database, undefined, ctx.updateStore, historyTrace, messageProjection)
+  const historySync = new HistorySyncService(ctx, store, platforms)
+  // 旧数据没有搜索字段，在后台分批补齐；每批之间让出事件循环，不阻塞启动和正常请求。
+  ctx.effect(() => {
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let total = 0
+    const step = () => {
+      if (stopped) return
+      void store.rebuildSearchFields(500).then((count) => {
+        total += count
+        if (stopped) return
+        if (count > 0) timer = setTimeout(step, 50)
+        else if (total > 0) bridgeLogger.info('search fields rebuilt for %d legacy messages', total)
+      }).catch((error) => {
+        bridgeLogger.warn('search field rebuild failed: %s', String(error))
+        if (!stopped) timer = setTimeout(step, 60_000)
+      })
+    }
+    timer = setTimeout(step, 1_000)
+    timer.unref?.()
+    return () => {
+      stopped = true
+      if (timer) clearTimeout(timer)
+    }
+  }, 'mtproto-bridge.search-rebuild')
   const drafts = new DraftStore(ctx.database)
   const notificationSettings = new NotificationSettingsStore(
     ctx.database, config.autoMuteGroupChats ?? true,
@@ -426,7 +457,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
       bridgeLogger.warn('system peer bootstrap failed: %s', String(error))
     })
   })
-  const requireBridgeSession = createSessionResolver(
+  const resolveBridgeSession = createSessionResolver(
     ctx, registry, stickerRpcFor, reactionRpcFor, resources, store, drafts, notificationSettings, blockedPeers,
     dialogFolders,
     subscriptions, uploads, systemPeers, generation,
@@ -442,6 +473,11 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     messageProjection,
     sendEchoes,
   )
+  const requireBridgeSession: typeof resolveBridgeSession = async (rpcContext, ...rest) => {
+    const state = await resolveBridgeSession(rpcContext, ...rest)
+    historySync.touch(state.session.platformSessionId, rpcContext.mtprotoRpc?.request._)
+    return state
+  }
   new MtprotoBridgeService(ctx, requireBridgeSession, dcId)
   registerGroupFilesMiniApp(ctx, platforms, requireBridgeSession, config.groupFilesMiniApp)
 
@@ -973,6 +1009,18 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     (await requireBridgeSession(rpc)).dialogs.getChannelMessages(req as tl.channels.RawGetMessagesRequest))
   rpc.register('messages.search', async (rpc, req) =>
     (await requireBridgeSession(rpc)).dialogs.search(req as tl.messages.RawSearchRequest))
+  rpc.register('messages.searchGlobal', async (rpc, req) =>
+    (await requireBridgeSession(rpc)).dialogs.searchGlobal(req as tl.messages.RawSearchGlobalRequest))
+  rpc.register('messages.searchSentMedia', async (rpc, req) =>
+    (await requireBridgeSession(rpc)).dialogs.searchSentMedia(req as tl.messages.RawSearchSentMediaRequest))
+  rpc.register('messages.getSearchResultsCalendar', async (rpc, req) =>
+    (await requireBridgeSession(rpc)).dialogs.getSearchResultsCalendar(
+      req as tl.messages.RawGetSearchResultsCalendarRequest,
+    ))
+  rpc.register('messages.getSearchResultsPositions', async (rpc, req) =>
+    (await requireBridgeSession(rpc)).dialogs.getSearchResultsPositions(
+      req as tl.messages.RawGetSearchResultsPositionsRequest,
+    ))
   rpc.register('messages.getSearchCounters', async (rpc, req) => bareVector(
     await (await requireBridgeSession(rpc)).dialogs.getSearchCounters(
       req as tl.messages.RawGetSearchCountersRequest,
