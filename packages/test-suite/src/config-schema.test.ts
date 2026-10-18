@@ -46,7 +46,7 @@ const cases = [
   ]],
   ['static', staticConfig, ['instanceId', 'mediaPath', 'transferChunkSize', 'eventIntervalMs', 'historySize']],
   ['satori', satoriConfig, ['bot']],
-  ['satori-exporter', exporterConfig, ['platformId', 'platform', 'maxMediaBytes']],
+  ['satori-exporter', exporterConfig, ['platformId', 'platform', 'maxMediaBytes', 'userIdSpace']],
   ['qq-flash-transfer-bot', flashTransferConfig, ['maxFiles', 'maxTotalBytes']],
   ['telegram-bot-api', botApiConfig, ['verifierSecret']],
   ['resources', resourcesConfig, ['assetsPath', 'providerId']],
@@ -108,6 +108,7 @@ describe('plugin config schemas', () => {
       platformId: 'qqnt',
       platform: 'qq',
       maxMediaBytes: 8 * 1024 * 1024,
+      userIdSpace: 'uin',
     })
     expect(debugConfig({})).toEqual({
       maxEvents: 2_000,
