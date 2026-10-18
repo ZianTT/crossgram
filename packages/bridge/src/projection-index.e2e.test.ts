@@ -53,6 +53,12 @@ describe('projection index schema', () => {
     expect(messageNames).not.toContain('index:mtproto_im_message:senderUserId')
     // 历史分页依赖的索引必须保留。
     expect(messageNames).toContain('index:mtproto_im_message:conversationId+timestamp')
+
+    // 左前缀重复的 messageId 单列索引不再出现在任何一张表上。
+    for (const table of ['mtproto_im_media', 'mtproto_im_message_reaction']) {
+      const names = (await driver.getIndexes(table)).map((index: { name: string }) => index.name)
+      expect(names).not.toContain(`index:${table}:messageId`)
+    }
   })
 
   it('still enforces per-scope message id uniqueness after the key reorder', async () => {

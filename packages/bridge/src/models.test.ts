@@ -48,6 +48,8 @@ describe('bridge models', () => {
     defineModels({ model: { extend } } as never)
     const partOptions = extend.mock.calls.find(([table]) => table === 'mtproto_tl_message_part')![2]
     const messageOptions = extend.mock.calls.find(([table]) => table === 'mtproto_im_message')![2]
+    const mediaOptions = extend.mock.calls.find(([table]) => table === 'mtproto_im_media')![2]
+    const reactionOptions = extend.mock.calls.find(([table]) => table === 'mtproto_im_message_reaction')![2]
 
     // messageId 查询由 unique(messageId, ordinal) 的左前缀承担。
     expect(partOptions.indexes).not.toContainEqual('messageId')
@@ -55,6 +57,9 @@ describe('bridge models', () => {
     expect(partOptions.indexes).not.toContainEqual(['platformSessionId', 'conversationId', 'tlMessageId'])
     // senderUserId 从不是查询条件。
     expect(messageOptions.indexes).not.toContainEqual('senderUserId')
+    // 媒体与回应的查询同样是 messageId = / IN (...)，unique 左前缀已覆盖。
+    expect(mediaOptions.indexes ?? []).not.toContainEqual('messageId')
+    expect(reactionOptions.indexes ?? []).not.toContainEqual('messageId')
   })
 
   it('keys platform message identity by conversation instead of repeating the session id', () => {

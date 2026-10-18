@@ -421,7 +421,7 @@ export function defineModels(ctx: Context): void {
   }, {
     primary: 'id', autoInc: true,
     unique: [['messageId', 'ordinal', 'platformMediaId']],
-    indexes: ['messageId'],
+    // 媒体查询一律是 messageId = / IN (...)，unique 的左前缀已经覆盖，无需单列索引。
   })
 
   ctx.model.extend('mtproto_tl_message_part', {
@@ -499,7 +499,7 @@ export function defineModels(ctx: Context): void {
   }, {
     primary: 'id', autoInc: true,
     unique: [['messageId', 'nativeReactionKey']],
-    indexes: ['messageId'],
+    // 回应查询只按 messageId 过滤，unique 的左前缀已经覆盖。
   })
 
   ctx.model.extend('mtproto_sticker_set_install', {
