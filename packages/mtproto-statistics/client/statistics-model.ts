@@ -104,4 +104,4 @@ export function distributionSlices(
   return slices
 }
 
-export { formatMs } from "cordis-webui-solidjs/utils"
+export { formatMs } from "cordis-webui-react/utils"

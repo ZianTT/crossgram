@@ -1,13 +1,12 @@
-import { createRoot, createSignal } from 'solid-js'
+import { createElement } from 'react'
+import { render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import {
-  parseCaptureQuery,
-  queryCapture,
-} from '../src/capture-api.js'
+import { parseCaptureQuery, queryCapture } from '../src/capture-api.js'
 import type { CapturedMtprotoEvent } from '../src/types.js'
 import {
   CAPTURE_POLL_MS,
   useCapturePages,
+  type CaptureController,
   type CaptureFilters,
 } from './capture.js'
 let rows: CapturedMtprotoEvent[], transport: ReturnType<typeof vi.fn>
@@ -22,15 +21,44 @@ const event = (id: number): CapturedMtprotoEvent => ({
   searchText: 'private payload-' + id,
   payload: { secret: 'payload-' + id },
 })
+/**
+ * The hook is imperative, so the harness only needs a component that mounts it
+ * and hands the controller back; every assertion reads the controller, which
+ * stays live through refs across re-renders.
+ */
+function Probe(props: {
+  filters: CaptureFilters
+  ready: boolean
+  capture: (value: CaptureController) => void
+}) {
+  props.capture(useCapturePages('/captures', props.filters, props.ready))
+  return null
+}
 function harness() {
-  const [filters, setFilters] = createSignal<CaptureFilters>({}),
-    [ready, setReady] = createSignal(true)
-  let capture!: ReturnType<typeof useCapturePages>
-  createRoot((dispose) => {
-    disposers.push(dispose)
-    capture = useCapturePages(() => '/captures', filters, ready)
-  })
-  return { capture, setFilters, setReady, dispose: disposers.at(-1)! }
+  let capture!: CaptureController
+  let filters: CaptureFilters = {}
+  let ready = true
+  const grab = (value: CaptureController) => {
+    capture = value
+  }
+  const view = () => createElement(Probe, { filters, ready, capture: grab })
+  const result = render(view())
+  const dispose = () => result.unmount()
+  disposers.push(dispose)
+  return {
+    get capture() {
+      return capture
+    },
+    setFilters(value: CaptureFilters) {
+      filters = value
+      result.rerender(view())
+    },
+    setReady(value: boolean) {
+      ready = value
+      result.rerender(view())
+    },
+    dispose,
+  }
 }
 beforeEach(() => {
   vi.useFakeTimers()
@@ -52,42 +80,42 @@ afterEach(() => {
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
-describe('Solid capture transport', () => {
+describe('capture transport', () => {
   it('loads summaries only, deduplicates detail requests and retains at most the active request/result pair', async () => {
     const { capture } = harness()
     await vi.advanceTimersByTimeAsync(0)
-    expect(capture.events()).toHaveLength(100)
-    expect(capture.events()[0].id).toBe(151)
-    expect(capture.events()[0].payload).toBeUndefined()
-    const first = capture.events()[0]
+    expect(capture.events).toHaveLength(100)
+    expect(capture.events[0].id).toBe(151)
+    expect(capture.events[0].payload).toBeUndefined()
+    const first = capture.events[0]
     capture.keepDetails([first.id])
     await Promise.all([capture.loadDetails(first), capture.loadDetails(first)])
     expect(transport).toHaveBeenCalledTimes(2)
-    expect(capture.details().get(151)?.payload).toEqual({
+    expect(capture.details.get(151)?.payload).toEqual({
       secret: 'payload-151',
     })
     capture.keepDetails([])
-    expect(capture.details().size).toBe(0)
+    expect(capture.details.size).toBe(0)
   })
   it('pages backwards and forwards, and consumes bursts without skipping the first forward page', async () => {
     const { capture } = harness()
     await vi.advanceTimersByTimeAsync(0)
     await capture.load('older')
-    expect(capture.events()[0].id).toBe(51)
-    expect(capture.live()).toBe(false)
+    expect(capture.events[0].id).toBe(51)
+    expect(capture.live).toBe(false)
     await vi.advanceTimersByTimeAsync(2 * CAPTURE_POLL_MS)
     expect(transport).toHaveBeenCalledTimes(2)
     await capture.load('newer')
-    expect(capture.events()[0].id).toBe(151)
+    expect(capture.events[0].id).toBe(151)
     await capture.load('latest')
     rows.push(...Array.from({ length: 250 }, (_, i) => event(251 + i)))
     await vi.advanceTimersByTimeAsync(CAPTURE_POLL_MS)
-    expect(capture.events().at(-1)?.id).toBe(350)
+    expect(capture.events.at(-1)?.id).toBe(350)
     await vi.advanceTimersByTimeAsync(150)
-    expect(capture.events().at(-1)?.id).toBe(450)
+    expect(capture.events.at(-1)?.id).toBe(450)
     await vi.advanceTimersByTimeAsync(150)
-    expect(capture.events().at(-1)?.id).toBe(500)
-    expect(capture.events()).toHaveLength(100)
+    expect(capture.events.at(-1)?.id).toBe(500)
+    expect(capture.events).toHaveLength(100)
   })
   it('aborts stale filter requests and never accepts their late responses', async () => {
     let resolve!: (response: Response) => void, signal!: AbortSignal
@@ -102,10 +130,10 @@ describe('Solid capture transport', () => {
     setFilters({ grep: 'payload-1' })
     await vi.advanceTimersByTimeAsync(200)
     expect(signal.aborted).toBe(true)
-    const ids = capture.events().map((event) => event.id)
+    const ids = capture.events.map((event) => event.id)
     resolve(Response.json({ events: [event(999)], total: 1 }))
     await vi.advanceTimersByTimeAsync(0)
-    expect(capture.events().map((event) => event.id)).toEqual(ids)
+    expect(capture.events.map((event) => event.id)).toEqual(ids)
     expect(ids).not.toContain(999)
   })
   it('stops polling in hidden pages and on disposal, then recovers from a failed poll', async () => {
@@ -119,9 +147,9 @@ describe('Solid capture transport', () => {
     vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
     document.dispatchEvent(new Event('visibilitychange'))
     await vi.advanceTimersByTimeAsync(0)
-    expect(capture.error()).toContain('503')
+    expect(capture.error).toContain('503')
     await vi.advanceTimersByTimeAsync(CAPTURE_POLL_MS)
-    expect(capture.error()).toBe('')
+    expect(capture.error).toBe('')
     dispose()
     const count = transport.mock.calls.length
     await vi.advanceTimersByTimeAsync(5000)
@@ -130,14 +158,14 @@ describe('Solid capture transport', () => {
   it('expires old rows/details and suspends transport while the Muon channel reconnects', async () => {
     const { capture, setReady } = harness()
     await vi.advanceTimersByTimeAsync(0)
-    const first = capture.events()[0]
+    const first = capture.events[0]
     capture.keepDetails([first.id])
     rows = []
     await capture.loadDetails(first)
-    expect(capture.error()).toContain('expired')
-    expect(capture.details().size).toBe(0)
+    expect(capture.error).toContain('expired')
+    expect(capture.details.size).toBe(0)
     await vi.advanceTimersByTimeAsync(CAPTURE_POLL_MS)
-    expect(capture.events()).toEqual([])
+    expect(capture.events).toEqual([])
     setReady(false)
     const count = transport.mock.calls.length
     await vi.advanceTimersByTimeAsync(5000)

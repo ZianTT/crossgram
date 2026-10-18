@@ -1,5 +1,5 @@
 import type { Context } from 'cordis'
-import type {} from 'cordis-webui-solidjs'
+import type {} from 'cordis-webui-react'
 import type {} from '@mtproto-relay/bridge'
 import z from 'schemastery'
 import { HistoryBackfillWorker } from './worker.js'

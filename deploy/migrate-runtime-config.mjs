@@ -31,18 +31,23 @@ const requiredPlugins = [
 ]
 
 const LEGACY_WEBUI_ENGINE = '@cordisjs/plugin-webui'
-const WEBUI_ENGINE = 'cordis-webui-solidjs'
+const LEGACY_REACT_ENGINE = 'cordis-webui-solidjs'
+const WEBUI_ENGINE = 'cordis-webui-react'
 const LEGACY_WEBUI_MONITOR = '@cordisjs/plugin-server-webui'
-const WEBUI_MONITOR = 'cordis-webui-solidjs/server'
+const LEGACY_REACT_MONITOR = 'cordis-webui-solidjs/server'
+const WEBUI_MONITOR = 'cordis-webui-react/server'
 
 /**
- * Point the WebUI group at the Solid implementation. The engine keeps its entry id and any
+ * Point the WebUI group at the React implementation. The engine keeps its entry id and any
  * configuration, and the server monitor (the successor of `plugin-server-webui`) is added
- * once right after it. Idempotent: running it against an already migrated config is a no-op.
+ * once right after it. The earlier Solid engine is renamed as well, so re-running the
+ * migration on an already migrated config stays a no-op.
  */
 export function migrateWebuiPlugin(source) {
   let next = renameEntry(source, LEGACY_WEBUI_ENGINE, WEBUI_ENGINE)
+  next = renameEntry(next, LEGACY_REACT_ENGINE, WEBUI_ENGINE)
   next = renameEntry(next, LEGACY_WEBUI_MONITOR, WEBUI_MONITOR)
+  next = renameEntry(next, LEGACY_REACT_MONITOR, WEBUI_MONITOR)
   if (!hasEntry(next, WEBUI_ENGINE) || hasEntry(next, WEBUI_MONITOR)) return next
   const lines = next.split('\n')
   const engineName = lines.findIndex((line) => line.trim() === `name: '${WEBUI_ENGINE}'`)
