@@ -375,7 +375,9 @@ export function defineModels(ctx: Context): void {
     createdAt: 'timestamp', updatedAt: 'timestamp',
   }, {
     primary: 'id', autoInc: true,
-    unique: [['platformSessionId', 'conversationId', 'primaryPlatformMessageId']],
+    // conversationId 是本表的全局唯一自增行号，已隐含 platformSessionId；
+    // 判重键不再重复携带 32 字节的会话 id，索引键从 55 字节降到 23 字节。
+    unique: [['conversationId', 'primaryPlatformMessageId']],
     // senderUserId 只作为已取到行的字段被读取，没有任何查询以它为条件（from: 搜索在投影后过滤），无需索引。
     indexes: [['conversationId', 'timestamp']],
   })
@@ -394,7 +396,8 @@ export function defineModels(ctx: Context): void {
     messageId: 'unsigned', ordinal: 'unsigned',
   }, {
     primary: 'id', autoInc: true,
-    unique: [['platformSessionId', 'conversationId', 'platformMessageId']],
+    // 同上：conversationId 已隐含 platformSessionId，平台消息 id 只需在会话内唯一。
+    unique: [['conversationId', 'platformMessageId']],
     indexes: ['messageId'],
   })
 

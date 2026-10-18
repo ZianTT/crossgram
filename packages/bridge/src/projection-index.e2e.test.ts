@@ -101,4 +101,41 @@ describe('projection index schema', () => {
     await expect(store.getOldestTlMessageId(session.platformSessionId, conversation.id))
       .resolves.toBe(ids[0])
   })
+
+  it('keeps platform message identity unique per conversation without the session prefix', async () => {
+    const { ctx } = await createDatabase()
+    const alias = {
+      platformSessionId: session.platformSessionId,
+      conversationId: 7,
+      platformMessageId: 'qq-message-1',
+      messageId: 11,
+      ordinal: 0,
+    }
+    await ctx.database.create('mtproto_im_message_alias', alias)
+    // 同一会话内的同一平台消息 id 仍然只能有一行。
+    await expect(ctx.database.create('mtproto_im_message_alias', {
+      ...alias, messageId: 12,
+    })).rejects.toThrow()
+    // 换成另一个会话（conversationId 全局唯一，因此也换了会话归属）可以重复。
+    await expect(ctx.database.create('mtproto_im_message_alias', {
+      ...alias, conversationId: 8,
+    })).resolves.toBeDefined()
+
+    const message = {
+      platformSessionId: session.platformSessionId,
+      conversationId: 7,
+      primaryPlatformMessageId: 'qq-message-1',
+      senderUserId: 1,
+      text: 'hello',
+      content: { parts: [{ type: 'text', text: 'hello' }] },
+      timestamp: 100,
+      outgoing: false,
+      deleted: false,
+      platformGroupId: null,
+      metadata: {},
+    }
+    await ctx.database.create('mtproto_im_message', message)
+    await expect(ctx.database.create('mtproto_im_message', { ...message, text: 'duplicate' }))
+      .rejects.toThrow()
+  })
 })

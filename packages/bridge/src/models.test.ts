@@ -56,4 +56,16 @@ describe('bridge models', () => {
     // senderUserId 从不是查询条件。
     expect(messageOptions.indexes).not.toContainEqual('senderUserId')
   })
+
+  it('keys platform message identity by conversation instead of repeating the session id', () => {
+    const extend = vi.fn()
+    defineModels({ model: { extend } } as never)
+    const messageOptions = extend.mock.calls.find(([table]) => table === 'mtproto_im_message')![2]
+    const aliasOptions = extend.mock.calls.find(([table]) => table === 'mtproto_im_message_alias')![2]
+
+    // conversationId 是全局唯一行号，已隐含 platformSessionId，
+    // 判重键不再重复携带 32 字节的会话 id。
+    expect(messageOptions.unique).toEqual([['conversationId', 'primaryPlatformMessageId']])
+    expect(aliasOptions.unique).toEqual([['conversationId', 'platformMessageId']])
+  })
 })
