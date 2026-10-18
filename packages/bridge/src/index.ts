@@ -38,6 +38,9 @@ import {
   SRP_PRIME_HEX, SrpChallengeStore, generateSrpVerifier, isValidSrpVerifier, verifySrpChallenge,
 } from './login-srp.js'
 import { DraftStore } from './draft-store.js'
+import {
+  ScheduledMessageDispatcher, ScheduledMessageStore, type ScheduledMessage,
+} from './scheduled-messages.js'
 import { NotificationSettingsStore } from './notification-settings.js'
 import {
   makeCrossGramServerConfig, makePlatformAccountView, makeUnavailableAccountView,
@@ -271,6 +274,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     }
   }, 'mtproto-bridge.search-rebuild')
   const drafts = new DraftStore(ctx.database)
+  const scheduledStore = new ScheduledMessageStore(ctx.database)
   const notificationSettings = new NotificationSettingsStore(
     ctx.database, config.autoMuteGroupChats ?? true,
   )
@@ -468,6 +472,7 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
       bridgeLogger.warn('system peer bootstrap failed: %s', String(error))
     })
   })
+  let scheduledDispatcher: ScheduledMessageDispatcher | undefined
   const resolveBridgeSession = createSessionResolver(
     ctx, registry, stickerRpcFor, reactionRpcFor, resources, store, drafts, notificationSettings, blockedPeers,
     dialogFolders,
@@ -483,12 +488,39 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     },
     messageProjection,
     sendEchoes,
+    scheduledStore,
+    () => { void scheduledDispatcher?.rescan() },
   )
   const requireBridgeSession: typeof resolveBridgeSession = async (rpcContext, ...rest) => {
     const state = await resolveBridgeSession(rpcContext, ...rest)
     historySync.touch(state.session.platformSessionId, rpcContext.mtprotoRpc?.request._)
     return state
   }
+  requireBridgeSession.buildState = resolveBridgeSession.buildState
+  const deliverScheduledMessage = async (message: ScheduledMessage): Promise<number | undefined> => {
+    const [row] = await ctx.database.get('mtproto_platform_session', {
+      id: message.platformSessionId, active: true,
+    })
+    if (!row) throw new Error(`platform session is not active: ${message.platformSessionId}`)
+    const state = await resolveBridgeSession.buildState({
+      platformId: row.platformId, platformSessionId: message.platformSessionId,
+    })
+    const delivered = await state.dialogs.deliverScheduled(message)
+    await updates.publishAccountUpdates(state.session, [{
+      _: 'updateDeleteScheduledMessages',
+      peer: delivered.peer,
+      messages: [message.tlMessageId],
+      sentMessages: delivered.sentTlMessageId === undefined ? undefined : [delivered.sentTlMessageId],
+    } as tl.TypeUpdate])
+    return delivered.sentTlMessageId
+  }
+  scheduledDispatcher = new ScheduledMessageDispatcher(scheduledStore, deliverScheduledMessage)
+  ctx.effect(() => {
+    void scheduledDispatcher!.start().catch((error) => {
+      bridgeLogger.warn('scheduled message dispatcher failed to start: %s', String(error))
+    })
+    return () => scheduledDispatcher!.stop()
+  }, 'mtproto-bridge.scheduled-messages')
   new MtprotoBridgeService(ctx, requireBridgeSession, dcId)
   registerGroupFilesMiniApp(ctx, platforms, requireBridgeSession, config.groupFilesMiniApp)
 
@@ -1057,6 +1089,12 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     ))
   rpc.register('messages.getScheduledHistory', async (rpc, req) =>
     (await requireBridgeSession(rpc)).dialogs.getScheduledHistory(req as tl.messages.RawGetScheduledHistoryRequest))
+  rpc.register('messages.getScheduledMessages', async (rpc, req) =>
+    (await requireBridgeSession(rpc)).dialogs.getScheduledMessages(req as tl.messages.RawGetScheduledMessagesRequest))
+  rpc.register('messages.sendScheduledMessages', async (rpc, req) =>
+    (await requireBridgeSession(rpc)).dialogs.sendScheduledMessages(req as tl.messages.RawSendScheduledMessagesRequest))
+  rpc.register('messages.deleteScheduledMessages', async (rpc, req) =>
+    (await requireBridgeSession(rpc)).dialogs.deleteScheduledMessages(req as tl.messages.RawDeleteScheduledMessagesRequest))
   rpc.register('messages.getPinnedDialogs', async (rpc, req) =>
     (await requireBridgeSession(rpc)).dialogs.getPinnedDialogs((req as tl.messages.RawGetPinnedDialogsRequest).folderId))
   rpc.register('messages.toggleDialogPin', async (rpc, req) => {
@@ -1562,6 +1600,8 @@ export function createSessionResolver(
   ) => void | Promise<void>,
   messageProjection?: MessageProjectionPipeline,
   sendEchoes?: SendEchoes,
+  scheduled?: ScheduledMessageStore,
+  onScheduledChange?: () => void,
 ) {
   const projection = messageProjection ?? new MessageProjectionPipeline(ctx)
   const loading = new Map<string, Promise<BridgeSessionState>>()
@@ -1583,7 +1623,60 @@ export function createSessionResolver(
     }
   }
 
-  return async (
+  const makeState = async (
+    identity: { platformId: string, platformSessionId: string },
+    options: { notifyRpc?: ServerRpcContext, authKeyId?: string } = {},
+  ) => {
+    const platform = registry.get(identity.platformId)
+    if (!platform) throw new RpcError(500, 'PLATFORM_NOT_AVAILABLE')
+    const [row] = await ctx.database.get('mtproto_platform_session', {
+      id: identity.platformSessionId,
+      active: true,
+    })
+    if (!row) throw new RpcError(401, 'PLATFORM_SESSION_REVOKED')
+    const [auth] = await ctx.database.get('mtproto_auth_session', {
+      platformId: identity.platformId, platformSessionId: identity.platformSessionId,
+    })
+    if (!auth) throw new RpcError(401, 'AUTH_KEY_UNREGISTERED')
+    const session = sessionFromRow(row, auth.virtualPhone)
+    const selfRow = await store.getUser(session.platformId, session.userId)
+      ?? await store.upsertUser(session, {
+        id: session.userId,
+        firstName: (row.metadata.firstName as string) ?? 'Bridge',
+        lastName: row.metadata.lastName as string | undefined,
+        username: row.metadata.username as string | undefined,
+        metadata: row.metadata,
+      })
+    await subscriptions.ensure(session)
+    if (options.notifyRpc) await notifyAuthorizedSession(session, options.notifyRpc)
+    const state: BridgeSessionState = {
+      generation, platform, session, projection,
+      stickers: stickerRpcFor(platform, session),
+      dialogs: undefined as never,
+    }
+    state.dialogs = new DialogRpc(
+      platform, session, store, uploads, onTransferProgress, dcId, state.stickers,
+      reactionRpcFor(platform, session),
+      resources,
+      (localSession, event, options) => subscriptions.ingestLocalEvent(localSession, event, options),
+      options.authKeyId,
+      historyTrace,
+      drafts,
+      onDraftUpdate,
+      notificationSettings,
+      selfRow.id,
+      blockedPeers,
+      dialogFolders,
+      systemPeers,
+      projection,
+      sendEchoes,
+      scheduled,
+      onScheduledChange,
+    )
+    return state
+  }
+
+  const requireSession = async (
     rpc: ServerRpcContext,
     provisionalIdentity?: { platformId: string, platformSessionId: string },
     cache = true,
@@ -1599,60 +1692,9 @@ export function createSessionResolver(
     if (!rpc.authKeyId) throw new RpcError(401, 'AUTH_KEY_UNREGISTERED')
 
     const authKeyId = authKeyHex(rpc.authKeyId)
-    const makeState = async (
-      identity: { platformId: string, platformSessionId: string },
-      notify = true,
-    ) => {
-      const platform = registry.get(identity.platformId)
-      if (!platform) throw new RpcError(500, 'PLATFORM_NOT_AVAILABLE')
-      const [row] = await ctx.database.get('mtproto_platform_session', {
-        id: identity.platformSessionId,
-        active: true,
-      })
-      if (!row) throw new RpcError(401, 'PLATFORM_SESSION_REVOKED')
-      const [auth] = await ctx.database.get('mtproto_auth_session', {
-        platformId: identity.platformId, platformSessionId: identity.platformSessionId,
-      })
-      if (!auth) throw new RpcError(401, 'AUTH_KEY_UNREGISTERED')
-      const session = sessionFromRow(row, auth.virtualPhone)
-      const selfRow = await store.getUser(session.platformId, session.userId)
-        ?? await store.upsertUser(session, {
-          id: session.userId,
-          firstName: (row.metadata.firstName as string) ?? 'Bridge',
-          lastName: row.metadata.lastName as string | undefined,
-          username: row.metadata.username as string | undefined,
-          metadata: row.metadata,
-        })
-      await subscriptions.ensure(session)
-      if (notify) await notifyAuthorizedSession(session, rpc)
-      const state: BridgeSessionState = {
-        generation, platform, session, projection,
-        stickers: stickerRpcFor(platform, session),
-        dialogs: undefined as never,
-      }
-      state.dialogs = new DialogRpc(
-        platform, session, store, uploads, onTransferProgress, dcId, state.stickers,
-        reactionRpcFor(platform, session),
-        resources,
-        (localSession, event, options) => subscriptions.ingestLocalEvent(localSession, event, options),
-        authKeyId,
-        historyTrace,
-        drafts,
-        onDraftUpdate,
-        notificationSettings,
-        selfRow.id,
-        blockedPeers,
-        dialogFolders,
-        systemPeers,
-        projection,
-        sendEchoes,
-      )
-      return state
-    }
-
     if (!cache) {
       if (!provisionalIdentity) throw new RpcError(401, 'AUTH_KEY_UNREGISTERED')
-      return makeState(provisionalIdentity, false)
+      return makeState(provisionalIdentity)
     }
 
     while (true) {
@@ -1661,7 +1703,7 @@ export function createSessionResolver(
         pending = (async () => {
           const [binding] = await ctx.database.get('mtproto_auth_binding', { authKeyId })
           if (!binding) throw new RpcError(401, 'AUTH_KEY_UNREGISTERED')
-          return makeState(binding)
+          return makeState(binding, { notifyRpc: rpc, authKeyId })
         })()
         loading.set(authKeyId, pending)
         pending.finally(() => {
@@ -1679,6 +1721,9 @@ export function createSessionResolver(
       return state
     }
   }
+  requireSession.buildState = async (identity: { platformId: string, platformSessionId: string }) =>
+    makeState(identity)
+  return requireSession
 }
 
 function authKeyHex(authKeyId: Uint8Array): string {

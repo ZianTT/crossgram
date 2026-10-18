@@ -1,0 +1,363 @@
+import { afterEach, describe, expect, it } from 'vitest'
+import { Context } from 'cordis'
+import Database from '@cordisjs/plugin-database'
+import SQLiteDriver from '@cordisjs/plugin-database-sqlite'
+import Long from 'long'
+import type { tl } from '@mtcute/core'
+import { defineModels } from './models.js'
+import { DialogRpc } from './dialogs.js'
+import { MessageStore } from './message-store.js'
+import type { IMMessageInput, IMPlatform } from './platform.js'
+import {
+  clampScheduleDelay, SCHEDULED_MESSAGE_MAX_DELAY_MS, ScheduledMessageDispatcher,
+  ScheduledMessageStore, type ScheduledMessage,
+} from './scheduled-messages.js'
+
+const disposals: Array<() => Promise<void>> = []
+
+afterEach(async () => {
+  await Promise.all(disposals.splice(0).map((dispose) => dispose()))
+})
+
+async function createDatabase() {
+  const ctx = new Context()
+  const fibers = [ctx.plugin(Database), ctx.plugin(SQLiteDriver, { path: ':memory:' })]
+  await Promise.all(fibers)
+  await new Promise((resolve) => setTimeout(resolve, 25))
+  defineModels(ctx)
+  await ctx.database.prepared()
+  disposals.push(async () => {
+    for (const fiber of fibers.reverse()) await Promise.resolve((fiber as any).dispose?.())
+  })
+  return ctx.database
+}
+
+function nowSeconds(): number {
+  return Math.floor(Date.now() / 1_000)
+}
+
+async function createDue(
+  store: ScheduledMessageStore,
+  options: { dueAt?: number, text?: string, tlMessageId?: number, randomId?: string } = {},
+): Promise<ScheduledMessage> {
+  return store.create({
+    platformSessionId: 'session',
+    platformConversationId: 'peer',
+    conversationKind: 'direct',
+    tlMessageId: options.tlMessageId ?? 1,
+    text: options.text ?? 'later',
+    dueAt: options.dueAt ?? nowSeconds() + 60,
+    randomId: options.randomId ?? String(options.tlMessageId ?? 1),
+  })
+}
+
+interface ArmedTimer {
+  dueMs: number
+  fire: () => void
+}
+
+function recordingScheduler(): { armed: ArmedTimer[], schedule: (dueMs: number, callback: () => void) => () => void } {
+  const armed: ArmedTimer[] = []
+  return {
+    armed,
+    schedule: (dueMs, callback) => {
+      armed.push({ dueMs, fire: callback })
+      return () => undefined
+    },
+  }
+}
+
+describe('scheduled message store', () => {
+  it('creates a message and its scheduling state in one row pair', async () => {
+    const database = await createDatabase()
+    const store = new ScheduledMessageStore(database)
+    const created = await createDue(store, { dueAt: 1_800_000_000 })
+    expect(created).toMatchObject({
+      platformSessionId: 'session',
+      platformConversationId: 'peer',
+      tlMessageId: 1,
+      status: 'pending',
+      attempts: 0,
+      dueAt: 1_800_000_000,
+    })
+    const list = await store.list('session', 'peer')
+    expect(list.map((row) => row.text)).toEqual(['later'])
+  })
+
+  it('cancels a pending message and hides it from the list', async () => {
+    const database = await createDatabase()
+    const store = new ScheduledMessageStore(database)
+    const created = await createDue(store)
+    expect(await store.cancel('session', 'peer', created.tlMessageId)).toBe(true)
+    expect(await store.list('session', 'peer')).toHaveLength(0)
+    expect(await store.cancel('session', 'peer', created.tlMessageId)).toBe(false)
+  })
+})
+
+describe('scheduled message dispatcher', () => {
+  it('sends a due message and marks it sent', async () => {
+    const database = await createDatabase()
+    const store = new ScheduledMessageStore(database)
+    const message = await createDue(store, { dueAt: nowSeconds() - 5 })
+    const sent: number[] = []
+    const timer = recordingScheduler()
+    const dispatcher = new ScheduledMessageDispatcher(store, async (row) => {
+      sent.push(row.tlMessageId)
+      return 900
+    }, { schedule: timer.schedule })
+    await dispatcher.start()
+    await dispatcher.sweep()
+    expect(sent).toEqual([message.tlMessageId])
+    const [state] = await database.get('mtproto_scheduled_state', { messageId: message.id })
+    expect(state.status).toBe('sent')
+    expect(state.sentTlMessageId).toBe(900)
+    dispatcher.stop()
+  })
+
+  it('recovers a message whose sender crashed with an expired lease', async () => {
+    const database = await createDatabase()
+    const store = new ScheduledMessageStore(database)
+    const message = await createDue(store, { dueAt: nowSeconds() - 60 })
+    await database.set('mtproto_scheduled_state', { messageId: message.id }, {
+      status: 'sending', leaseOwner: 'crashed', leaseUntil: nowSeconds() - 30,
+    })
+    const sent: number[] = []
+    const dispatcher = new ScheduledMessageDispatcher(store, async (row) => {
+      sent.push(row.tlMessageId)
+      return 1
+    }, { schedule: recordingScheduler().schedule })
+    await dispatcher.start()
+    await dispatcher.sweep()
+    expect(sent).toEqual([message.tlMessageId])
+    dispatcher.stop()
+  })
+
+  it('sends once when two dispatchers race for the same row', async () => {
+    const database = await createDatabase()
+    const store = new ScheduledMessageStore(database)
+    await createDue(store, { dueAt: nowSeconds() - 5 })
+    let sends = 0
+    const send = async () => {
+      sends++
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      return 7
+    }
+    const first = new ScheduledMessageDispatcher(store, send, {
+      owner: 'first', schedule: recordingScheduler().schedule,
+    })
+    const second = new ScheduledMessageDispatcher(store, send, {
+      owner: 'second', schedule: recordingScheduler().schedule,
+    })
+    await Promise.all([first.sweep(), second.sweep()])
+    expect(sends).toBe(1)
+    first.stop()
+    second.stop()
+  })
+
+  it('does not send a cancelled message', async () => {
+    const database = await createDatabase()
+    const store = new ScheduledMessageStore(database)
+    const message = await createDue(store, { dueAt: nowSeconds() - 5 })
+    await store.cancel('session', 'peer', message.tlMessageId)
+    let sends = 0
+    const dispatcher = new ScheduledMessageDispatcher(store, async () => {
+      sends++
+      return 1
+    }, { schedule: recordingScheduler().schedule })
+    await dispatcher.start()
+    await dispatcher.sweep()
+    expect(sends).toBe(0)
+    dispatcher.stop()
+  })
+
+  it('keeps the current timer when a later message is added', async () => {
+    const database = await createDatabase()
+    const store = new ScheduledMessageStore(database)
+    const timer = recordingScheduler()
+    const dispatcher = new ScheduledMessageDispatcher(store, async () => 1, {
+      schedule: timer.schedule,
+    })
+    await createDue(store, { dueAt: nowSeconds() + 120, tlMessageId: 10, randomId: '10' })
+    await dispatcher.start()
+    expect(timer.armed).toHaveLength(1)
+
+    await createDue(store, { dueAt: nowSeconds() + 300, tlMessageId: 11, randomId: '11' })
+    await dispatcher.rescan()
+    expect(timer.armed).toHaveLength(1)
+
+    await createDue(store, { dueAt: nowSeconds() + 30, tlMessageId: 12, randomId: '12' })
+    await dispatcher.rescan()
+    expect(timer.armed).toHaveLength(2)
+    dispatcher.stop()
+  })
+
+  it('parks a message after repeated send failures', async () => {
+    const database = await createDatabase()
+    const store = new ScheduledMessageStore(database)
+    const message = await createDue(store, { dueAt: nowSeconds() - 5 })
+    const dispatcher = new ScheduledMessageDispatcher(store, async () => {
+      throw new Error('platform offline')
+    }, { schedule: recordingScheduler().schedule })
+    await dispatcher.start()
+    for (let attempt = 0; attempt < 7; attempt++) {
+      await database.set('mtproto_scheduled_state', { messageId: message.id }, {
+        status: 'pending', nextAttemptAt: nowSeconds() - 1,
+      })
+      await dispatcher.sweep()
+    }
+    const [state] = await database.get('mtproto_scheduled_state', { messageId: message.id })
+    expect(state.status).toBe('failed')
+    expect(state.lastError).toBe('platform offline')
+    dispatcher.stop()
+  })
+})
+
+describe('scheduled timer cap', () => {
+  it('never asks a timer to wait longer than the 24 day cap', () => {
+    const thirtyDays = 30 * 24 * 60 * 60 * 1_000
+    expect(clampScheduleDelay(thirtyDays)).toBe(SCHEDULED_MESSAGE_MAX_DELAY_MS)
+    expect(clampScheduleDelay(-5)).toBe(0)
+    expect(clampScheduleDelay(Number.POSITIVE_INFINITY)).toBe(SCHEDULED_MESSAGE_MAX_DELAY_MS)
+    expect(SCHEDULED_MESSAGE_MAX_DELAY_MS).toBeLessThan(2 ** 31 - 1)
+  })
+})
+
+describe('scheduled message RPCs', () => {
+  it('creates, lists, delivers and deletes a scheduled text message', async () => {
+    const database = await createDatabase()
+    const store = new MessageStore(database)
+    const scheduled = new ScheduledMessageStore(database)
+    const session = {
+      platformSessionId: 'rpc-session', platformId: 'rpc-platform', userId: 'self',
+      credentials: {}, metadata: { firstName: 'Self' },
+    }
+    let lastInput: IMMessageInput | undefined
+    const platform: IMPlatform = {
+      capabilities: {
+        history: true,
+        send: { text: true, images: false, files: false, mixed: false, maxTextLength: 4096, maxMedia: 0 },
+        conversations: { groups: false, channels: false, subchannels: false },
+      },
+      async subscribe() { return () => {} },
+      async sendMessage(_session, conversation, content) {
+        lastInput = content
+        return {
+          id: String(Date.now()), conversationId: conversation.id, senderId: 'self',
+          timestamp: Math.floor(Date.now() / 1_000), outgoing: true, content,
+        }
+      },
+      async getDialogs() {
+        return {
+          dialogs: [{
+            conversation: { id: 'alice', kind: 'direct' as const, title: 'Alice' },
+            unreadCount: 0,
+          }],
+        }
+      },
+      async getHistory() { return { messages: [] } },
+      async getUser(_session, id) {
+        return id === 'alice' ? { id, firstName: 'Alice' } : null
+      },
+      async getContacts() { return { users: [{ id: 'alice', firstName: 'Alice' }] } },
+    } as unknown as IMPlatform
+    const rpc = new DialogRpc(
+      platform, session, store, undefined, undefined, 1, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, 1, undefined,
+      undefined, undefined, undefined, undefined, scheduled,
+    )
+    await rpc.getContacts()
+    const aliceId = rpc.peerTlId('alice')
+    const peer = { _: 'inputPeerUser' as const, userId: aliceId, accessHash: Long.ZERO }
+    const created = await rpc.sendMessage({
+      _: 'messages.sendMessage', peer, message: 'send this later',
+      randomId: Long.fromNumber(41), scheduleDate: nowSeconds() + 120,
+    })
+    expect(created).toMatchObject({
+      _: 'updates',
+      updates: [{ _: 'updateNewScheduledMessage', message: { message: 'send this later' } }],
+    })
+
+    const listed = await rpc.getScheduledHistory({
+      _: 'messages.getScheduledHistory', peer, hash: Long.ZERO,
+    })
+    expect(listed).toMatchObject({ _: 'messages.messages' })
+    const listedMessages = 'messages' in listed ? listed.messages : []
+    expect(listedMessages).toHaveLength(1)
+    const scheduledMessage = listedMessages[0] as tl.RawMessage
+    expect(scheduledMessage).toMatchObject({ message: 'send this later', out: true })
+
+    const row = (await scheduled.list(session.platformSessionId, 'alice'))[0]
+    const delivered = await rpc.deliverScheduled(row)
+    expect(lastInput?.parts[0]).toMatchObject({ type: 'text', text: 'send this later' })
+    expect(delivered.sentTlMessageId).toBeGreaterThan(0)
+
+    const deleted = await rpc.deleteScheduledMessages({
+      _: 'messages.deleteScheduledMessages', peer, id: [scheduledMessage.id],
+    })
+    expect(deleted).toMatchObject({
+      _: 'updates',
+      updates: [{ _: 'updateDeleteScheduledMessages', messages: [scheduledMessage.id] }],
+    })
+    expect(await scheduled.list(session.platformSessionId, 'alice')).toHaveLength(0)
+  })
+
+  it('sends a scheduled message immediately when asked', async () => {
+    const database = await createDatabase()
+    const store = new MessageStore(database)
+    const scheduled = new ScheduledMessageStore(database)
+    const session = {
+      platformSessionId: 'rpc-session-2', platformId: 'rpc-platform', userId: 'self',
+      credentials: {}, metadata: { firstName: 'Self' },
+    }
+    let lastInput: IMMessageInput | undefined
+    const platform: IMPlatform = {
+      capabilities: {
+        history: true,
+        send: { text: true, images: false, files: false, mixed: false, maxTextLength: 4096, maxMedia: 0 },
+        conversations: { groups: false, channels: false, subchannels: false },
+      },
+      async subscribe() { return () => {} },
+      async sendMessage(_session, conversation, content) {
+        lastInput = content
+        return {
+          id: String(Date.now()), conversationId: conversation.id, senderId: 'self',
+          timestamp: Math.floor(Date.now() / 1_000), outgoing: true, content,
+        }
+      },
+      async getDialogs() {
+        return {
+          dialogs: [{
+            conversation: { id: 'alice', kind: 'direct' as const, title: 'Alice' },
+            unreadCount: 0,
+          }],
+        }
+      },
+      async getHistory() { return { messages: [] } },
+      async getUser(_session, id) { return { id, firstName: id } },
+      async getContacts() { return { users: [{ id: 'alice', firstName: 'Alice' }] } },
+    } as unknown as IMPlatform
+    const rpc = new DialogRpc(
+      platform, session, store, undefined, undefined, 1, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, 1, undefined,
+      undefined, undefined, undefined, undefined, scheduled,
+    )
+    await rpc.getContacts()
+    const peer = { _: 'inputPeerUser' as const, userId: rpc.peerTlId('alice'), accessHash: Long.ZERO }
+    await rpc.sendMessage({
+      _: 'messages.sendMessage', peer, message: 'right now',
+      randomId: Long.fromNumber(77), scheduleDate: nowSeconds() + 600,
+    })
+    const listed = await rpc.getScheduledHistory({
+      _: 'messages.getScheduledHistory', peer, hash: Long.ZERO,
+    })
+    const listedMessages = 'messages' in listed ? listed.messages : []
+    const scheduledId = (listedMessages[0] as tl.RawMessage).id
+    const sent = await rpc.sendScheduledMessages({
+      _: 'messages.sendScheduledMessages', peer, id: [scheduledId],
+    })
+    expect(lastInput?.parts[0]).toMatchObject({ type: 'text', text: 'right now' })
+    expect((sent._ === 'updates' ? sent.updates : [])
+      .some((update) => update._ === 'updateDeleteScheduledMessages')).toBe(true)
+    expect(await scheduled.list(session.platformSessionId, 'alice')).toHaveLength(0)
+  })
+})

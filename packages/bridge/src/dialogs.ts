@@ -38,6 +38,7 @@ import { probeImageDimensions } from './image-dimensions.js'
 import { withAutoLinkEntities } from './message-entities.js'
 import { getCardThumbnailFile, makeCardThumbnailPhoto, storageFileType } from './card-thumbnail.js'
 import type { DraftStore, StoredDraft } from './draft-store.js'
+import type { ScheduledMessage, ScheduledMessageStore } from './scheduled-messages.js'
 import { MUTE_FOREVER, type NotificationSettingsStore, type NotificationTarget } from './notification-settings.js'
 import type { BlockedPeerChange, BlockedPeerStore } from './blocked-peers.js'
 import { SystemPeerCallbackError, type SystemPeerResolution, type SystemPeerService } from './system-peer.js'
@@ -330,6 +331,8 @@ export class DialogRpc {
     private readonly _systemPeers?: SystemPeerService,
     private readonly _messageProjection?: MessageProjectionPipeline,
     private readonly _sendEchoes?: SendEchoes,
+    private readonly _scheduled?: ScheduledMessageStore,
+    private readonly _onScheduledChange?: () => void,
   ) {
     this._actions = new PlatformMessageActions(_platform, _session)
     // 有 `MessageStore` 时淘汰旧条目并由数据库兜底；无存储模式不可淘汰，避免重用已分配的 ID。
@@ -1335,7 +1338,221 @@ export class DialogRpc {
     req: tl.messages.RawGetScheduledHistoryRequest,
   ): Promise<tl.messages.TypeMessages> {
     await this._hydratePeers()
-    return this._emptyMessages(this._conversation(this._resolvePeer(req.peer)))
+    const conversation = this._conversation(this._resolvePeer(req.peer))
+    const rows = await this._scheduledMessages(conversation.id)
+    return this._scheduledMessagesReply(conversation, rows)
+  }
+
+  async getScheduledMessages(
+    req: tl.messages.RawGetScheduledMessagesRequest,
+  ): Promise<tl.messages.TypeMessages> {
+    await this._hydratePeers()
+    const conversation = this._conversation(this._resolvePeer(req.peer))
+    if (!this._scheduled) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    const rows = await this._scheduled.byTlIds(
+      this._session.platformSessionId, conversation.id, req.id,
+    )
+    return this._scheduledMessagesReply(conversation, rows)
+  }
+
+  /**
+   * Send scheduled messages now.
+   *
+   * Each row goes through the ordinary send path, so the resulting message is
+   * persisted and published exactly like a normal send; the scheduled entries
+   * are then removed from the client-visible list.
+   */
+  async sendScheduledMessages(
+    req: tl.messages.RawSendScheduledMessagesRequest,
+  ): Promise<tl.TypeUpdates> {
+    await this._hydratePeers()
+    const conversation = this._conversation(this._resolvePeer(req.peer))
+    if (!this._scheduled) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    const rows = await this._scheduled.byTlIds(
+      this._session.platformSessionId, conversation.id, req.id,
+    )
+    if (!rows.length) throw new RpcError(400, 'MESSAGE_ID_INVALID')
+    const updates: tl.TypeUpdate[] = []
+    const sentIds: number[] = []
+    for (const row of rows) {
+      const sent = await this._sendMessage(this._scheduledSendRequest(row))
+      const sentUpdates = sent._ === 'updates' ? sent.updates : []
+      updates.push(...sentUpdates)
+      const newId = sentUpdates
+        .map((update) => update._ === 'updateNewMessage' || update._ === 'updateNewChannelMessage'
+          ? update.message.id
+          : undefined)
+        .find((id): id is number => id !== undefined)
+      if (newId !== undefined) sentIds.push(newId)
+      await this._scheduled.cancel(
+        this._session.platformSessionId, conversation.id, row.tlMessageId,
+      )
+    }
+    this._onScheduledChange?.()
+    updates.push({
+      _: 'updateDeleteScheduledMessages',
+      peer: this._conversationPeer(conversation),
+      messages: rows.map((row) => row.tlMessageId),
+    })
+    return {
+      _: 'updates', updates,
+      users: [this._makeSelfUser()],
+      chats: conversation.kind === 'direct' ? [] : [this._makeChat(conversation)],
+      date: Math.floor(Date.now() / 1_000), seq: 0,
+    }
+  }
+
+  async deleteScheduledMessages(
+    req: tl.messages.RawDeleteScheduledMessagesRequest,
+  ): Promise<tl.TypeUpdates> {
+    await this._hydratePeers()
+    const conversation = this._conversation(this._resolvePeer(req.peer))
+    if (!this._scheduled) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    const removed: number[] = []
+    for (const tlMessageId of req.id) {
+      if (await this._scheduled.cancel(
+        this._session.platformSessionId, conversation.id, tlMessageId,
+      )) removed.push(tlMessageId)
+    }
+    if (removed.length) this._onScheduledChange?.()
+    return {
+      _: 'updates', updates: [{
+        _: 'updateDeleteScheduledMessages',
+        peer: this._conversationPeer(conversation),
+        messages: removed,
+      }],
+      users: [this._makeSelfUser()],
+      chats: conversation.kind === 'direct' ? [] : [this._makeChat(conversation)],
+      date: Math.floor(Date.now() / 1_000), seq: 0,
+    }
+  }
+
+  /**
+   * Deliver one stored row when its time comes (called by the dispatcher).
+   *
+   * The peer is rebuilt from the stored conversation id rather than from the
+   * creating client's input peer, so a restart cannot leave a stale peer behind.
+   */
+  async deliverScheduled(message: ScheduledMessage): Promise<{
+    sentTlMessageId?: number
+    peer: tl.TypePeer
+  }> {
+    const conversationId = message.platformConversationId
+    if (!this._conversations.has(conversationId)) {
+      const stored = await this._store?.getConversation(
+        this._session.platformSessionId, conversationId,
+      )
+      if (stored) this._conversations.set(conversationId, stored)
+      else this._conversations.set(conversationId, {
+        id: conversationId, kind: message.conversationKind, title: conversationId,
+      })
+    }
+    const conversation = this._conversation(conversationId)
+    if (conversation.kind === 'direct') await this._getPeerUser(conversationId)
+    const result = await this._sendMessage(this._scheduledSendRequest(message))
+    const resultUpdates = result._ === 'updates' ? result.updates : []
+    const sentTlMessageId = resultUpdates
+      .map((update) => update._ === 'updateNewMessage' || update._ === 'updateNewChannelMessage'
+        ? update.message.id
+        : undefined)
+      .find((id): id is number => id !== undefined)
+    return { sentTlMessageId, peer: this._conversationPeer(conversation) }
+  }
+
+  private _scheduledSendRequest(message: ScheduledMessage): SendMessageRequest {
+    const conversation = this._conversation(message.platformConversationId)
+    const peer: tl.TypeInputPeer = conversation.kind === 'direct'
+      ? { _: 'inputPeerUser', userId: this._userId(conversation.id), accessHash: Long.ZERO }
+      : { _: 'inputPeerChannel', channelId: this._peerId(conversation.id), accessHash: Long.ONE }
+    return {
+      _: 'messages.sendMessage',
+      peer,
+      message: message.text,
+      randomId: Long.fromString(message.randomId),
+      entities: (message.entities ?? undefined) as unknown as tl.TypeMessageEntity[] | undefined,
+      replyTo: message.replyToMsgId
+        ? { _: 'inputReplyToMessage', replyToMsgId: message.replyToMsgId }
+        : undefined,
+    }
+  }
+
+  private async _scheduleTextMessage(req: SendMessageRequest): Promise<tl.TypeUpdates> {
+    if (!this._scheduled || !this._store) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    await this._hydratePeers()
+    const conversationId = this._resolveMessageTarget(req.peer, req.replyTo)
+    this._assertWritableConversation(conversationId)
+    const conversation = this._conversation(conversationId)
+    if (conversation.kind === 'channel' && conversation.parentId) {
+      throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    }
+    const dueAt = req.scheduleDate!
+    if (!Number.isSafeInteger(dueAt) || dueAt <= 0) throw new RpcError(400, 'SCHEDULE_DATE_INVALID')
+    const idScope = `scheduled:${this._session.platformSessionId}:${conversationId}`
+    const [tlMessageId] = await this._store.allocateIds(idScope, 1)
+    const replyToMsgId = req.replyTo?._ === 'inputReplyToMessage'
+      ? req.replyTo.replyToMsgId
+      : undefined
+    const row = await this._scheduled.create({
+      platformSessionId: this._session.platformSessionId,
+      platformConversationId: conversationId,
+      conversationKind: conversation.kind,
+      tlMessageId,
+      text: req.message,
+      entities: (req.entities as unknown as JsonValue[] | undefined) ?? null,
+      replyToMsgId,
+      dueAt,
+      randomId: req.randomId.toString(),
+    })
+    this._onScheduledChange?.()
+    return {
+      _: 'updates',
+      updates: [{
+        _: 'updateNewScheduledMessage',
+        message: this._scheduledMessageTl(row, conversation),
+      }],
+      users: [this._makeSelfUser()],
+      chats: conversation.kind === 'direct' ? [] : [this._makeChat(conversation)],
+      date: Math.floor(Date.now() / 1_000), seq: 0,
+    }
+  }
+
+  private async _scheduledMessages(conversationId: string): Promise<ScheduledMessage[]> {
+    if (!this._scheduled) return []
+    return this._scheduled.list(this._session.platformSessionId, conversationId)
+  }
+
+  private _scheduledMessagesReply(
+    conversation: import('./platform.js').IMConversation,
+    rows: ScheduledMessage[],
+  ): tl.messages.RawMessages {
+    return {
+      _: 'messages.messages',
+      messages: rows
+        .sort((left, right) => left.dueAt - right.dueAt)
+        .map((row) => this._scheduledMessageTl(row, conversation)),
+      topics: [],
+      chats: conversation.kind === 'direct' ? [] : [this._makeChat(conversation)],
+      users: [this._makeSelfUser()],
+    }
+  }
+
+  private _scheduledMessageTl(
+    row: ScheduledMessage,
+    conversation: import('./platform.js').IMConversation,
+  ): tl.RawMessage {
+    return {
+      _: 'message',
+      id: row.tlMessageId,
+      peerId: this._conversationPeer(conversation),
+      fromId: { _: 'peerUser', userId: this._selfId },
+      date: row.dueAt,
+      message: row.text,
+      entities: (row.entities ?? undefined) as unknown as tl.TypeMessageEntity[] | undefined,
+      out: true,
+      replyTo: row.replyToMsgId
+        ? { _: 'messageReplyHeader', replyToScheduled: true, replyToMsgId: row.replyToMsgId }
+        : undefined,
+    }
   }
 
   async getMessages(req: GetMessagesRequest): Promise<tl.messages.TypeMessages> {
@@ -2222,6 +2439,7 @@ export class DialogRpc {
   }
 
   async sendMedia(req: SendMediaRequest, excludeConnection?: ServerConnection): Promise<tl.TypeUpdates> {
+    if (req.scheduleDate !== undefined) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
     return this._sendMediaOnce(req.randomId.toString(), async () => {
       const startedAt = performance.now()
       const resolved = await this._resolveSendMedia(req.media)
@@ -2257,6 +2475,7 @@ export class DialogRpc {
   }
 
   async sendMultiMedia(req: SendMultiMediaRequest, excludeConnection?: ServerConnection): Promise<tl.TypeUpdates> {
+    if (req.scheduleDate !== undefined) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
     const randomId = req.multiMedia.map((item) => item.randomId.toString()).join(':')
     return this._sendMediaOnce(randomId, async () => {
       if (!req.multiMedia.length) throw new RpcError(400, 'MEDIA_EMPTY')
@@ -3497,7 +3716,7 @@ export class DialogRpc {
     if (Array.from(req.message).length > this._platform.capabilities.send.maxTextLength) {
       throw new RpcError(400, 'MESSAGE_TOO_LONG')
     }
-    if (req.scheduleDate !== undefined) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    if (req.scheduleDate !== undefined) return this._scheduleTextMessage(req)
 
     await this._hydratePeers()
     const peerId = this._resolveMessageTarget(req.peer, req.replyTo)

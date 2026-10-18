@@ -281,6 +281,33 @@ export interface DialogFilterRow {
   updatedAt: Date
 }
 
+
+export interface ScheduledMessageRow {
+  id: number
+  platformSessionId: string
+  platformConversationId: string
+  conversationKind: IMConversationKind
+  tlMessageId: number
+  text: string
+  entities: JsonValue[] | null
+  replyToMsgId: number | null
+  createdAt: Date
+}
+
+export interface ScheduledMessageStateRow {
+  messageId: number
+  dueAt: number
+  status: 'pending' | 'sending' | 'sent' | 'failed' | 'cancelled'
+  attempts: number
+  nextAttemptAt: number
+  leaseOwner: string | null
+  leaseUntil: number | null
+  randomId: string
+  sentTlMessageId: number | null
+  lastError: string | null
+  updatedAt: Date
+}
+
 export interface DialogFolderPeerRow {
   id: string
   platformSessionId: string
@@ -320,6 +347,8 @@ declare module '@cordisjs/plugin-database' {
     mtproto_blocked_peer: BlockedPeerRow
     mtproto_dialog_filter: DialogFilterRow
     mtproto_dialog_folder_peer: DialogFolderPeerRow
+    mtproto_scheduled_message: ScheduledMessageRow
+    mtproto_scheduled_state: ScheduledMessageStateRow
   }
 }
 
@@ -560,4 +589,29 @@ export function defineModels(ctx: Context): void {
     unique: [['platformSessionId', 'platformConversationId']],
     indexes: [['platformSessionId', 'folderId'], ['platformSessionId', 'pinnedOrder']],
   })
+
+  ctx.model.extend('mtproto_scheduled_message', {
+    id: 'unsigned', platformSessionId: 'string', platformConversationId: 'text',
+    conversationKind: 'string', tlMessageId: 'unsigned', text: 'text',
+    entities: { type: 'json', nullable: true },
+    replyToMsgId: { type: 'unsigned', nullable: true },
+    createdAt: 'timestamp',
+  }, {
+    primary: 'id', autoInc: true,
+    unique: [['platformSessionId', 'platformConversationId', 'tlMessageId']],
+    indexes: [['platformSessionId', 'platformConversationId']],
+  })
+
+  ctx.model.extend('mtproto_scheduled_state', {
+    messageId: 'unsigned', dueAt: 'integer', status: 'string', attempts: 'unsigned',
+    nextAttemptAt: 'integer', leaseOwner: { type: 'text', nullable: true },
+    leaseUntil: { type: 'integer', nullable: true }, randomId: 'text',
+    sentTlMessageId: { type: 'unsigned', nullable: true },
+    lastError: { type: 'text', nullable: true }, updatedAt: 'timestamp',
+  }, {
+    primary: 'messageId',
+    unique: [['randomId']],
+    indexes: [['status', 'nextAttemptAt'], ['status', 'leaseUntil']],
+    })
 }
+
