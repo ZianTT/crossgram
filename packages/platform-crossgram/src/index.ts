@@ -1032,7 +1032,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     _session: PlatformSession,
     target: { conversationId: string, messageId: string, nativeSequence?: string },
     button: Extract<import('@mtproto-relay/bridge').IMInlineKeyboardButton, { type: 'callback' }>,
-  ): Promise<{ message?: string, alert?: boolean, url?: string }> {
+  ): Promise<{ message?: string, alert?: boolean, url?: string, refresh?: true }> {
     if (button.data.startsWith('group-invite:')) {
       const [, groupCode, msgSeq] = button.data.split(':')
       if (groupCode && msgSeq) {

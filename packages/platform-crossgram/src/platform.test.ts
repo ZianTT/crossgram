@@ -11,7 +11,7 @@ import {
   type IMMedia, type PlatformSession, type VoiceWorkerClient,
 } from '@mtproto-relay/bridge'
 import { parseQQMarkdown, QQNTPlatform } from './index.js'
-import type { QQMediaLocator, WireReactionContext } from './protocol.js'
+import type { QQMediaLocator, WireMessage, WireReactionContext } from './protocol.js'
 import { QQStickerProvider } from './sticker-provider.js'
 
 const session: PlatformSession = {
@@ -252,7 +252,7 @@ describe('QQNTPlatform mapping', () => {
 
   it('renders an accept button for official group-invite cards', async () => {
     const platform = new QQNTPlatform()
-    platform.client.getHistory = vi.fn(async () => ({
+    platform.client.getHistory = vi.fn(async (): Promise<{ messages: WireMessage[] }> => ({
       messages: [{
         id: 'invite-message', conversationId: 'direct', senderId: 'friend', timestamp: 1, outgoing: false,
         parts: [{ type: 'card' as const, card: {

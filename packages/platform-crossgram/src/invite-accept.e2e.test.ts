@@ -106,7 +106,7 @@ describe('QQNT group-invite accept E2E', () => {
     const edits: IMEvent[] = []
     const rpc = new DialogRpc(platform, session, store, undefined, undefined, 1,
       undefined, undefined, undefined,
-      async (_session, event) => { edits.push(event); return { updates: [] } })
+      async (_session, event) => { edits.push(event) })
 
     // getMessages hydrates the store's conversations and users first so the
     // direct peer id below resolves as a user id, not a channel one.
@@ -116,7 +116,7 @@ describe('QQNT group-invite accept E2E', () => {
     const peer = { _: 'inputPeerUser' as const, userId: rpc.peerTlId('invite-room'), accessHash: Long.ZERO }
     await rpc.getHistory({
       _: 'messages.getHistory', peer, offsetId: 0, offsetDate: 0, addOffset: 0,
-      limit: 10, maxId: 0, minId: 0,
+      limit: 10, maxId: 0, minId: 0, hash: Long.ZERO,
     })
     const message = projected.messages[0] as tl.RawMessage
     expect(message.replyMarkup).toMatchObject({
