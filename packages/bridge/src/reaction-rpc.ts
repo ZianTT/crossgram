@@ -5,7 +5,7 @@ import { RpcError } from '@mtproto-relay/mtproto'
 import { stableId } from './dialogs.js'
 import type {
   IMDirectDownload, IMMessage, IMPlatform, IMReactionContext, IMReactionDefinition, IMReactionResource,
-  JsonValue, PlatformSession,
+  PlatformSession,
 } from './platform.js'
 
 const CATALOG_VERSION = 2
@@ -20,12 +20,6 @@ interface RecentReaction {
   reactionValue: string
   /** 自定义表情的平台 key；资源版本升级导致 documentId 变更时用于关联到当前版本。 */
   definitionKey?: string | null
-  /**
-   * 自定义表情的完整定义（`IMReactionDefinition` 的 JSON 形态）。最近使用必须自带定义：
-   * 新设备、服务重启后的冷进程还没有注册任何会话目录，只能靠它把记录解析成可渲染的
-   * documentId 并供客户端下载。
-   */
-  definition?: JsonValue
   lastUsedAt: Date
 }
 
@@ -164,8 +158,6 @@ export class ReactionRpc {
       const current = this._currentDocumentId(id, row.definitionKey)
       if (current !== undefined) return current
     }
-    const stored = row.definition
-    if (isCustomReactionDefinition(stored)) return this._remember(stored as unknown as IMReactionDefinition)
     if (this._custom.has(id)) return id
     return catalogKnown ? undefined : id
   }
@@ -460,33 +452,18 @@ function reactionKey(reaction: tl.TypeReaction): string {
   return 'empty'
 }
 
-/** 校验从数据库读回的 JSON 是否还是一个可用的自定义回应定义。 */
-function isCustomReactionDefinition(value: JsonValue | null | undefined): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  const record = value as { key?: unknown, presentation?: unknown }
-  if (typeof record.key !== 'string') return false
-  const presentation = record.presentation as { type?: unknown, alt?: unknown, resource?: unknown } | undefined
-  return presentation?.type === 'custom'
-    && typeof presentation.alt === 'string'
-    && !!presentation.resource
-    && typeof presentation.resource === 'object'
-}
-
 function serializeReaction(
   reaction: tl.TypeReaction,
   lastUsedAt: Date,
   definition: IMReactionDefinition,
 ): RecentReaction {
   if (reaction._ === 'reactionEmoji') {
-    return { reactionType: 'emoji', reactionValue: reaction.emoticon, definitionKey: null, definition: null, lastUsedAt }
+    return { reactionType: 'emoji', reactionValue: reaction.emoticon, definitionKey: null, lastUsedAt }
   }
   if (reaction._ === 'reactionCustomEmoji') {
     return {
       reactionType: 'custom', reactionValue: reaction.documentId.toString(),
-      // 连同定义一起落库：冷进程（新设备、重启后）靠它把记录还原成可渲染的 documentId。
-      definitionKey: definition.key,
-      definition: definition.presentation.type === 'custom' ? definition as unknown as JsonValue : null,
-      lastUsedAt,
+      definitionKey: definition.key, lastUsedAt,
     }
   }
   throw new RpcError(400, 'REACTION_INVALID')

@@ -322,7 +322,7 @@ describe('ReactionRpc', () => {
     }, context)).toThrowError(/REACTION_INVALID/)
   })
 
-  it('renders recent custom reactions in a fresh process without any conversation catalog', async () => {
+  it('keeps recent custom reactions renderable across asset re-versions and catalog removals', async () => {
     const database = await createDatabase()
     const platform = { capabilities: {} } as IMPlatform
     const face = (key: string, version: number): IMReactionDefinition => ({
@@ -333,35 +333,32 @@ describe('ReactionRpc', () => {
       },
     })
     const writer = new ReactionRpc(platform, session, 1, database)
-    const smile = face('1:14', 1)
-    const removed = face('1:999', 1)
+    const oldSmile = face('1:14', 1)
+    const oldRemoved = face('1:999', 1)
     const fire = { key: 'fire', presentation: { type: 'emoji' as const, emoticon: '🔥' } }
-    await writer.markUsed('group', [removed])
+    await writer.markUsed('group', [oldRemoved])
     await writer.markUsed('group', [fire])
-    await writer.markUsed('group', [smile])
+    await writer.markUsed('group', [oldSmile])
 
-    // 新设备/服务重启后的冷进程：还没注册过任何会话目录，记录自带定义就要能直接渲染和下载。
+    // 还没见过任何会话目录时无从判断哪些 id 已经过期，原样返回记录里的 id。
     const cold = new ReactionRpc(platform, session, 1, database)
-    const coldList = await cold.recentReactions(10)
-    expect(coldList.reactions).toMatchObject([
-      { documentId: Long.fromNumber(cold.customDocumentId(smile)) },
-      { emoticon: '🔥' },
-      { documentId: Long.fromNumber(cold.customDocumentId(removed)) },
-    ])
-    const coldIds = coldList.reactions.flatMap((reaction) =>
-      reaction._ === 'reactionCustomEmoji' ? [reaction.documentId] : [])
-    expect(cold.getCustomEmojiDocuments(coldIds)).toHaveLength(coldIds.length)
+    await expect(cold.recentReactions(10)).resolves.toMatchObject({
+      reactions: [
+        { documentId: Long.fromNumber(cold.customDocumentId(oldSmile)) },
+        { emoticon: '🔥' },
+        { documentId: Long.fromNumber(cold.customDocumentId(oldRemoved)) },
+      ],
+    })
 
-    // 平台把 1:14 重新发版、并把 1:999 从目录里去掉：前者换成当前版本，后者靠记录里的定义继续可用，
-    // 而不是像只有 documentId 的老记录那样整条消失。
+    // 平台把 1:14 重新发版、并从目录里去掉 1:999：前者换成当前版本，后者整条跳过。
     const newSmile = face('1:14', 2)
     cold.chatReactions('group', { available: [newSmile, fire], reactions: [], maxSelected: 20 })
     const recent = await cold.recentReactions(10)
     expect(recent.reactions).toEqual([
       { _: 'reactionCustomEmoji', documentId: Long.fromNumber(cold.customDocumentId(newSmile)) },
       { _: 'reactionEmoji', emoticon: '🔥' },
-      { _: 'reactionCustomEmoji', documentId: Long.fromNumber(cold.customDocumentId(removed)) },
     ])
+    // 返回的每个 id 都能解析出 document，客户端不会留下占位。
     const ids = recent.reactions.flatMap((reaction) =>
       reaction._ === 'reactionCustomEmoji' ? [reaction.documentId] : [])
     expect(cold.getCustomEmojiDocuments(ids)).toHaveLength(ids.length)
@@ -369,7 +366,7 @@ describe('ReactionRpc', () => {
       reactions: [
         { documentId: Long.fromNumber(cold.customDocumentId(newSmile)) },
         { emoticon: '🔥' },
-        { documentId: Long.fromNumber(cold.customDocumentId(removed)) },
+        { emoticon: '👍' },
       ],
     })
   })
@@ -394,7 +391,7 @@ describe('ReactionRpc', () => {
     })
   })
 
-  it('drops legacy recent rows that never stored a definition once their key leaves the catalog', async () => {
+  it('drops recent rows whose key left the catalog and re-keys the ones still present', async () => {
     const database = await createDatabase()
     const platform = { capabilities: {} } as IMPlatform
     const face = (key: string, version: number): IMReactionDefinition => ({
@@ -404,7 +401,7 @@ describe('ReactionRpc', () => {
         resource: { version, format: 'static', mimeType: 'image/png', width: 56, height: 56, size: 4 },
       },
     })
-    // 老版本代码只写了 key + documentId，没有定义。
+    // 记录里只有 key + documentId；目录里还有 1:14（新版本），'removed-face' 已经下架。
     await database.create('mtproto_reaction_recent', {
       platformSessionId: session.platformSessionId, reactionType: 'custom',
       reactionValue: String(legacyInlineCustomEmojiDocumentId(session.platformSessionId, 'group', face('1:14', 1))),
