@@ -72,6 +72,57 @@ describe('QQNTPlatform mapping', () => {
     ])
   })
 
+  it('keeps a mention range and the sender text when QQ hands over a NUL', async () => {
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: [{
+        id: 'nul-message', conversationId: 'group', senderId: 'peer', timestamp: 1, outgoing: false,
+        sender: { id: 'peer', name: 'Bad\u0000Name', alias: 're\u0000mark' },
+        parts: [{
+          type: 'text' as const, text: '@alice\u0000 hello',
+          entities: [{ type: 'mention' as const, offset: 0, length: 6, userId: 'alice' }],
+        }],
+      }],
+    }))
+
+    const [message] = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(message.sender).toMatchObject({ firstName: 'Bad.Name' })
+    expect((message.sender?.metadata as { qqName?: string }).qqName).toBe('Bad.Name')
+    expect(message.senderTitle).toBe('re.mark')
+    const part = message.content.parts[0]
+    expect(part).toMatchObject({ type: 'text', text: '@alice. hello' })
+    expect(entitySlices(part as never)).toEqual(['mention:@alice'])
+  })
+
+  it('keeps a group title and a request note free of the units PostgreSQL rejects', async () => {
+    const platform = new QQNTPlatform()
+    platform.client.getConversation = vi.fn(async () => ({
+      id: 'group', kind: 'group' as const, title: 'Gr\u0000oup\uD800',
+      peerUid: 'group', peerUin: '42', chatType: 2 as const,
+    }))
+    platform.client.getRequests = vi.fn(async () => ({ requests: [{
+      id: 'request', kind: 'friend' as const, status: 'pending' as const,
+      requester: { id: 'peer', name: 'Frie\u0000nd' },
+      group: { id: 'group', name: 'Gr\u0000oup' },
+      message: 'let me in\u0000',
+      timestamp: 1,
+    }] }))
+    platform.client.getUser = vi.fn(async () => ({
+      id: 'peer', name: 'Na\u0000me', signature: 'sig\uD800',
+    }))
+
+    await expect(platform.getConversation(session, 'group')).resolves.toMatchObject({ title: 'Gr.oup.' })
+    const [request] = (await platform.getRequests(session)).requests
+    expect(request).toMatchObject({
+      requester: { firstName: 'Frie.nd' },
+      group: { title: 'Gr.oup' },
+      message: 'let me in.',
+    })
+    await expect(platform.getUser(session, 'peer')).resolves.toMatchObject({
+      firstName: 'Na.me', about: 'sig.',
+    })
+  })
+
   it('maps QQNT ranged-read past EOF responses to an empty Telegram chunk', async () => {
     const platform = new QQNTPlatform()
     platform.client.downloadFile = vi.fn(async function* () {

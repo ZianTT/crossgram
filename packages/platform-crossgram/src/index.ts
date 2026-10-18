@@ -29,6 +29,9 @@ import { defineQQMediaPreviewModel, mediaPreviewKey, QQMediaPreviewer } from './
 import { extractRemoteVideoFrame, type RemoteVideoFrameExtractor } from './video-frame.js'
 import { migrateLegacyQQMessageMedia } from './raw-media-migration.js'
 import { migrateLegacyQQGroupAliasUsers } from './user-name-migration.js'
+import {
+  sanitizeWireConversation, sanitizeWireEvent, sanitizeWireMessage, sanitizeWireRequest, sanitizeWireUser,
+} from './sanitize.js'
 import type {
   QQMediaLocator, QQStickerReference, WireCallSignalEvent, WireCard, WireConversation, WireEvent, WireGroupFilePage, WireMedia, WireMessage,
   WireMultiForwardLocator, WireNativeAvsdkEvent, WireReactionState, WireRequest, WireTextPart,
@@ -309,8 +312,9 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       || status.protocolVersion < MIN_PROTOCOL_VERSION) {
       throw new Error(`QQNT bridge protocol ${status.protocolVersion} is unsupported; protocol ${MIN_PROTOCOL_VERSION} or newer is required`)
     }
-    const user = await this.client.getUser(userId)
-    if (!user) throw new Error(`QQNT current user is unavailable: ${userId}`)
+    const profile = await this.client.getUser(userId)
+    if (!profile) throw new Error(`QQNT current user is unavailable: ${userId}`)
+    const user = sanitizeWireUser(profile)
     const qq = typeof status.selfUin === 'string' && /^\d+$/.test(status.selfUin)
       ? status.selfUin
       : typeof user.numericId === 'string' && /^\d+$/.test(user.numericId)
@@ -418,7 +422,11 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         platformSessionId, attempt, this.client.webSocketEndpoint, lastEventId ?? '<none>',
       )
       try {
-        await this.client.subscribe(async (event, eventId) => {
+        await this.client.subscribe(async (rawEvent, eventId) => {
+          // Cleaned before any step of the stream reads the event: the
+          // checkpoint persists the event only after the handler commits, so
+          // one string PostgreSQL cannot store would stall every later event.
+          const event = sanitizeWireEvent(rawEvent)
           consecutiveStreamFailures = 0
           try {
             if (event.type === 'native-avsdk') {
@@ -837,14 +845,17 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   async getContacts(_session: PlatformSession, query: IMPageQuery = {}): Promise<IMUserPage<QQMediaLocator>> {
     const page = await this.client.getContacts({ cursor: query.cursor, limit: query.limit })
     return {
-      users: page.users.map((user) => ({
-        id: user.id,
-        firstName: user.name,
-        username: user.numericId,
-        about: typeof user.signature === 'string' ? user.signature : undefined,
-        avatar: user.avatar ? mapMedia(user.avatar) : undefined,
-        metadata: qqUserMetadata(user),
-      })),
+      users: page.users.map((wireUser) => {
+        const user = sanitizeWireUser(wireUser)
+        return {
+          id: user.id,
+          firstName: user.name,
+          username: user.numericId,
+          about: typeof user.signature === 'string' ? user.signature : undefined,
+          avatar: user.avatar ? mapMedia(user.avatar) : undefined,
+          metadata: qqUserMetadata(user),
+        }
+      }),
       nextCursor: page.nextCursor,
     }
   }
@@ -997,8 +1008,9 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   }
 
   async getUser(_session: PlatformSession, userId: string): Promise<IMUser<QQMediaLocator> | null> {
-    const user = await this.client.getUser(userId)
-    if (!user) return null
+    const wireUser = await this.client.getUser(userId)
+    if (!wireUser) return null
+    const user = sanitizeWireUser(wireUser)
     return {
       id: user.id,
       firstName: user.name,
@@ -1089,18 +1101,21 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     if (isFilteredConversationId(conversation.id)) return { members: [], total: 0 }
     const page = await this.client.getMembers(conversation.id, { cursor: query.cursor, limit: query.limit })
     return {
-      members: page.members.map((member): IMConversationMember<QQMediaLocator> => ({
-        user: {
-          id: member.user.id,
-          firstName: member.user.name,
-          username: member.user.numericId,
-          avatar: member.user.avatar ? mapMedia(member.user.avatar) : undefined,
-          metadata: { ...qqUserMetadata(member.user), qqName: member.user.name },
-        },
-        role: member.role,
-        permissions: permissions(member.role),
-        title: member.user.alias?.trim() || undefined,
-      })),
+      members: page.members.map((member): IMConversationMember<QQMediaLocator> => {
+        const user = sanitizeWireUser(member.user)
+        return {
+          user: {
+            id: user.id,
+            firstName: user.name,
+            username: user.numericId,
+            avatar: user.avatar ? mapMedia(user.avatar) : undefined,
+            metadata: { ...qqUserMetadata(user), qqName: user.name },
+          },
+          role: member.role,
+          permissions: permissions(member.role),
+          title: user.alias?.trim() || undefined,
+        }
+      }),
       total: page.total,
       nextCursor: page.nextCursor,
     }
@@ -2238,6 +2253,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   }
 
   private mapConversation(input: WireConversation, session?: PlatformSession): IMConversation<QQMediaLocator> {
+    input = sanitizeWireConversation(input)
     const id = session && this.savedMessagesConversationIds.get(session.platformSessionId) === input.id
       ? session.userId
       : input.id
@@ -2337,7 +2353,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   }
 
   private mapMessage(input: WireMessage, conversationId?: string): IMMessage<QQMediaLocator> {
-    input = this.splitOutgoingMessages.get(input.id) ?? input
+    input = sanitizeWireMessage(this.splitOutgoingMessages.get(input.id) ?? input)
     const message = mapMessage(
       conversationId ? { ...input, conversationId } : input,
       this.reactionCatalog, this.stickerProviderId,
@@ -2597,6 +2613,7 @@ function mapConversation(input: WireConversation): IMConversation<QQMediaLocator
 }
 
 function mapRequest(input: WireRequest): IMRequest<QQMediaLocator> {
+  input = sanitizeWireRequest(input)
   return {
     id: input.id,
     kind: input.kind,
