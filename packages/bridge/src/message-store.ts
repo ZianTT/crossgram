@@ -463,7 +463,7 @@ export class MessageStore {
       platformMessageId,
       messageId: message!.id,
       ordinal,
-    })), ['platformSessionId', 'conversationId', 'platformMessageId'])
+    })), ['conversationId', 'platformMessageId'])
 
     const media = source.content.parts.flatMap((part, partIndex) => part.type === 'media'
       ? [{ item: part.media, partIndex }]
