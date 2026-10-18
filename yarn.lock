@@ -1883,6 +1883,7 @@ __metadata:
     "@mtproto-relay/mtproto": "workspace:*"
     "@mtproto-relay/update-store": "workspace:*"
     "@mtproto-relay/update-store-memory": "workspace:*"
+    "@testing-library/react": "npm:^16.3.0"
     "@types/react": "npm:^19.2.0"
     "@types/react-dom": "npm:^19.2.0"
     happy-dom: "npm:^20.11.2"
@@ -1928,6 +1929,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@mtproto-relay/history-backfill@workspace:packages/history-backfill"
   dependencies:
+    "@testing-library/react": "npm:^16.3.0"
     "@types/react": "npm:^19.2.0"
     "@types/react-dom": "npm:^19.2.0"
     schemastery: "npm:^3.18.0"
