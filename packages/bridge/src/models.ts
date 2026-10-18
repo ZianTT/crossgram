@@ -221,6 +221,8 @@ export interface ReactionRecentRow {
   reactionType: 'emoji' | 'custom'
   reactionValue: string
   definitionKey?: string | null
+  /** 自定义回应的完整定义（`IMReactionDefinition`），让没有会话目录的冷进程也能渲染并解析资源。 */
+  definition?: JsonValue
   lastUsedAt: Date
 }
 
@@ -493,6 +495,7 @@ export function defineModels(ctx: Context): void {
   ctx.model.extend('mtproto_reaction_recent', {
     id: 'unsigned', platformSessionId: 'string', reactionType: 'string', reactionValue: 'text',
     definitionKey: { type: 'text', nullable: true },
+    definition: { type: 'json', nullable: true },
     lastUsedAt: 'timestamp',
   }, {
     primary: 'id', autoInc: true,

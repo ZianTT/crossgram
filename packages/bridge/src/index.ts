@@ -315,6 +315,17 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
       .registerInlineCustomEmoji(conversationId, definition),
     sendEchoes,
   )
+  /**
+   * 「最近使用回应」是账号级数据：发起写入的连接已经在 RPC 结果里拿到 updateRecentReactions，
+   * 同一账号的其它设备/连接只能靠这条账号级广播才会重新拉取最近列表。
+   */
+  const publishRecentReactions = async (
+    state: BridgeSessionState,
+    rpc: ServerRpcContext,
+  ): Promise<void> => await updates.publishAccountUpdates(
+    state.session, [{ _: 'updateRecentReactions' }],
+    rpc.authKeyId ? authKeyHex(rpc.authKeyId) : undefined,
+  )
   const builtInMediaProvider = createBuiltInVoiceMediaProvider({
     serverHost: config.serverHost,
     directIce: config.voiceDirectIce,
@@ -1193,16 +1204,27 @@ export function apply(ctx: Context, config: BridgeConfig = {}): void {
     ))
   rpc.register('messages.getDefaultTagReactions', async (rpc) =>
     (await requireBridgeSession(rpc)).dialogs.getTopReactions(100))
-  rpc.register('messages.clearRecentReactions', async (rpc) =>
-    (await requireBridgeSession(rpc)).dialogs.clearRecentReactions())
+  rpc.register('messages.clearRecentReactions', async (rpc) => {
+    const state = await requireBridgeSession(rpc)
+    const result = await state.dialogs.clearRecentReactions()
+    await publishRecentReactions(state, rpc)
+    return result
+  })
   rpc.register('messages.getEmojiStickers', async (rpc) =>
     (await requireBridgeSession(rpc)).dialogs.getEmojiStickers())
   rpc.register('messages.getCustomEmojiDocuments', async (rpc, req) =>
     bareVector(await (await requireBridgeSession(rpc)).dialogs.getCustomEmojiDocuments(
       req as tl.messages.RawGetCustomEmojiDocumentsRequest,
     )))
-  rpc.register('messages.sendReaction', async (rpc, req) =>
-    (await requireBridgeSession(rpc)).dialogs.sendReaction(req as tl.messages.RawSendReactionRequest))
+  rpc.register('messages.sendReaction', async (rpc, req) => {
+    const state = await requireBridgeSession(rpc)
+    const result = await state.dialogs.sendReaction(req as tl.messages.RawSendReactionRequest)
+    // 最近使用回应是账号级的：发起写入的连接在 RPC 结果里已经拿到了 updateRecentReactions，
+    // 其它设备/连接必须靠账号级广播才知道该重新拉取，否则会一直显示旧顺序。
+    const changed = (result as tl.RawUpdates).updates?.some((update) => update._ === 'updateRecentReactions')
+    if (changed) await publishRecentReactions(state, rpc)
+    return result
+  })
   rpc.register('messages.getMessagesReactions', async (rpc, req) =>
     (await requireBridgeSession(rpc)).dialogs.getMessagesReactions(req as tl.messages.RawGetMessagesReactionsRequest))
   rpc.register('messages.getMessageReactionsList', async (rpc, req) =>

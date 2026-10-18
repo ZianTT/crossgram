@@ -4,7 +4,8 @@ import Long from 'long'
 import { RpcError } from '@mtproto-relay/mtproto'
 import { stableId } from './dialogs.js'
 import type {
-  IMDirectDownload, IMMessage, IMPlatform, IMReactionContext, IMReactionDefinition, IMReactionResource, PlatformSession,
+  IMDirectDownload, IMMessage, IMPlatform, IMReactionContext, IMReactionDefinition, IMReactionResource,
+  JsonValue, PlatformSession,
 } from './platform.js'
 
 const CATALOG_VERSION = 2
@@ -19,6 +20,12 @@ interface RecentReaction {
   reactionValue: string
   /** 自定义表情的平台 key；资源版本升级导致 documentId 变更时用于关联到当前版本。 */
   definitionKey?: string | null
+  /**
+   * 自定义表情的完整定义（`IMReactionDefinition` 的 JSON 形态）。最近使用必须自带定义：
+   * 新设备、服务重启后的冷进程还没有注册任何会话目录，只能靠它把记录解析成可渲染的
+   * documentId 并供客户端下载。
+   */
+  definition?: JsonValue
   lastUsedAt: Date
 }
 
@@ -28,7 +35,7 @@ export class ReactionRpc {
   private readonly _aliases = new Map<number, CustomEntry>()
   private readonly _memoryRecent = new Map<string, RecentReaction>()
   private readonly _currentByKey = new Map<string, number>()
-  private _recentWrite = Promise.resolve()
+  private _recentWrite = Promise.resolve<unknown>(undefined)
 
   constructor(
     private readonly _platform: IMPlatform,
@@ -50,18 +57,43 @@ export class ReactionRpc {
     return makeReactionList(await this._recentReactions(limit))
   }
 
-  markUsed(conversationId: string, definitions: readonly IMReactionDefinition[]): Promise<void> {
-    if (!definitions.length) return Promise.resolve()
+  /**
+   * 记录一次回应使用。
+   *
+   * `append` 对应 `messages.sendReaction` 的 `add_to_recent`：客户端只在用户从回应面板里
+   * 主动挑选时置位。没置位时（双击快速回应、气泡内联条等）只刷新列表里已有的记录，
+   * 不把新的回应塞进去，避免最近使用被随手一点的默认回应刷满。
+   * @returns 是否改动了列表，调用方据此决定要不要推送 `updateRecentReactions`。
+   */
+  markUsed(
+    conversationId: string,
+    definitions: readonly IMReactionDefinition[],
+    options: { append?: boolean } = {},
+  ): Promise<boolean> {
+    if (!definitions.length) return Promise.resolve(false)
+    const append = options.append ?? true
     const write = this._recentWrite.then(async () => {
-      const reactions = definitions.map((definition) => this.toTlReaction(conversationId, definition))
       const existing = await this._recentRows()
-      let timestamp = Math.max(Date.now(), ...existing.map((row) => row.lastUsedAt.getTime() + 1))
-      for (const [index, reaction] of reactions.entries()) {
-        const definition = definitions[index]!
-        const recent = serializeReaction(
-          reaction, new Date(timestamp++),
-          definition.presentation.type === 'custom' ? definition.key : undefined,
-        )
+      const trackedValues = new Set(existing.map((row) => `${row.reactionType}\u0000${row.reactionValue}`))
+      const trackedKeys = new Set(existing.flatMap((row) => (row.definitionKey ? [row.definitionKey] : [])))
+      const pending = definitions.map((definition) => ({
+        definition,
+        reaction: this.toTlReaction(conversationId, definition),
+      })).filter(({ definition, reaction }) => {
+        if (append) return true
+        if (trackedKeys.has(definition.key)) return true
+        return reaction._ === 'reactionEmoji'
+          ? trackedValues.has(`emoji\u0000${reaction.emoticon}`)
+          : reaction._ === 'reactionCustomEmoji'
+            && trackedValues.has(`custom\u0000${reaction.documentId.toString()}`)
+      })
+      if (!pending.length) return false
+      let timestamp = existing.reduce(
+        (latest, row) => Math.max(latest, new Date(row.lastUsedAt).getTime() + 1),
+        Date.now(),
+      )
+      for (const { definition, reaction } of pending) {
+        const recent = serializeReaction(reaction, new Date(timestamp++), definition)
         if (this._database) {
           await this._database.upsert('mtproto_reaction_recent', [{
             platformSessionId: this._session.platformSessionId,
@@ -71,6 +103,7 @@ export class ReactionRpc {
           this._memoryRecent.set(reactionKey(reaction), recent)
         }
       }
+      return true
     })
     this._recentWrite = write.catch(() => {})
     return write
@@ -89,7 +122,10 @@ export class ReactionRpc {
 
   /**
    * 获取客户端可渲染的最近使用回应。
-   * 自定义回应的 documentId 会随资源版本变化；若原 ID 已失效，则替换为该 key 当前版本的 documentId，已下架的则跳过。
+   *
+   * 自定义回应的 documentId 会随资源版本变化。解析顺序是：会话目录里出现过的 key 用当前版本；
+   * 否则退回记录自带的历史定义（新设备、服务重启后还没有任何会话目录）；
+   * 两者都没有时，目录已知就说明这个回应已经下架，跳过；目录未知则保留原始 id 交给客户端缓存处理。
    */
   private async _recentReactions(limit: number): Promise<tl.TypeReaction[]> {
     if (limit <= 0) return []
@@ -97,6 +133,7 @@ export class ReactionRpc {
     const rows = await this._recentRows()
     const catalogKnown = this._currentByKey.size > 0
     const seen = new Set<string>()
+    const seenKeys = new Set<string>()
     const reactions: tl.TypeReaction[] = []
     for (const row of rows) {
       if (reactions.length >= limit) break
@@ -104,9 +141,13 @@ export class ReactionRpc {
       if (row.reactionType === 'emoji') {
         reaction = { _: 'reactionEmoji', emoticon: row.reactionValue }
       } else {
-        const id = Number(row.reactionValue)
-        const resolved = catalogKnown ? this._currentDocumentId(id, row.definitionKey) : id
+        const resolved = this._recentDocumentId(row, catalogKnown)
         if (resolved === undefined) continue
+        // 同一个 key 的不同资源版本会留下多行，按最近时间保留一条。
+        if (row.definitionKey) {
+          if (seenKeys.has(row.definitionKey)) continue
+          seenKeys.add(row.definitionKey)
+        }
         reaction = { _: 'reactionCustomEmoji', documentId: Long.fromNumber(resolved) }
       }
       const key = reactionKey(reaction)
@@ -115,6 +156,26 @@ export class ReactionRpc {
       reactions.push(reaction)
     }
     return reactions
+  }
+
+  private _recentDocumentId(row: RecentReaction, catalogKnown: boolean): number | undefined {
+    const id = Number(row.reactionValue)
+    if (catalogKnown) {
+      const current = this._currentDocumentId(id, row.definitionKey)
+      if (current !== undefined) return current
+    }
+    const stored = row.definition
+    if (isCustomReactionDefinition(stored)) return this._remember(stored as unknown as IMReactionDefinition)
+    if (this._custom.has(id)) return id
+    return catalogKnown ? undefined : id
+  }
+
+  /** 把定义登记为可渲染的自定义表情，返回它对应的 documentId。 */
+  private _remember(definition: IMReactionDefinition): number | undefined {
+    if (definition.presentation.type !== 'custom') return undefined
+    const id = this.customDocumentId(definition)
+    this._custom.set(id, { definition: definition as CustomEntry['definition'] })
+    return id
   }
 
   private _currentDocumentId(id: number, definitionKey?: string | null): number | undefined {
@@ -137,12 +198,7 @@ export class ReactionRpc {
   }
 
   registerContext(_conversationId: string, context?: IMReactionContext): void {
-    for (const definition of context?.available ?? []) {
-      if (definition.presentation.type !== 'custom') continue
-      this._custom.set(this.customDocumentId(definition), {
-        definition: definition as CustomEntry['definition'],
-      })
-    }
+    for (const definition of context?.available ?? []) this._remember(definition)
   }
 
   private _registerCatalog(conversationId: string, context?: IMReactionContext): void {
@@ -404,18 +460,33 @@ function reactionKey(reaction: tl.TypeReaction): string {
   return 'empty'
 }
 
+/** 校验从数据库读回的 JSON 是否还是一个可用的自定义回应定义。 */
+function isCustomReactionDefinition(value: JsonValue | null | undefined): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const record = value as { key?: unknown, presentation?: unknown }
+  if (typeof record.key !== 'string') return false
+  const presentation = record.presentation as { type?: unknown, alt?: unknown, resource?: unknown } | undefined
+  return presentation?.type === 'custom'
+    && typeof presentation.alt === 'string'
+    && !!presentation.resource
+    && typeof presentation.resource === 'object'
+}
+
 function serializeReaction(
   reaction: tl.TypeReaction,
   lastUsedAt: Date,
-  definitionKey?: string,
+  definition: IMReactionDefinition,
 ): RecentReaction {
   if (reaction._ === 'reactionEmoji') {
-    return { reactionType: 'emoji', reactionValue: reaction.emoticon, lastUsedAt }
+    return { reactionType: 'emoji', reactionValue: reaction.emoticon, definitionKey: null, definition: null, lastUsedAt }
   }
   if (reaction._ === 'reactionCustomEmoji') {
     return {
       reactionType: 'custom', reactionValue: reaction.documentId.toString(),
-      definitionKey: definitionKey ?? null, lastUsedAt,
+      // 连同定义一起落库：冷进程（新设备、重启后）靠它把记录还原成可渲染的 documentId。
+      definitionKey: definition.key,
+      definition: definition.presentation.type === 'custom' ? definition as unknown as JsonValue : null,
+      lastUsedAt,
     }
   }
   throw new RpcError(400, 'REACTION_INVALID')

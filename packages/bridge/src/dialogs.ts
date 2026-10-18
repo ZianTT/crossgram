@@ -3214,7 +3214,11 @@ export class DialogRpc {
     }
     const conversation = this._conversation(peerId)
     const result = await this._store!.setReactions(this._session, conversation, target, updated)
-    await this._reactions!.markUsed(peerId, newlySelected)
+    // `add_to_recent` 只在用户从回应面板里主动挑选时置位；没置位（双击快速回应、气泡内联条）
+    // 只刷新最近列表里已有的记录，不新增条目。
+    const recentChanged = await this._reactions!.markUsed(peerId, newlySelected, {
+      append: Boolean(req.addToRecent),
+    })
     const update: tl.RawUpdateMessageReactions = {
       _: 'updateMessageReactions',
       peer: this._conversationPeer(conversation),
@@ -3226,7 +3230,7 @@ export class DialogRpc {
         (id) => this._userId(id),
       ),
     }
-    const recentUpdate: tl.TypeUpdate[] = newlySelected.length
+    const recentUpdate: tl.TypeUpdate[] = recentChanged
       ? [{ _: 'updateRecentReactions' }]
       : []
     return {
