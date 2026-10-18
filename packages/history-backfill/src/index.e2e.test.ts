@@ -104,13 +104,20 @@ describe('history backfill e2e', () => {
     expect(found.messages.map((item) => item.source.id)).toEqual(['msg-7'])
   })
 
-  it('reports activity only for interactive RPCs', async () => {
+  it('reports activity only for RPCs that mean someone is using a client', async () => {
     const { sync } = await setup(5, [5])
-    sync.touch(session.platformSessionId, 'updates.getDifference')
-    sync.touch(session.platformSessionId, 'account.updateStatus')
+    // 客户端挂着时的周期性轮询：实测每分钟都会出现，不能当成「有人在用」。
+    for (const method of [
+      'updates.getDifference', 'updates.getChannelDifference', 'account.updateStatus',
+      'messages.getPeerDialogs', 'messages.getMessagesReactions', 'messages.getTopReactions',
+      'crossgram.getFileUrl', 'upload.getFile', 'stories.getPeerStories', 'help.getConfig',
+    ]) sync.touch(session.platformSessionId, method)
     expect(sync.lastActivityAt(session.platformSessionId)).toBeUndefined()
-    sync.touch(session.platformSessionId, 'messages.getHistory')
-    expect(sync.lastActivityAt(session.platformSessionId)).toBeTypeOf('number')
+    // 打开会话、搜索、发送、刷新会话列表这类会竞争数据库或上游的调用仍算活跃。
+    for (const method of ['messages.getHistory', 'messages.search', 'messages.sendMessage', 'messages.getDialogs']) {
+      sync.touch(session.platformSessionId, method)
+      expect(sync.lastActivityAt(session.platformSessionId)).toBeTypeOf('number')
+    }
   })
 
   it('runs as a plugin loop with a WebUI switch and live snapshot', async () => {

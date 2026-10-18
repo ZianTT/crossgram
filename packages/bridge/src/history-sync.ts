@@ -35,10 +35,34 @@ export interface StoredMessageAnchor {
 
 /**
  * 不代表用户正在使用客户端的后台 RPC：客户端挂着时也会周期性调用，不能据此判定「忙」。
+ * 实测 Telegram Desktop / Android 在会话列表停住时仍会每分钟轮询这些方法，若都算活跃，
+ * 回填就永远等不到空闲窗口。
  */
-const PASSIVE_RPC_PREFIXES = ['updates.', 'help.', 'langpack.']
+const PASSIVE_RPC_PREFIXES = ['updates.', 'help.', 'langpack.', 'stories.']
 const PASSIVE_RPC_METHODS = new Set([
-  'account.updateStatus', 'ping', 'ping_delay_disconnect', 'messages.getDialogFilters',
+  'account.updateStatus',
+  'ping',
+  'ping_delay_disconnect',
+  // 客户端重启/重连后补齐的只读状态。
+  'account.getNotifySettings',
+  'account.getNotifyExceptions',
+  'account.getAutoDownloadSettings',
+  'account.getGlobalPrivacySettings',
+  'messages.getDialogFilters',
+  'messages.getPeerDialogs',
+  'messages.getSavedDialogs',
+  'messages.getMessagesReactions',
+  'messages.getTopReactions',
+  'messages.getAvailableReactions',
+  'messages.getRecentReactions',
+  'messages.readReactions',
+  'messages.getMessagesViews',
+  'contacts.getContacts',
+  'contacts.getBlocked',
+  // 媒体直链续期与分片下载：播放/下载时每几秒一次。
+  'crossgram.getFileUrl',
+  'upload.getFile',
+  'upload.getFileHashes',
 ])
 
 export function isPassiveRpc(method: string | undefined): boolean {
