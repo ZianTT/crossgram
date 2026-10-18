@@ -1250,37 +1250,19 @@ export class MessageStore {
     const messages = await this._database.get('mtproto_im_message', {
       conversationId: conversation.id, deleted: false, timestamp: oldest.timestamp,
     })
-    const [part] = await this._database.select('mtproto_tl_message_part', {
+    // 同一秒内可能有多条消息，先按 messageId 取回首条分片再比较 tlMessageId，
+    // 这样不必维护「会话维度 + tlMessageId 有序」的索引。
+    const parts = await this._database.get('mtproto_tl_message_part', {
       platformSessionId,
-      conversationId: conversation.id,
       messageId: { $in: messages.map((message) => message.id) },
       ordinal: 0,
-    }).orderBy('tlMessageId').limit(1).execute()
-    return part?.tlMessageId
-  }
-
-  async getNewestTlMessageId(
-    platformSessionId: string,
-    platformConversationId: string,
-  ): Promise<number | undefined> {
-    const [conversation] = await this._database.get('mtproto_im_conversation', {
-      platformSessionId, platformConversationId,
     })
-    if (!conversation) return
-    const [newest] = await this._database.select('mtproto_im_message', {
-      conversationId: conversation.id, deleted: false,
-    }).orderBy('timestamp', 'desc').limit(1).execute()
-    if (!newest) return
-    const messages = await this._database.get('mtproto_im_message', {
-      conversationId: conversation.id, deleted: false, timestamp: newest.timestamp,
-    })
-    const [part] = await this._database.select('mtproto_tl_message_part', {
-      platformSessionId,
-      conversationId: conversation.id,
-      messageId: { $in: messages.map((message) => message.id) },
-      ordinal: 0,
-    }).orderBy('tlMessageId', 'desc').limit(1).execute()
-    return part?.tlMessageId
+    return parts.reduce<number | undefined>(
+      (smallest, part) => smallest === undefined || part.tlMessageId < smallest
+        ? part.tlMessageId
+        : smallest,
+      undefined,
+    )
   }
 
   async getMedia(platformSessionId: string, mediaId: number): Promise<StoredMedia | undefined> {
