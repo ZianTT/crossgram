@@ -2279,8 +2279,12 @@
     max-height: none;
     overscroll-behavior: auto;
   }
+}
+
+@layer utilities {
+  /* These live in `utilities` because the legacy mobile rules that made tabs
+     wrap and tables nest-scroll are also in `utilities`. */
   @media (max-width: 620px) {
-    /* Tabs stay on one row and scroll horizontally instead of wrapping. */
     .segmented {
       flex-wrap: nowrap;
       overflow-x: auto;
@@ -2289,6 +2293,9 @@
     }
     .segmented button {
       flex: 0 0 auto;
+    }
+    .table-scroll {
+      max-height: none;
     }
   }
 }
