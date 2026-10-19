@@ -172,10 +172,19 @@
     .history-backfill .table-scroll table {
       min-width: 0;
       width: 100%;
+      table-layout: fixed;
     }
     .history-backfill .table-scroll th,
     .history-backfill .table-scroll td {
       white-space: normal;
+      overflow-wrap: anywhere;
+    }
+    .history-backfill .table-scroll th:nth-child(3),
+    .history-backfill .table-scroll td:nth-child(3) {
+      width: 88px;
+    }
+    .history-backfill .backfill-cell-progress {
+      min-width: 0;
     }
   }
 }
