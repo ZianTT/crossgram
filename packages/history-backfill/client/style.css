@@ -176,20 +176,22 @@
     }
     .history-backfill .table-scroll th,
     .history-backfill .table-scroll td {
+      padding: 8px;
       white-space: normal;
       overflow-wrap: anywhere;
     }
-    .history-backfill .table-scroll th:nth-child(1),
-    .history-backfill .table-scroll td:nth-child(1) {
-      width: auto;
-    }
     .history-backfill .table-scroll th:nth-child(3),
     .history-backfill .table-scroll td:nth-child(3) {
-      width: 38%;
+      width: 36%;
     }
     .history-backfill .table-scroll th:nth-child(8),
     .history-backfill .table-scroll td:nth-child(8) {
-      width: 64px;
+      width: 76px;
+    }
+    .history-backfill .table-scroll td .button {
+      min-height: 30px;
+      padding: 0 8px;
+      font-size: 11px;
     }
     .history-backfill .table-scroll th {
       font-size: 10px;
