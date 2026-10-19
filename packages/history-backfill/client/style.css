@@ -179,9 +179,21 @@
       white-space: normal;
       overflow-wrap: anywhere;
     }
+    .history-backfill .table-scroll th:nth-child(1),
+    .history-backfill .table-scroll td:nth-child(1) {
+      width: auto;
+    }
     .history-backfill .table-scroll th:nth-child(3),
     .history-backfill .table-scroll td:nth-child(3) {
-      width: 88px;
+      width: 42%;
+    }
+    .history-backfill .table-scroll th:nth-child(8),
+    .history-backfill .table-scroll td:nth-child(8) {
+      width: 84px;
+    }
+    .history-backfill .table-scroll th {
+      font-size: 10px;
+      letter-spacing: 0.04em;
     }
     .history-backfill .backfill-cell-progress {
       min-width: 0;
