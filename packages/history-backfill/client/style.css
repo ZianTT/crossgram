@@ -185,11 +185,11 @@
     }
     .history-backfill .table-scroll th:nth-child(3),
     .history-backfill .table-scroll td:nth-child(3) {
-      width: 42%;
+      width: 38%;
     }
     .history-backfill .table-scroll th:nth-child(8),
     .history-backfill .table-scroll td:nth-child(8) {
-      width: 84px;
+      width: 64px;
     }
     .history-backfill .table-scroll th {
       font-size: 10px;
