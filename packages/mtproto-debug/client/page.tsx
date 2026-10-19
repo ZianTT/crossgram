@@ -241,10 +241,13 @@ export default function CapturePage(props: PageProps) {
               )
             })}
             {!ids.length && !capture.loading ? (
-              <p className="capture-empty muted">
-                No matching events. Start capture or adjust your filters.
-                Payloads are fetched only when you expand an event.
-              </p>
+              <div className="capture-empty">
+                <h3>No matching events</h3>
+                <p className="muted">
+                  Start capture or adjust your filters. Payloads are fetched
+                  only when you expand an event.
+                </p>
+              </div>
             ) : null}
           </div>
           <div className="pagination capture-pagination">

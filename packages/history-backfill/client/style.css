@@ -154,4 +154,28 @@
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
+  @media (max-width: 760px) {
+    /* Keep the conversation, its progress and the retry action; the rest is
+       available on wider screens instead of forcing a horizontal pan. */
+    .history-backfill .table-scroll table th:nth-child(2),
+    .history-backfill .table-scroll table td:nth-child(2),
+    .history-backfill .table-scroll table th:nth-child(4),
+    .history-backfill .table-scroll table td:nth-child(4),
+    .history-backfill .table-scroll table th:nth-child(5),
+    .history-backfill .table-scroll table td:nth-child(5),
+    .history-backfill .table-scroll table th:nth-child(6),
+    .history-backfill .table-scroll table td:nth-child(6),
+    .history-backfill .table-scroll table th:nth-child(7),
+    .history-backfill .table-scroll table td:nth-child(7) {
+      display: none;
+    }
+    .history-backfill .table-scroll table {
+      min-width: 0;
+      width: 100%;
+    }
+    .history-backfill .table-scroll th,
+    .history-backfill .table-scroll td {
+      white-space: normal;
+    }
+  }
 }

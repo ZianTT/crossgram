@@ -12,7 +12,7 @@ import {
   clickNav,
 } from './browser-test-utils.js'
 import type { MtprotoDebugEvent } from '../../mtproto/src/debug.js'
-describe('Solid capture with the real MTProto capture backend', () => {
+describe('React capture with the real MTProto capture backend', () => {
   it('keeps large payloads off sockets, lazily fetches details, groups RPC results, filters/pages, reconnects and cleans up on mobile navigation', async () => {
     // Load the real non-strict backend through Vitest without pulling its generated protocol project into the UI's strict TypeScript project.
     const debug = await vi.importActual<{
@@ -101,7 +101,7 @@ describe('Solid capture with the real MTProto capture backend', () => {
           .locator('.capture-direction')
           .first()
           .evaluate((element) => getComputedStyle(element).width),
-      ).toBe('34px')
+      ).toBe('26px')
       expect(
         requests.every(
           (url) => new URL(url).searchParams.get('summary') === 'true',

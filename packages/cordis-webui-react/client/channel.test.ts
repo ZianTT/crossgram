@@ -8,10 +8,12 @@ class Socket {
   onclose?: () => void
   onerror?: () => void
   frames: any[] = []
+  closed?: [number | undefined, string | undefined]
   send(data: string) {
     this.frames.push(JSON.parse(data))
   }
-  close() {
+  close(code?: number, reason?: string) {
+    this.closed = [code, reason]
     this.readyState = 3
     this.onclose?.()
   }
@@ -100,9 +102,12 @@ describe('Muon channel store', () => {
     expect(channel.state.ready).toBe(false)
     // Invalidate publishes the "not ready" state to subscribers as well.
     expect(updates).toBe(5)
+    // A delta that arrives while the channel waits for a fresh snapshot is
+    // dropped; the snapshot that follows is authoritative.
     expect(() =>
       channel.delta({ id: 'test', o: 'SET', p: ['untouched'], v: 2 }),
-    ).toThrow('snapshot')
+    ).not.toThrow()
+    expect(channel.state.value.untouched).toBe(10)
     unsubscribe()
     expect(updates).toBe(5)
   })
@@ -277,5 +282,29 @@ describe('Connection lifecycle', () => {
     expect(connection.state.status).toBe('offline')
     expect(connection.state.error).toContain('Incompatible')
     release()
+  })
+  it('drops a delta that overtakes its snapshot without failing the connection', () => {
+    const { connection, socket } = setup()
+    const { channel, release } = connection.acquire('test')
+    socket.receive('entry:delta', { id: 'test', p: ['count'], o: 'SET', v: 1 })
+    expect(channel.state.ready).toBe(false)
+    expect(connection.state.error).toBe('')
+    expect(connection.state.status).toBe('connected')
+    socket.receive('entry:snapshot', {
+      id: 'test',
+      data: { count: 4 },
+      cursor: { p: [], o: 'SET' },
+    })
+    expect(channel.state.value).toEqual({ count: 4 })
+    release()
+    connection.stop()
+  })
+  it('resynchronizes malformed frames with a browser-valid close code', () => {
+    const { connection, socket } = setup()
+    socket.onmessage?.({ data: '{not json' })
+    // Browsers reject close codes outside 1000/3000-4999, so never use 1002.
+    expect(socket.closed).toEqual([4002, 'Resynchronize'])
+    expect(connection.state.error).toContain('State synchronization failed')
+    connection.stop()
   })
 })

@@ -47,14 +47,11 @@
   }
   .capture-row {
     border-bottom: 0.5px solid var(--dsw-alias-border-l2);
-    content-visibility: auto;
-    contain-intrinsic-size: auto 52px;
   }
   .capture-row:last-child {
     border-bottom: 0;
   }
   .capture-row.expanded {
-    content-visibility: visible;
     background: color-mix(
       in srgb,
       var(--dsw-alias-interactive-bg-hover-solid) 45%,
@@ -138,8 +135,17 @@
     padding: 4px 16px 16px;
   }
   .capture-empty {
-    padding: 28px 16px;
+    padding: 32px 16px;
     text-align: center;
+  }
+  .capture-empty h3 {
+    margin: 0 0 6px;
+    font-size: 14px;
+    font-weight: 500;
+  }
+  .capture-empty p {
+    margin: 0 auto;
+    max-width: 420px;
     font-size: 12px;
   }
   .capture-pagination {
@@ -223,7 +229,8 @@
       gap: 8px;
     }
     .capture-toolbar .button {
-      width: 100%;
+      width: auto;
+      margin-left: auto;
     }
     .capture-status {
       padding: 0 12px 10px;

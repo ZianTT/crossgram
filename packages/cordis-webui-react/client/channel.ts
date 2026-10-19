@@ -68,7 +68,11 @@ export class Channel<T = any> extends Observable<{ value: T; ready: boolean }> {
     this.set({ value: snapshot.data as T, ready: true })
   }
   delta(delta: EntryDelta) {
-    if (!this.state.ready) throw new Error('Delta arrived before snapshot')
+    // A delta can overtake the snapshot that created the subscription. The
+    // snapshot is authoritative and arrives next, so dropping the early delta
+    // is safe; a stale cursor (after invalidate/reconnect) still throws so the
+    // connection can resubscribe just this entry.
+    if (!this.state.ready) return
     const mutation = this.cursor.load(delta)
     this.set({ value: apply(this.state.value, mutation), ready: true })
   }
@@ -124,9 +128,19 @@ export class Connection extends Observable<ConnectionStoreState> {
       if (socket !== this.socket) return
       try {
         this.receive(JSON.parse(String(event.data)))
-      } catch {
-        this.patch({ error: 'State synchronization failed. Reconnecting…' })
-        socket.close(1002, 'Resynchronize')
+      } catch (error) {
+        this.patch({
+          error:
+            'State synchronization failed. Reconnecting…' +
+            (error instanceof Error ? ` (${error.message})` : ''),
+        })
+        // 1002 is a valid wire code but the browser WebSocket API rejects it
+        // outside 1000/3000-4999, so use an application code for the resync.
+        try {
+          socket.close(4002, 'Resynchronize')
+        } catch {
+          // A close that raced with the transport is already disconnected.
+        }
       }
     }
     socket.onclose = () => {
@@ -194,7 +208,15 @@ export class Connection extends Observable<ConnectionStoreState> {
     }
     if (type === 'entry:delta') {
       const channel = this.channels.get(body.id)
-      if (channel?.users) channel.delta(body)
+      if (!channel?.users) return
+      try {
+        channel.delta(body)
+      } catch {
+        // Cursor mismatch: resubscribe this entry only. Killing and rebuilding
+        // the whole socket would surface a sync error for one bad delta.
+        if (this.state.status === 'connected')
+          this.send('entry:subscribe', { id: body.id })
+      }
       return
     }
     if (type === 'entry:missing') {
