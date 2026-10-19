@@ -126,6 +126,13 @@ describe('React capture with the real MTProto capture backend', () => {
         window.scrollTo(0, 0)
         document.querySelector('.capture-list')!.scrollTop = 0
       })
+      // The shell owns scrolling: navigating to another page starts at the top.
+      await page.evaluate(() => window.scrollTo(0, 1500))
+      expect(await page.evaluate(() => window.scrollY)).toBeGreaterThan(0)
+      await clickNav(page, 'Overview')
+      expect(await page.evaluate(() => window.scrollY)).toBe(0)
+      await clickNav(page, 'MTProto capture')
+      await page.locator('.capture-row').first().waitFor()
       if (process.env.WEBUI_SCREENSHOTS) {
         await mkdir(process.env.WEBUI_SCREENSHOTS, { recursive: true })
         await page.screenshot({
