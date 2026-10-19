@@ -17,7 +17,12 @@ export default function CapturePage(props: PageProps) {
   const action = useAction()
   const [filters, setFilters] = useState<CaptureFilters>({})
   const [expanded, setExpanded] = useState<number | undefined>(undefined)
-  const capture = useCapturePages(rpc.data.apiPath, filters, rpc.ready)
+  const capture = useCapturePages(
+    rpc.data.apiPath,
+    filters,
+    rpc.ready,
+    rpc.data.revision,
+  )
   const groups = useMemo(
     () =>
       new Map(
@@ -96,8 +101,8 @@ export default function CapturePage(props: PageProps) {
       />
       <ActionError error={action.error || capture.error} />
       <LiveContent ready={rpc.ready}>
-        <section className="panel stack capture-controls">
-          <div className="toolbar">
+        <section className="panel capture-panel">
+          <div className="capture-toolbar">
             <label className="field grow">
               <span>Search captured events</span>
               <input
@@ -117,7 +122,22 @@ export default function CapturePage(props: PageProps) {
               {capture.live ? 'Pause live view' : 'Follow latest'}
             </button>
           </div>
-          <details>
+          <div className="capture-status" role="status">
+            <span
+              className={
+                'status-dot' + (rpc.data.capturing ? ' online' : '')
+              }
+            />
+            <span>{rpc.data.capturing ? 'Capturing' : 'Capture paused'}</span>
+            <span className="muted">
+              {capture.events.length} shown / {capture.snapshot?.total ?? 0}{' '}
+              retained · {capture.snapshot?.dropped ?? 0} dropped
+            </span>
+            {capture.loading ? (
+              <span className="muted">Updating…</span>
+            ) : null}
+          </div>
+          <details className="capture-filters">
             <summary>Advanced filters</summary>
             <div className="capture-filter-grid">
               <label className="field">
@@ -197,80 +217,67 @@ export default function CapturePage(props: PageProps) {
               · clear
             </button>
           ) : null}
-          <div className="toolbar">
-            <span className="chip">
-              {rpc.data.capturing ? 'Capturing' : 'Capture paused'}
-            </span>
-            <span className="muted">
-              {capture.events.length} shown / {capture.snapshot?.total ?? 0}{' '}
-              retained · {capture.snapshot?.dropped ?? 0} dropped
-            </span>
-            {capture.loading ? (
-              <span className="muted" role="status">
-                Updating…
-              </span>
+          <div
+            className="capture-list"
+            role="list"
+            aria-label="Captured MTProto events"
+          >
+            {ids.map((id) => {
+              const group = groups.get(id)!
+              const event = capture.details.get(id) ?? group.event
+              const result = group.result
+                ? (capture.details.get(group.result.id) ?? group.result)
+                : undefined
+              return (
+                <CaptureRow
+                  key={id}
+                  event={event}
+                  result={result}
+                  expanded={expanded === id}
+                  toggle={() => toggle(id)}
+                  filter={filterType}
+                  rawLink={rawLink}
+                />
+              )
+            })}
+            {!ids.length && !capture.loading ? (
+              <p className="capture-empty muted">
+                No matching events. Start capture or adjust your filters.
+                Payloads are fetched only when you expand an event.
+              </p>
             ) : null}
           </div>
+          <div className="pagination capture-pagination">
+            <button
+              className="button outlined"
+              disabled={
+                !rpc.ready || capture.loading || !capture.snapshot?.hasOlder
+              }
+              aria-label="Load older events"
+              onClick={() => void capture.load('older')}
+            >
+              Older
+            </button>
+            <button
+              className="button tonal"
+              disabled={!rpc.ready || capture.loading}
+              aria-label="Show latest events"
+              onClick={() => void capture.load('latest')}
+            >
+              Latest
+            </button>
+            <button
+              className="button outlined"
+              disabled={
+                !rpc.ready || capture.loading || !capture.snapshot?.hasNewer
+              }
+              aria-label="Load newer events"
+              onClick={() => void capture.load('newer')}
+            >
+              Newer
+            </button>
+          </div>
         </section>
-        <section className="capture-list" aria-label="Captured MTProto events">
-          {ids.map((id) => {
-            const group = groups.get(id)!
-            const event = capture.details.get(id) ?? group.event
-            const result = group.result
-              ? (capture.details.get(group.result.id) ?? group.result)
-              : undefined
-            return (
-              <CaptureRow
-                key={id}
-                event={event}
-                result={result}
-                expanded={expanded === id}
-                toggle={() => toggle(id)}
-                filter={filterType}
-                rawLink={rawLink}
-              />
-            )
-          })}
-          {!ids.length && !capture.loading ? (
-            <div className="panel empty-state">
-              <h2>No matching events</h2>
-              <p>
-                Start capture or adjust your filters. Payloads are fetched only
-                when you expand an event.
-              </p>
-            </div>
-          ) : null}
-        </section>
-        <div className="panel pagination capture-pagination">
-          <button
-            className="button outlined"
-            disabled={
-              !rpc.ready || capture.loading || !capture.snapshot?.hasOlder
-            }
-            aria-label="Load older events"
-            onClick={() => void capture.load('older')}
-          >
-            Older
-          </button>
-          <button
-            className="button tonal"
-            disabled={!rpc.ready || capture.loading}
-            aria-label="Show latest events"
-            onClick={() => void capture.load('latest')}
-          >
-            Latest
-          </button>
-          <button
-            className="button outlined"
-            disabled={
-              !rpc.ready || capture.loading || !capture.snapshot?.hasNewer
-            }
-            aria-label="Load newer events"
-            onClick={() => void capture.load('newer')}
-          >
-            Newer
-          </button>
-        </div>
       </LiveContent>
     </>
   )
@@ -286,6 +293,7 @@ function CaptureRow(props: {
   const metrics = getRpcResultMetrics(props.event, props.result)
   return (
     <article
+      role="listitem"
       className={
         'capture-row' +
         (metrics?.state === 'error' ? ' rpc-error' : '') +
@@ -304,7 +312,7 @@ function CaptureRow(props: {
                 ? 'arrowUpRight'
                 : 'arrowDownLeft'
             }
-            size={16}
+            size={14}
           />
         </span>
         <div className="capture-row-title">
@@ -329,7 +337,10 @@ function CaptureRow(props: {
             </span>
           ) : null}
         </div>
-        <Icon name={props.expanded ? 'minus' : 'plus'} size={16} />
+        <Icon
+          name={props.expanded ? 'chevronDown' : 'chevronRight'}
+          size={15}
+        />
       </button>
       {props.result ? (
         <p className="capture-result">

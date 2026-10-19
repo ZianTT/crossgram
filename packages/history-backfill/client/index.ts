@@ -1,4 +1,5 @@
 import Page0 from './page.js'
+import './style.css'
 import type { ClientModule } from 'cordis-webui-react/client'
 export default {
   pages: [

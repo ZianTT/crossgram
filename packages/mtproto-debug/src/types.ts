@@ -24,6 +24,11 @@ export interface MtprotoDebugData {
   apiPath: string
   dropped: number
   maxEvents: number
+  /**
+   * Bumped whenever the retained buffer changes. The page follows this Muon
+   * field and fetches one summary page per tick, so the browser never polls.
+   */
+  revision: number
   start(): Promise<void>
   pause(): Promise<void>
   clear(): Promise<void>

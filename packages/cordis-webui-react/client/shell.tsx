@@ -50,6 +50,11 @@ export function App({ initialNotice: bootNotice }: { initialNotice?: string }) {
     window.addEventListener('popstate', updatePath)
     return () => window.removeEventListener('popstate', updatePath)
   }, [connection.config.uiPath])
+  useEffect(() => {
+    // The shell owns scrolling: switching pages must start at the top instead
+    // of inheriting the previous page's offset.
+    window.scrollTo({ top: 0, left: 0, behavior: 'instant' })
+  }, [path])
   const wasOpen = useRef(false)
   useEffect(() => {
     if (menu && mobile)

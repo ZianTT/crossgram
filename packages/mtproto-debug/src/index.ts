@@ -40,6 +40,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     apiPath,
     dropped: 0,
     maxEvents,
+    revision: 0,
     async start() {
       entry.mutate(value => { value.capturing = true })
     },
@@ -56,6 +57,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       entry.mutate((value) => {
         replaceChunks(chunks, [])
         value.dropped = 0
+        value.revision += 1
       })
     },
   }
@@ -72,9 +74,14 @@ export function apply(ctx: Context, config: Config = {}): void {
     const batch = pending
     pending = []
     const dropped = appendChunkedEvents(chunks, batch, maxEvents, chunkSize)
-    // Captures stay server-side. Only infrequent control-state changes are
-    // broadcast; event history is fetched by the debug page over paged HTTP.
-    data.dropped += dropped
+    // Captures stay server-side. Only the revision counter is broadcast; the
+    // debug page reacts to it and fetches one summary page over HTTP, so no
+    // client ever polls on a timer.
+    const nextDropped = data.dropped + dropped
+    entry.mutate((value) => {
+      value.dropped = nextDropped
+      value.revision += 1
+    })
   }
   const scheduleFlush = () => {
     if (flushTimer) return

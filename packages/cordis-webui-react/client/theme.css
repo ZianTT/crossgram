@@ -2250,3 +2250,45 @@
     color: var(--dsw-alias-label-secondary);
   }
 }
+
+@layer refinements {
+  /* Responsive and long-content fixes shared by every page. */
+  .panel {
+    min-width: 0;
+  }
+  .panel > header,
+  .page-heading,
+  .toolbar {
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+  .panel > header > h3,
+  .panel h3,
+  .page-title h1 {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .metric-grid > *,
+  .stat-row > *,
+  .page-grid > * {
+    min-width: 0;
+  }
+  /* Tables flow with the page; only horizontal scrolling remains, so a table
+     never traps the wheel inside its own viewport. */
+  .table-scroll {
+    max-height: none;
+    overscroll-behavior: auto;
+  }
+  @media (max-width: 620px) {
+    /* Tabs stay on one row and scroll horizontally instead of wrapping. */
+    .segmented {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      overflow-y: hidden;
+      border-radius: var(--dsw-radius-md);
+    }
+    .segmented button {
+      flex: 0 0 auto;
+    }
+  }
+}

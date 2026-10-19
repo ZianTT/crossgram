@@ -3,7 +3,12 @@ import type { CapturedMtprotoEvent } from '../src/types.js'
 import type { MtprotoCaptureSnapshot } from '../src/capture-api.js'
 import { readResponse, sameOriginPath } from 'cordis-webui-react/utils'
 export const CAPTURE_PAGE_SIZE = 100
-export const CAPTURE_POLL_MS = 1000
+/**
+ * Coalescing window for server-pushed capture revisions. The server bumps the
+ * Muon `revision` field after each flush; the page waits this long before
+ * fetching so a burst collapses into one request. There is no periodic timer.
+ */
+export const CAPTURE_FOLLOW_DELAY_MS = 250
 export interface CaptureFilters {
   grep?: string
   typeName?: string
@@ -14,13 +19,13 @@ export interface CaptureFilters {
   field?: string
   since?: string
 }
-export type CaptureMode = 'latest' | 'older' | 'newer' | 'poll'
+export type CaptureMode = 'latest' | 'older' | 'newer' | 'follow'
 /**
- * The capture session is imperative (polling timers, abortable requests, a
- * detail cache) but every value a page renders is exposed as a plain property.
- * The setters below mirror each React state into a ref, so async work that
- * happens between renders always reads the value it just produced; the state
- * copy is what makes React re-render.
+ * The capture session is imperative (abortable requests, a detail cache) but
+ * every value a page renders is exposed as a plain property. The setters below
+ * mirror each React state into a ref, so async work that happens between
+ * renders always reads the value it just produced; the state copy is what makes
+ * React re-render.
  */
 export interface CaptureController {
   readonly events: CapturedMtprotoEvent[]
@@ -29,18 +34,19 @@ export interface CaptureController {
   readonly error: string
   readonly live: boolean
   readonly details: ReadonlyMap<number, CapturedMtprotoEvent>
-  /** Reload the window (or page it with `older`/`newer`); `poll` appends. */
+  /** Reload the window (or page it with `older`/`newer`); `follow` appends. */
   load(mode?: CaptureMode): Promise<void>
   loadDetails(event: CapturedMtprotoEvent): Promise<void>
   /** Only these ids keep their fetched payload across the next window change. */
   keepDetails(ids: number[]): void
-  /** Follow new events, or stop polling entirely. */
+  /** Follow server-pushed revisions, or stop following entirely. */
   setLive(value: boolean): void
 }
 export function useCapturePages(
   endpoint: string | undefined,
   filters: CaptureFilters,
   enabled: boolean,
+  revision: number,
 ): CaptureController {
   const [events, setEventsState] = useState<CapturedMtprotoEvent[]>([])
   const [snapshot, setSnapshotState] = useState<MtprotoCaptureSnapshot>()
@@ -107,14 +113,19 @@ export function useCapturePages(
     initial = useRef(true)
   const cursor = useRef<number | undefined>(undefined),
     wantedDetails = useRef(new Set<number>())
-  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined),
-    debounce = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const followTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+      undefined,
+    ),
+    followPending = useRef(false),
+    lastRevision = useRef(revision)
+  const debounce = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const cancel = useCallback(() => {
     generation.current++
     for (const controller of controllers.current) controller.abort()
     controllers.current.clear()
     detailJobs.current.clear()
-    clearTimeout(timer.current)
+    clearTimeout(followTimer.current)
+    followPending.current = false
     setLoading(false)
   }, [setLoading])
   const request = useCallback(
@@ -157,18 +168,25 @@ export function useCapturePages(
     [],
   )
   const loadRef = useRef<(mode?: CaptureMode) => Promise<void>>(async () => {})
-  const schedule = useCallback(() => {
-    clearTimeout(timer.current)
+  /** One follow fetch per coalescing window, and only while following. */
+  const scheduleFollow = useCallback(() => {
     if (
-      active.current &&
-      enabledRef.current &&
-      liveRef.current &&
-      !document.hidden
+      !active.current ||
+      !enabledRef.current ||
+      !liveRef.current ||
+      document.hidden
     )
-      timer.current = setTimeout(
-        () => void loadRef.current('poll'),
-        snapshotRef.current?.hasNewer ? 150 : CAPTURE_POLL_MS,
-      )
+      return
+    if (loadingRef.current) {
+      // Finish the in-flight page first; the newest revision stays pending.
+      followPending.current = true
+      return
+    }
+    clearTimeout(followTimer.current)
+    followTimer.current = setTimeout(
+      () => void loadRef.current('follow'),
+      CAPTURE_FOLLOW_DELAY_MS,
+    )
   }, [])
   const load = useCallback(
     async (mode: CaptureMode = 'latest') => {
@@ -176,10 +194,10 @@ export function useCapturePages(
         !active.current ||
         !enabledRef.current ||
         !endpointRef.current ||
-        (mode === 'poll' && loadingRef.current)
+        (mode === 'follow' && loadingRef.current)
       )
         return
-      if (mode !== 'poll') {
+      if (mode !== 'follow') {
         cancel()
         setLiveValue(mode === 'latest')
       }
@@ -197,12 +215,12 @@ export function useCapturePages(
         params.set('beforeId', String(rows[0].id))
       if (mode === 'newer' && rows.at(-1))
         params.set('afterId', String(rows.at(-1)!.id))
-      if (mode === 'poll' && cursor.current !== undefined)
+      if (mode === 'follow' && cursor.current !== undefined)
         params.set('afterId', String(cursor.current))
       try {
         const result = await request(params)
         if (!active.current || current !== generation.current) return
-        if (mode === 'poll') {
+        if (mode === 'follow') {
           const retained = eventsRef.current.filter(
             (event) =>
               result.oldestId !== undefined && event.id >= result.oldestId,
@@ -219,7 +237,7 @@ export function useCapturePages(
           ? result.events.at(-1)?.id
           : result.newestId
         setSnapshot(
-          mode === 'poll' &&
+          mode === 'follow' &&
             eventsRef.current.length &&
             result.oldestId !== undefined
             ? { ...result, hasOlder: eventsRef.current[0].id > result.oldestId }
@@ -240,14 +258,17 @@ export function useCapturePages(
       } finally {
         if (active.current && current === generation.current) {
           setLoading(false)
-          schedule()
+          if (followPending.current) {
+            followPending.current = false
+            scheduleFollow()
+          }
         }
       }
     },
     [
       cancel,
       request,
-      schedule,
+      scheduleFollow,
       setDetails,
       setError,
       setEvents,
@@ -337,9 +358,8 @@ export function useCapturePages(
   useEffect(() => {
     active.current = true
     const visibility = () => {
-      if (document.hidden) {
-        clearTimeout(timer.current)
-      } else if (liveRef.current) void loadRef.current('poll')
+      if (document.hidden) clearTimeout(followTimer.current)
+      else if (liveRef.current) void loadRef.current('follow')
     }
     document.addEventListener('visibilitychange', visibility)
     return () => {
@@ -350,11 +370,18 @@ export function useCapturePages(
       wantedDetails.current.clear()
     }
   }, [cancel])
+  useEffect(() => {
+    // The first revision belongs to the initial page load; later ones mean the
+    // server buffer changed and the follow fetch should catch up once.
+    if (revision === lastRevision.current) return
+    lastRevision.current = revision
+    scheduleFollow()
+  }, [revision, scheduleFollow])
   const setLiveMode = useCallback(
     (value: boolean) => {
       setLiveValue(value)
       if (value) void load('latest')
-      else clearTimeout(timer.current)
+      else clearTimeout(followTimer.current)
     },
     [load, setLiveValue],
   )

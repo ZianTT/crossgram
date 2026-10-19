@@ -92,36 +92,30 @@ export function BackfillDashboard(props: {
       {props.snapshot.recent.length ? (
         <section className="panel">
           <h3>Recent requests</h3>
-          <div className="table-scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>When</th>
-                  <th>Conversation</th>
-                  <th>Kind</th>
-                  <th>Range</th>
-                  <th>Fetched</th>
-                  <th>New</th>
-                  <th>Error</th>
-                </tr>
-              </thead>
-              <tbody>
-                {props.snapshot.recent.map((event, index) => (
-                  <tr key={index}>
-                    <td>{formatDate(event.at)}</td>
-                    <td>{event.title}</td>
-                    <td>
-                      {event.kind === 'gap' ? 'gap' : 'older'} · {event.mode}
-                    </td>
-                    <td>{event.range}</td>
-                    <td>{formatNumber(event.fetched)}</td>
-                    <td>{formatNumber(event.inserted)}</td>
-                    <td>{event.error ?? ''}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <ol className="timeline" aria-label="Recent backfill requests">
+            {props.snapshot.recent.map((event, index) => (
+              <li
+                key={event.at + ':' + index}
+                className={'timeline-item' + (event.error ? ' failed' : '')}
+              >
+                <span className="timeline-dot" aria-hidden="true" />
+                <time dateTime={new Date(event.at).toISOString()}>
+                  {formatDate(event.at)}
+                </time>
+                <div className="timeline-body">
+                  <strong>{event.title}</strong>
+                  <small>
+                    {event.kind === 'gap' ? 'gap' : 'older'} · {event.mode} ·{' '}
+                    {event.range} · {formatNumber(event.fetched)} fetched ·{' '}
+                    {formatNumber(event.inserted)} new
+                  </small>
+                  {event.error ? (
+                    <small className="timeline-error">{event.error}</small>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ol>
         </section>
       ) : null}
     </div>
@@ -137,6 +131,10 @@ function SessionPanel(props: {
   const rows = props.session.conversations.filter(
     (item) => filter === 'all' || !(item.floorReached && item.gapCount === 0),
   )
+  const totals = props.session.totals
+  const coverage = totals.conversations
+    ? Math.round((totals.complete / totals.conversations) * 100)
+    : 0
   return (
     <section className="panel">
       <header>
@@ -147,36 +145,63 @@ function SessionPanel(props: {
           {sessionStatusLabel(props.session.status)}
         </span>
       </header>
-      <div className="metric-grid compact-metrics">
-        <div className="metric">
-          <span>Conversations</span>
-          <strong>{formatNumber(props.session.totals.conversations)}</strong>
-          <p>{formatNumber(props.session.totals.complete)} fully backfilled</p>
+      <div className="backfill-progress">
+        <div className="backfill-progress-head">
+          <span>Backfill coverage</span>
+          <strong>{coverage}%</strong>
         </div>
-        <div className="metric">
-          <span>Known gaps</span>
-          <strong>{formatNumber(props.session.totals.gaps)}</strong>
-          <p>
-            {formatNumber(props.session.totals.missing)} sequence numbers
-            missing
-          </p>
+        <div
+          className="progress-track"
+          role="progressbar"
+          aria-label={'Backfill coverage for ' + props.session.platformSessionId}
+          aria-valuenow={coverage}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <span style={{ width: coverage + '%' }} />
         </div>
-        <div className="metric">
-          <span>Fetched</span>
-          <strong>{formatNumber(props.session.totals.fetched)}</strong>
-          <p>
-            {formatNumber(props.session.totals.inserted)} new messages stored
-          </p>
-        </div>
-        <div className="metric">
-          <span>Requests today</span>
-          <strong>{formatNumber(props.session.requestsToday)}</strong>
-          <p>
-            limit {formatNumber(props.session.dailyRequestCap)} · last client
-            activity {formatAge(props.session.lastActivityAt)}
-          </p>
-        </div>
+        <p className="muted">
+          {formatNumber(totals.complete)} of{' '}
+          {formatNumber(totals.conversations)} conversations complete ·{' '}
+          {formatNumber(totals.gaps)} gaps ·{' '}
+          {formatNumber(totals.missing)} missing sequence numbers
+        </p>
       </div>
+      <dl className="backfill-stats">
+        <div>
+          <dt>Conversations</dt>
+          <dd>
+            {formatNumber(totals.conversations)}
+            <small>{formatNumber(totals.complete)} fully backfilled</small>
+          </dd>
+        </div>
+        <div>
+          <dt>Known gaps</dt>
+          <dd>
+            {formatNumber(totals.gaps)}
+            <small>
+              {formatNumber(totals.missing)} sequence numbers missing
+            </small>
+          </dd>
+        </div>
+        <div>
+          <dt>Fetched</dt>
+          <dd>
+            {formatNumber(totals.fetched)}
+            <small>{formatNumber(totals.inserted)} new messages stored</small>
+          </dd>
+        </div>
+        <div>
+          <dt>Requests today</dt>
+          <dd>
+            {formatNumber(props.session.requestsToday)}
+            <small>
+              limit {formatNumber(props.session.dailyRequestCap)} · last client
+              activity {formatAge(props.session.lastActivityAt)}
+            </small>
+          </dd>
+        </div>
+      </dl>
       <div className="toolbar">
         <div
           className="segmented"
@@ -243,11 +268,33 @@ function ConversationRow(props: {
   onReset: () => void
 }) {
   const item = props.item
+  const percent = item.floorReached
+    ? 100
+    : item.bootstrapped
+      ? Math.min(
+          99,
+          Math.round((item.covered / Math.max(1, item.covered + item.missing)) * 100),
+        )
+      : 0
   return (
     <tr>
       <td>{item.title}</td>
       <td>{item.mode === 'sequence' ? 'msgSeq' : 'anchor'}</td>
-      <td>{conversationProgress(item)}</td>
+      <td>
+        <div className="backfill-cell-progress">
+          <div
+            className="progress-track small"
+            role="progressbar"
+            aria-label={'Progress for ' + item.title}
+            aria-valuenow={percent}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            <span style={{ width: percent + '%' }} />
+          </div>
+          <small>{conversationProgress(item)}</small>
+        </div>
+      </td>
       <td>
         {item.gapCount
           ? `${formatNumber(item.gapCount)} (${formatNumber(item.missing)})`

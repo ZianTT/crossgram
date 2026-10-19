@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { parseCaptureQuery, queryCapture } from '../src/capture-api.js'
 import type { CapturedMtprotoEvent } from '../src/types.js'
 import {
-  CAPTURE_POLL_MS,
+  CAPTURE_FOLLOW_DELAY_MS,
   useCapturePages,
   type CaptureController,
   type CaptureFilters,
@@ -29,19 +29,24 @@ const event = (id: number): CapturedMtprotoEvent => ({
 function Probe(props: {
   filters: CaptureFilters
   ready: boolean
+  revision: number
   capture: (value: CaptureController) => void
 }) {
-  props.capture(useCapturePages('/captures', props.filters, props.ready))
+  props.capture(
+    useCapturePages('/captures', props.filters, props.ready, props.revision),
+  )
   return null
 }
 function harness() {
   let capture!: CaptureController
   let filters: CaptureFilters = {}
   let ready = true
+  let revision = 0
   const grab = (value: CaptureController) => {
     capture = value
   }
-  const view = () => createElement(Probe, { filters, ready, capture: grab })
+  const view = () =>
+    createElement(Probe, { filters, ready, revision, capture: grab })
   const result = render(view())
   const dispose = () => result.unmount()
   disposers.push(dispose)
@@ -55,6 +60,10 @@ function harness() {
     },
     setReady(value: boolean) {
       ready = value
+      result.rerender(view())
+    },
+    bumpRevision() {
+      revision += 1
       result.rerender(view())
     },
     dispose,
@@ -97,25 +106,42 @@ describe('capture transport', () => {
     capture.keepDetails([])
     expect(capture.details.size).toBe(0)
   })
-  it('pages backwards and forwards, and consumes bursts without skipping the first forward page', async () => {
+  it('pages backwards and forwards without a timer on the side', async () => {
     const { capture } = harness()
     await vi.advanceTimersByTimeAsync(0)
     await capture.load('older')
     expect(capture.events[0].id).toBe(51)
     expect(capture.live).toBe(false)
-    await vi.advanceTimersByTimeAsync(2 * CAPTURE_POLL_MS)
+    await vi.advanceTimersByTimeAsync(2 * CAPTURE_FOLLOW_DELAY_MS)
     expect(transport).toHaveBeenCalledTimes(2)
     await capture.load('newer')
     expect(capture.events[0].id).toBe(151)
     await capture.load('latest')
+  })
+  it('follows server-pushed revisions once per coalescing window and stops while paused', async () => {
+    const { capture, bumpRevision } = harness()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(transport).toHaveBeenCalledTimes(1)
+    // A revision with no new rows still costs one follow fetch, then settles.
+    bumpRevision()
+    await vi.advanceTimersByTimeAsync(CAPTURE_FOLLOW_DELAY_MS)
+    expect(transport).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(transport).toHaveBeenCalledTimes(2)
+    // Two revisions inside one window collapse into a single request.
     rows.push(...Array.from({ length: 250 }, (_, i) => event(251 + i)))
-    await vi.advanceTimersByTimeAsync(CAPTURE_POLL_MS)
+    bumpRevision()
+    bumpRevision()
+    await vi.advanceTimersByTimeAsync(CAPTURE_FOLLOW_DELAY_MS)
+    expect(transport).toHaveBeenCalledTimes(3)
     expect(capture.events.at(-1)?.id).toBe(350)
-    await vi.advanceTimersByTimeAsync(150)
-    expect(capture.events.at(-1)?.id).toBe(450)
-    await vi.advanceTimersByTimeAsync(150)
-    expect(capture.events.at(-1)?.id).toBe(500)
-    expect(capture.events).toHaveLength(100)
+    // Pausing live view ignores later revisions until following resumes.
+    capture.setLive(false)
+    rows.push(...Array.from({ length: 50 }, (_, i) => event(501 + i)))
+    bumpRevision()
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(transport).toHaveBeenCalledTimes(3)
+    expect(capture.live).toBe(false)
   })
   it('aborts stale filter requests and never accepts their late responses', async () => {
     let resolve!: (response: Response) => void, signal!: AbortSignal
@@ -136,21 +162,23 @@ describe('capture transport', () => {
     expect(capture.events.map((event) => event.id)).toEqual(ids)
     expect(ids).not.toContain(999)
   })
-  it('stops polling in hidden pages and on disposal, then recovers from a failed poll', async () => {
-    const { capture, dispose } = harness()
+  it('defers follow fetches while the page is hidden and recovers from a failed one', async () => {
+    const { capture, bumpRevision } = harness()
     await vi.advanceTimersByTimeAsync(0)
     vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
     document.dispatchEvent(new Event('visibilitychange'))
-    await vi.advanceTimersByTimeAsync(3 * CAPTURE_POLL_MS)
+    bumpRevision()
+    await vi.advanceTimersByTimeAsync(3 * CAPTURE_FOLLOW_DELAY_MS)
     expect(transport).toHaveBeenCalledOnce()
     transport.mockResolvedValueOnce(new Response('failed', { status: 503 }))
     vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
     document.dispatchEvent(new Event('visibilitychange'))
     await vi.advanceTimersByTimeAsync(0)
     expect(capture.error).toContain('503')
-    await vi.advanceTimersByTimeAsync(CAPTURE_POLL_MS)
+    // The next server revision is what recovers the view; there is no timer.
+    bumpRevision()
+    await vi.advanceTimersByTimeAsync(CAPTURE_FOLLOW_DELAY_MS)
     expect(capture.error).toBe('')
-    dispose()
     const count = transport.mock.calls.length
     await vi.advanceTimersByTimeAsync(5000)
     expect(transport).toHaveBeenCalledTimes(count)
@@ -164,8 +192,6 @@ describe('capture transport', () => {
     await capture.loadDetails(first)
     expect(capture.error).toContain('expired')
     expect(capture.details.size).toBe(0)
-    await vi.advanceTimersByTimeAsync(CAPTURE_POLL_MS)
-    expect(capture.events).toEqual([])
     setReady(false)
     const count = transport.mock.calls.length
     await vi.advanceTimersByTimeAsync(5000)

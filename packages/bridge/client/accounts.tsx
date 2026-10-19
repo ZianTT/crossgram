@@ -28,7 +28,13 @@ export default function AccountsPage(props: PageProps) {
   const [now, setNow] = useState(() => Date.now()),
     [qr, setQr] = useState(false),
     [copied, setCopied] = useState(false)
+  // Local clock for login-code countdowns only: never a network poll, and it
+  // stops as soon as no code is waiting.
+  const countdown = (rpc.data.accounts ?? []).some(
+    (account) => (account.validUntil ?? 0) > now,
+  )
   useEffect(() => {
+    if (!countdown) return
     const tick = () => {
       if (!document.hidden) setNow(Date.now())
     }
@@ -38,7 +44,7 @@ export default function AccountsPage(props: PageProps) {
       clearInterval(timer)
       document.removeEventListener('visibilitychange', tick)
     }
-  }, [])
+  }, [countdown])
   const accounts = new Map(
     (rpc.data.accounts ?? []).map((account) => [account.platformId, account]),
   )

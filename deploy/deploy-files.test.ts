@@ -266,5 +266,12 @@ describe('Crossgram Linux deployment', () => {
     // Idempotent, and a config without any WebUI entry is left alone.
     expect(migrateWebuiPlugin(migrated)).toBe(migrated)
     expect(migrateWebuiPlugin("- id: bridge\n  name: '@mtproto-relay/bridge'\n")).toBe("- id: bridge\n  name: '@mtproto-relay/bridge'\n")
+    // Hand-written runtime configs may use unquoted scalars, and the engine's
+    // own config must stay with the engine instead of moving to the monitor.
+    const unquoted = `- id: webui\n  name: cordis-webui-solidjs\n  config:\n    sessionExpiry: 604800000\n`
+    const renamed = migrateWebuiPlugin(unquoted)
+    expect(renamed).toBe(
+      `- id: webui\n  name: 'cordis-webui-react'\n  config:\n    sessionExpiry: 604800000\n- id: webui-server-monitor\n  name: 'cordis-webui-react/server'\n`,
+    )
   })
 
