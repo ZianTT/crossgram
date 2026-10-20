@@ -114,6 +114,7 @@ describe('React capture with the real MTProto capture backend', () => {
         .locator('.capture-row-header')
         .filter({ hasText: 'messages.getHistory' })
         .click()
+      await page.getByRole('tab', { name: 'Result', exact: true }).click()
       await page.locator('.json-toggle').filter({ hasText: 'result' }).click()
       await page.getByText('EXAMPLE_ERROR', { exact: false }).waitFor()
       expect(await page.locator('.rpc-error').count()).toBe(1)

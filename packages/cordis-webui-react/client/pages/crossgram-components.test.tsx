@@ -92,15 +92,15 @@ describe('bounded Crossgram components', () => {
       <JsonTree value={Array.from({ length: 10_000 }, (_, index) => index)} />,
     )
     const container = large.container
-    expect(container.querySelectorAll('.json-leaf')).toHaveLength(30)
+    expect(container.querySelectorAll('.json-value')).toHaveLength(100)
     fireEvent.click(
       Array.from(container.querySelectorAll('button')).find((button) =>
-        button.textContent?.includes('Show 30 more'),
+        button.textContent?.includes('Show 100 more'),
       )!,
     )
-    expect(container.querySelectorAll('.json-leaf')).toHaveLength(60)
+    expect(container.querySelectorAll('.json-value')).toHaveLength(200)
     fireEvent.click(container.querySelector<HTMLButtonElement>('.json-toggle')!)
-    expect(container.querySelectorAll('.json-leaf')).toHaveLength(0)
+    expect(container.querySelectorAll('.json-value')).toHaveLength(0)
     large.unmount()
     const preview = render(<JsonTree value={'x'.repeat(100_000)} />)
     expect(preview.container.textContent!.length).toBeLessThan(1000)

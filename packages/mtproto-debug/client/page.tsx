@@ -16,6 +16,7 @@ export default function CapturePage(props: PageProps) {
   const action = useAction()
   const [filters, setFilters] = useState<CaptureFilters>({})
   const [expanded, setExpanded] = useState<number | undefined>(undefined)
+  const [pane, setPane] = useState<'event' | 'result'>('event')
   const list = useRef<HTMLDivElement>(null)
   const capture = useCapturePages(
     rpc.data.apiPath,
@@ -46,13 +47,15 @@ export default function CapturePage(props: PageProps) {
       typeName: mode === 'include' ? name : '',
       excludeName: mode === 'exclude' ? name : '',
     }))
-  const toggle = (id: number) => {
-    if (expanded === id) {
+  const select = (id: number | undefined) => {
+    setPane('event')
+    if (id === undefined) {
       setExpanded(undefined)
       capture.keepDetails([])
       return
     }
-    const group = groups.get(id)!
+    const group = groups.get(id)
+    if (!group) return
     setExpanded(id)
     capture.keepDetails([id, ...(group.result ? [group.result.id] : [])])
     void capture.loadDetails(group.event)
@@ -64,8 +67,6 @@ export default function CapturePage(props: PageProps) {
     url.searchParams.set('limit', '1')
     return url.href
   }
-  const dropped = capture.snapshot?.dropped ?? 0
-  const retained = capture.snapshot?.total ?? capture.events.length
   const filtersKey = JSON.stringify(filters)
   useEffect(() => {
     // A new filter starts a new window; keep the list at the newest event.
@@ -88,6 +89,14 @@ export default function CapturePage(props: PageProps) {
     if (element.scrollHeight <= element.clientHeight + 1)
       void capture.load('older')
   }, [capture.events.length, capture.loading, capture.snapshot?.hasOlder])
+  const selected = expanded === undefined ? undefined : groups.get(expanded)
+  const result = selected?.result
+  const detail =
+    pane === 'result' && result
+      ? (capture.details.get(result.id) ?? result)
+      : selected
+        ? (capture.details.get(selected.event.id) ?? selected.event)
+        : undefined
   return (
     <>
       <ActionError error={action.error || capture.error} />
@@ -127,8 +136,7 @@ export default function CapturePage(props: PageProps) {
                 description="The in-memory capture buffer will be cleared. This does not disconnect clients."
                 action={async () => {
                   await rpc.data.clear()
-                  setExpanded(undefined)
-                  capture.keepDetails([])
+                  select(undefined)
                   await capture.load('latest')
                 }}
               />
@@ -225,10 +233,10 @@ export default function CapturePage(props: PageProps) {
                   {ids.map((id) => {
                     const group = groups.get(id)!
                     const event = capture.details.get(id) ?? group.event
-                    const result = group.result
+                    const groupResult = group.result
                       ? (capture.details.get(group.result.id) ?? group.result)
                       : undefined
-                    const metrics = getRpcResultMetrics(event, result)
+                    const metrics = getRpcResultMetrics(event, groupResult)
                     return (
                       <tr
                         key={id}
@@ -240,7 +248,7 @@ export default function CapturePage(props: PageProps) {
                         onClick={(click) => {
                           if ((click.target as HTMLElement).closest('button'))
                             return
-                          toggle(id)
+                          select(expanded === id ? undefined : id)
                         }}
                       >
                         <td className="capture-time">
@@ -254,7 +262,9 @@ export default function CapturePage(props: PageProps) {
                           <button
                             className="capture-row-header"
                             aria-expanded={expanded === id}
-                            onClick={() => toggle(id)}
+                            onClick={() =>
+                              select(expanded === id ? undefined : id)
+                            }
                           >
                             <span className="capture-row-title">
                               <strong>{event.name}</strong>
@@ -321,48 +331,59 @@ export default function CapturePage(props: PageProps) {
                 <p className="capture-more muted">End of retained capture.</p>
               ) : null}
             </div>
-            {expanded !== undefined && groups.get(expanded) ? (
+            {selected && detail ? (
               <section
                 className="capture-inspector"
                 aria-label="Captured event details"
               >
                 <header className="capture-inspector-header">
-                  <strong>{groups.get(expanded)!.event.name}</strong>
+                  <strong>{detail.name}</strong>
                   <span className="muted">
-                    #{expanded} · {groups.get(expanded)!.event.connectionId} ·{' '}
-                    {clock(groups.get(expanded)!.event.timestamp)}
+                    #{detail.id} · {detail.connectionId} ·{' '}
+                    {clock(detail.timestamp)}
                   </span>
+                  {selected.result ? (
+                    <div
+                      className="segmented capture-panes"
+                      role="tablist"
+                      aria-label="Captured event sections"
+                    >
+                      <button
+                        role="tab"
+                        aria-selected={pane === 'event'}
+                        className={pane === 'event' ? 'selected' : undefined}
+                        onClick={() => setPane('event')}
+                      >
+                        Event
+                      </button>
+                      <button
+                        role="tab"
+                        aria-selected={pane === 'result'}
+                        className={pane === 'result' ? 'selected' : undefined}
+                        onClick={() => {
+                          setPane('result')
+                          if (selected.result)
+                            void capture.loadDetails(selected.result)
+                        }}
+                      >
+                        Result
+                      </button>
+                    </div>
+                  ) : null}
                   <button
                     className="icon-button"
                     aria-label="Close details"
-                    onClick={() => {
-                      setExpanded(undefined)
-                      capture.keepDetails([])
-                    }}
+                    onClick={() => select(undefined)}
                   >
                     <Icon name="x" size={14} />
                   </button>
                 </header>
                 <div className="capture-inspector-body">
                   <EventDetail
-                    event={
-                      capture.details.get(expanded) ??
-                      groups.get(expanded)!.event
-                    }
+                    event={detail}
                     filter={filterType}
                     rawLink={rawLink}
                   />
-                  {groups.get(expanded)!.result ? (
-                    <EventDetail
-                      event={
-                        capture.details.get(
-                          groups.get(expanded)!.result!.id,
-                        ) ?? groups.get(expanded)!.result!
-                      }
-                      filter={filterType}
-                      rawLink={rawLink}
-                    />
-                  ) : null}
                 </div>
               </section>
             ) : null}
@@ -393,13 +414,8 @@ function EventDetail(props: {
 }) {
   const action = useAction()
   return (
-    <section className="stack event-detail">
-      <div className="toolbar">
-        <strong className="grow">{props.event.name}</strong>
-        <span className="chip">{props.event.phase}</span>
-        <span className="chip">
-          {props.event.direction === 'client->server' ? '↑' : '↓'}
-        </span>
+    <section className="event-detail">
+      <div className="event-detail-toolbar">
         <button
           className="button outlined"
           onClick={() => props.filter('include', props.event.name)}
@@ -431,6 +447,10 @@ function EventDetail(props: {
         >
           Copy payload
         </button>
+        <span className="chip">{props.event.phase}</span>
+        <span className="chip">
+          {props.event.direction === 'client->server' ? '↑ request' : '↓ response'}
+        </span>
       </div>
       <dl className="event-metadata">
         {Object.entries({
@@ -451,111 +471,173 @@ function EventDetail(props: {
       </dl>
       <ActionError error={action.error || props.event.error || ''} />
       {props.event.payloadOmitted ? (
-        <p className="muted" role="status">
+        <p className="muted event-detail-loading" role="status">
           <Icon name="refresh" size={15} /> Loading payload…
         </p>
       ) : (
-        <div className="json-tree">
-          <JsonTree value={props.event.payload} />
-        </div>
+        <JsonTree value={props.event.payload} />
       )}
     </section>
   )
 }
-export function JsonTree(props: {
-  value: unknown
+type JsonKind =
+  | 'object'
+  | 'array'
+  | 'string'
+  | 'number'
+  | 'boolean'
+  | 'null'
+  | 'other'
+function kindOf(value: unknown): JsonKind {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  switch (typeof value) {
+    case 'object':
+      return 'object'
+    case 'string':
+      return 'string'
+    case 'number':
+      return 'number'
+    case 'boolean':
+      return 'boolean'
+    default:
+      return 'other'
+  }
+}
+function previewOf(value: unknown): string {
+  const kind = kindOf(value)
+  if (kind === 'array') return 'Array(' + (value as unknown[]).length + ')'
+  if (kind === 'object') return '{…}'
+  if (kind === 'string') {
+    const text = value as string
+    return text.length > 200
+      ? JSON.stringify(text.slice(0, 200) + '…')
+      : JSON.stringify(text)
+  }
+  if (kind === 'null') return 'null'
+  if (kind === 'other') return String(value)
+  return String(value)
+}
+function primitiveClass(kind: JsonKind): string {
+  return 'json-value json-' + kind
+}
+function JsonNode(props: {
   name?: string
-  depth?: number
+  value: unknown
+  depth: number
+  defaultExpanded?: boolean
 }) {
-  const [expanded, setExpanded] = useState(() => !props.depth)
-  const [limit, setLimit] = useState(30)
-  const [stringLimit, setStringLimit] = useState(800)
-  const value = props.value
-  const object = value !== null && typeof value === 'object'
-  const keys = useMemo(
-    () =>
-      value !== null && typeof value === 'object' && !Array.isArray(value)
-        ? Object.keys(value)
-        : [],
-    [value],
-  )
-  const count = Array.isArray(value) ? value.length : keys.length
+  const [expanded, setExpanded] = useState(props.defaultExpanded ?? false)
+  const [showFull, setShowFull] = useState(false)
+  const [limit, setLimit] = useState(100)
+  const kind = kindOf(props.value)
+  const expandable = kind === 'object' || kind === 'array'
   const entries = useMemo(() => {
-    if (value === null || typeof value !== 'object') return []
-    if (Array.isArray(value))
-      return value.slice(0, limit).map((item, index) => ({
-        key: String(index),
-        value: item as unknown,
-      }))
-    return keys.slice(0, limit).map((key) => ({
-      key,
-      value: (value as Record<string, unknown>)[key],
-    }))
-  }, [keys, limit, value])
-  const rawText = String(value)
-  const text =
-    typeof value === 'string'
-      ? JSON.stringify(rawText.slice(0, stringLimit))
-      : rawText.slice(0, stringLimit)
-  if (!object)
+    if (kind === 'array')
+      return (props.value as unknown[]).map(
+        (item, index) => [String(index), item] as const,
+      )
+    if (kind === 'object')
+      return Object.entries(props.value as Record<string, unknown>)
+    return []
+  }, [kind, props.value])
+  const indent = { paddingLeft: 12 + props.depth * 14 }
+  if (!expandable) {
+    const text = props.value as string
+    const longText = kind === 'string' && text.length > 200
+    const shown =
+      longText && !showFull
+        ? JSON.stringify(text.slice(0, 200) + '…')
+        : kind === 'string'
+          ? JSON.stringify(
+              text.length > 2000 ? text.slice(0, 2000) + '…' : text,
+            )
+          : previewOf(props.value)
     return (
-      <div className="json-leaf">
-        {props.name ? <strong>{props.name}: </strong> : null}
-        <span>{text}</span>
-        {rawText.length > stringLimit ? (
-          stringLimit < 16000 ? (
-            <button
-              className="field-reset"
-              onClick={() =>
-                setStringLimit(Math.min(16000, stringLimit + 2000))
-              }
-            >
-              Show more ({rawText.length} characters total)
-            </button>
-          ) : (
-            <span className="muted">
-              {' '}
-              Preview limited to 16,000 characters; use the raw event link for
-              the full value.
-            </span>
-          )
+      <div className="json-row" style={indent}>
+        <span className="json-caret" />
+        {props.name !== undefined ? (
+          <>
+            <span className="json-key">{props.name}</span>
+            <span className="json-punct">:&nbsp;</span>
+          </>
+        ) : null}
+        <span className={primitiveClass(kind)}>{shown}</span>
+        {longText ? (
+          <button
+            className="json-string-toggle"
+            onClick={(event) => {
+              event.stopPropagation()
+              setShowFull(!showFull)
+            }}
+          >
+            {showFull ? 'collapse' : 'show all'}
+          </button>
         ) : null}
       </div>
     )
+  }
   return (
-    <div className="json-branch">
-      <button
-        className="json-toggle"
+    <>
+      <div
+        className={'json-row json-toggle' + (expandable ? ' expandable' : '')}
+        style={indent}
+        role="treeitem"
         aria-expanded={expanded}
-        disabled={(props.depth ?? 0) > 20}
+        tabIndex={0}
         onClick={() => setExpanded(!expanded)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            setExpanded(!expanded)
+          }
+        }}
       >
-        <Icon name={expanded ? 'minus' : 'plus'} size={14} />
-        <strong>{props.name ?? 'Payload'}</strong>
-        <span className="muted">
-          {count} {Array.isArray(value) ? 'items' : 'keys'}
+        <span className="json-caret">{expanded ? '▾' : '▸'}</span>
+        {props.name !== undefined ? (
+          <>
+            <span className="json-key">{props.name}</span>
+            <span className="json-punct">:&nbsp;</span>
+          </>
+        ) : null}
+        <span className="json-punct">
+          {expanded ? (kind === 'array' ? '[' : '{') : previewOf(props.value)}
         </span>
-      </button>
-      {expanded && (props.depth ?? 0) <= 20 ? (
-        <div className="json-children">
-          {entries.map((entry) => (
-            <JsonTree
-              key={entry.key}
-              name={entry.key}
-              value={entry.value}
-              depth={(props.depth ?? 0) + 1}
-            />
+      </div>
+      {expanded ? (
+        <>
+          {entries.slice(0, limit).map(([key, value]) => (
+            <JsonNode key={key} name={key} value={value} depth={props.depth + 1} />
           ))}
-          {count > limit ? (
-            <button
-              className="button outlined"
-              onClick={() => setLimit(limit + 30)}
-            >
-              Show 30 more ({count - limit} remaining)
-            </button>
+          {entries.length > limit ? (
+            <div className="json-row" style={indent}>
+              <span className="json-caret" />
+              <button
+                className="json-string-toggle json-more"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setLimit(limit + 100)
+                }}
+              >
+                Show 100 more ({entries.length - limit} remaining)
+              </button>
+            </div>
           ) : null}
-        </div>
+          <div className="json-row" style={indent}>
+            <span className="json-caret" />
+            <span className="json-punct">
+              {kind === 'array' ? ']' : '}'}
+            </span>
+          </div>
+        </>
       ) : null}
+    </>
+  )
+}
+export function JsonTree({ value }: { value: unknown }) {
+  return (
+    <div className="json-tree" role="tree" aria-label="Payload">
+      <JsonNode value={value} depth={0} defaultExpanded />
     </div>
   )
 }
