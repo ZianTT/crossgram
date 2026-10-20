@@ -143,8 +143,15 @@ describe('React capture with the real MTProto capture backend', () => {
       expect(requests.some((url) => new URL(url).searchParams.has('id'))).toBe(
         true,
       )
-      await page.getByRole('button', { name: 'Load older events' }).click()
-      await page.locator('.capture-row-header').first().click()
+      // The list pages itself: scrolling to the end requests older events.
+      const initialRows = await page.locator('.capture-row').count()
+      await page.locator('.capture-list').evaluate((element) => {
+        element.scrollTop = element.scrollHeight
+      })
+      await expect
+        .poll(() => page.locator('.capture-row').count())
+        .toBeGreaterThan(initialRows)
+      await page.locator('.capture-row-header').last().click()
       await page
         .getByText(/ON_DEMAND_ONLY_/)
         .first()
@@ -155,7 +162,6 @@ describe('React capture with the real MTProto capture backend', () => {
         .poll(() => page.locator('.capture-row-title strong').allTextContents())
         .toEqual(expect.arrayContaining(['test.call15']))
       await page.getByLabel('Search captured events').fill('')
-      await page.getByRole('button', { name: 'Show latest events' }).click()
       await page
         .getByRole('button', { name: 'Pause capture', exact: true })
         .click()

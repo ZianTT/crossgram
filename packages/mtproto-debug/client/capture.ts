@@ -19,7 +19,7 @@ export interface CaptureFilters {
   field?: string
   since?: string
 }
-export type CaptureMode = 'latest' | 'older' | 'newer' | 'follow'
+export type CaptureMode = 'latest' | 'older' | 'follow'
 /**
  * The capture session is imperative (abortable requests, a detail cache) but
  * every value a page renders is exposed as a plain property. The setters below
@@ -199,7 +199,7 @@ export function useCapturePages(
         return
       if (mode !== 'follow') {
         cancel()
-        setLiveValue(mode === 'latest')
+        if (mode === 'latest') setLiveValue(true)
       }
       const current = generation.current
       setLoading(true)
@@ -213,8 +213,6 @@ export function useCapturePages(
       const rows = eventsRef.current
       if (mode === 'older' && rows[0])
         params.set('beforeId', String(rows[0].id))
-      if (mode === 'newer' && rows.at(-1))
-        params.set('afterId', String(rows.at(-1)!.id))
       if (mode === 'follow' && cursor.current !== undefined)
         params.set('afterId', String(cursor.current))
       try {
@@ -227,15 +225,20 @@ export function useCapturePages(
           )
           const merged = new Map(retained.map((event) => [event.id, event]))
           for (const event of result.events) merged.set(event.id, event)
-          setEvents(
-            [...merged.values()]
-              .sort((a, b) => a.id - b.id)
-              .slice(-CAPTURE_PAGE_SIZE),
+          setEvents([...merged.values()].sort((a, b) => a.id - b.id))
+        } else if (mode === 'older') {
+          // Infinite scroll accumulates older pages instead of replacing the
+          // window; the follow cursor keeps pointing at the newest event.
+          const merged = new Map(
+            eventsRef.current.map((event) => [event.id, event]),
           )
-        } else setEvents(result.events.slice(-CAPTURE_PAGE_SIZE))
-        cursor.current = result.hasNewer
-          ? result.events.at(-1)?.id
-          : result.newestId
+          for (const event of result.events) merged.set(event.id, event)
+          setEvents([...merged.values()].sort((a, b) => a.id - b.id))
+        } else setEvents(result.events)
+        if (mode !== 'older')
+          cursor.current = result.hasNewer
+            ? result.events.at(-1)?.id
+            : result.newestId
         setSnapshot(
           mode === 'follow' &&
             eventsRef.current.length &&

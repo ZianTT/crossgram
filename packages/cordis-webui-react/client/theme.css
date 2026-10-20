@@ -2653,3 +2653,23 @@
     font-size: 12px;
   }
 }
+
+@layer utilities {
+  @media (max-width: 760px) {
+    .workbench .server-table th:nth-child(3),
+    .workbench .server-table td:nth-child(3),
+    .workbench .server-table th:nth-child(5),
+    .workbench .server-table td:nth-child(5) {
+      display: none;
+    }
+    .workbench .server-table .cell-grow {
+      width: auto;
+      max-width: none;
+    }
+  }
+  @media (max-width: 480px) {
+    .workbench-header h1 {
+      display: none;
+    }
+  }
+}

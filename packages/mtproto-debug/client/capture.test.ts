@@ -106,17 +106,19 @@ describe('capture transport', () => {
     capture.keepDetails([])
     expect(capture.details.size).toBe(0)
   })
-  it('pages backwards and forwards without a timer on the side', async () => {
+  it('accumulates older pages while keeping live following enabled', async () => {
     const { capture } = harness()
     await vi.advanceTimersByTimeAsync(0)
+    expect(capture.events).toHaveLength(100)
     await capture.load('older')
     expect(capture.events[0].id).toBe(51)
-    expect(capture.live).toBe(false)
+    expect(capture.live).toBe(true)
+    await capture.load('older')
+    expect(capture.events[0].id).toBe(1)
+    expect(capture.events).toHaveLength(250)
+    const calls = transport.mock.calls.length
     await vi.advanceTimersByTimeAsync(2 * CAPTURE_FOLLOW_DELAY_MS)
-    expect(transport).toHaveBeenCalledTimes(2)
-    await capture.load('newer')
-    expect(capture.events[0].id).toBe(151)
-    await capture.load('latest')
+    expect(transport).toHaveBeenCalledTimes(calls)
   })
   it('follows server-pushed revisions once per coalescing window and stops while paused', async () => {
     const { capture, bumpRevision } = harness()

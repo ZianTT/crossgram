@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CapturedMtprotoEvent, MtprotoDebugData } from '../src/types.js'
 import { getRpcResultMetrics, groupRpcEvents } from '../src/event-groups.js'
 import { useRpc, type PageProps } from 'cordis-webui-react/client'
@@ -16,6 +16,7 @@ export default function CapturePage(props: PageProps) {
   const action = useAction()
   const [filters, setFilters] = useState<CaptureFilters>({})
   const [expanded, setExpanded] = useState<number | undefined>(undefined)
+  const list = useRef<HTMLDivElement>(null)
   const capture = useCapturePages(
     rpc.data.apiPath,
     filters,
@@ -65,8 +66,20 @@ export default function CapturePage(props: PageProps) {
   }
   const dropped = capture.snapshot?.dropped ?? 0
   const retained = capture.snapshot?.total ?? capture.events.length
-  const activeFilters =
-    !!filters.typeName || !!filters.excludeName || !!filters.grep
+  const filtersKey = JSON.stringify(filters)
+  useEffect(() => {
+    // A new filter starts a new window; keep the list at the newest event.
+    list.current?.scrollTo({ top: 0 })
+  }, [filtersKey])
+  const onScroll = () => {
+    const element = list.current
+    if (!element || capture.loading || !capture.snapshot?.hasOlder) return
+    if (
+      element.scrollTop + element.clientHeight >=
+      element.scrollHeight - 240
+    )
+      void capture.load('older')
+  }
   return (
     <>
       <ActionError error={action.error || capture.error} />
@@ -75,10 +88,8 @@ export default function CapturePage(props: PageProps) {
           <header className="workbench-header">
             <h1>MTProto capture</h1>
             <span className="workbench-sub">
-              {rpc.data.capturing ? 'Capturing' : 'Paused'} ·{' '}
-              {capture.events.length} shown / {retained} retained · {dropped}{' '}
-              dropped
-              {capture.loading ? ' · updating…' : ''}
+              {rpc.data.capturing ? 'Capturing' : 'Paused'}
+              {capture.loading ? ' · loading events…' : ''}
             </span>
             <div className="workbench-actions">
               <button
@@ -182,11 +193,14 @@ export default function CapturePage(props: PageProps) {
               </button>
             ) : null}
           </div>
-          <div className="workbench-body">
+          <div className="workbench-body capture-body">
             <div
+              ref={list}
               className="workbench-scroll capture-list"
               role="list"
               aria-label="Captured MTProto events"
+              tabIndex={0}
+              onScroll={onScroll}
             >
               <table className="workbench-table capture-table">
                 <thead>
@@ -290,6 +304,14 @@ export default function CapturePage(props: PageProps) {
                   </p>
                 </div>
               ) : null}
+              {capture.loading && ids.length ? (
+                <p className="capture-more muted" role="status">
+                  Loading older events…
+                </p>
+              ) : null}
+              {!capture.snapshot?.hasOlder && ids.length ? (
+                <p className="capture-more muted">End of retained capture.</p>
+              ) : null}
             </div>
             {expanded !== undefined && groups.get(expanded) ? (
               <section
@@ -337,40 +359,6 @@ export default function CapturePage(props: PageProps) {
               </section>
             ) : null}
           </div>
-          <footer className="workbench-footer capture-footer">
-            <button
-              className="button outlined"
-              disabled={
-                !rpc.ready || capture.loading || !capture.snapshot?.hasOlder
-              }
-              aria-label="Load older events"
-              onClick={() => void capture.load('older')}
-            >
-              Older
-            </button>
-            <button
-              className="button tonal"
-              disabled={!rpc.ready || capture.loading}
-              aria-label="Show latest events"
-              onClick={() => void capture.load('latest')}
-            >
-              Latest
-            </button>
-            <button
-              className="button outlined"
-              disabled={
-                !rpc.ready || capture.loading || !capture.snapshot?.hasNewer
-              }
-              aria-label="Load newer events"
-              onClick={() => void capture.load('newer')}
-            >
-              Newer
-            </button>
-            <span>
-              {capture.events.length} events
-              {activeFilters ? ' · filtered' : ''}
-            </span>
-          </footer>
         </div>
       </LiveContent>
     </>
