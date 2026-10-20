@@ -71,6 +71,9 @@ export default function ServerPage({ entryId, path }: PageProps) {
               <input
                 type="search"
                 aria-label={'Filter ' + (requests ? 'requests' : 'routes')}
+                placeholder={
+                  'Filter ' + (requests ? 'requests' : 'routes') + '…'
+                }
                 value={search}
                 onChange={(event) => {
                   setSearch(event.currentTarget.value)

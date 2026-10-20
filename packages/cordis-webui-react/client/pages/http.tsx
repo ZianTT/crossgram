@@ -96,6 +96,7 @@ function HttpHistory({
           <input
             type="search"
             aria-label="Search requests"
+            placeholder="Filter by URL, method, status…"
             value={search}
             onChange={(event) => {
               setSearch(event.currentTarget.value)
