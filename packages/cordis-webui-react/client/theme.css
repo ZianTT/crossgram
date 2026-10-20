@@ -2673,3 +2673,22 @@
     }
   }
 }
+
+@layer utilities {
+  @media (min-width: 1024px) {
+    .workbench .capture-body {
+      flex-direction: row;
+    }
+    .workbench .capture-body > .capture-list {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .workbench .capture-body > .capture-inspector {
+      flex: 0 0 min(460px, 40vw);
+      height: auto;
+      min-height: 0;
+      border-top: 0;
+      border-left: 0.5px solid var(--outline-variant);
+    }
+  }
+}
