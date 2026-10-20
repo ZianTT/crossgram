@@ -24,7 +24,10 @@ const cases = [
     'blockedContentMode', 'recalledMessageMode', 'voiceWorkerSocketPath', 'voiceWorkerTimeoutMs', 'voiceDirectIce',
     'voiceTurnHost', 'voiceTurnPort', 'voiceTurnSharedSecret', 'voiceTurnTtlSeconds',
   ]],
-  ['debug', debugConfig, ['maxEvents', 'initiallyPaused', 'apiPath']],
+  ['debug', debugConfig, [
+    'maxEvents', 'initiallyPaused', 'apiPath',
+    'recordingsPath', 'recordingsApiPath', 'maxRecordings',
+  ]],
   ['mtproto', mtprotoConfig, [
     'port', 'wsPort', 'wsPath', 'host', 'rsaKeyPath', 'authKeyStorePath',
     'maxConnections', 'maxConnectionsPerIp', 'connectionIdleTimeoutMs', 'keepAliveInitialDelayMs',
@@ -114,6 +117,9 @@ describe('plugin config schemas', () => {
       maxEvents: 2_000,
       initiallyPaused: false,
       apiPath: '/api/mtproto-debug/events',
+      recordingsPath: './data/mtproto-debug-recordings',
+      recordingsApiPath: '/api/mtproto-debug/recordings',
+      maxRecordings: 50,
     })
     expect(qqntConfig({})).toMatchObject({
       grayTipFilters: ['回应了你的消息'],
@@ -177,6 +183,7 @@ describe('plugin config schemas', () => {
     expect(() => exporterConfig({ platformId: undefined as unknown as string })).toThrow(/platformId/)
     expect(() => exporterConfig({ platformId: 'qqnt', maxMediaBytes: 0 })).toThrow(/maxMediaBytes/)
     expect(() => statisticsConfig({ sampleIntervalMs: 499 })).toThrow(/sampleIntervalMs/)
+    expect(() => debugConfig({ maxRecordings: 0 })).toThrow(/maxRecordings/)
     expect(() => flashTransferConfig({ maxFiles: 101 })).toThrow(/maxFiles/)
     expect(() => stickerImporterConfig({ botToken: 'token', importCooldownMs: 60_001 })).toThrow(/importCooldownMs/)
     expect(() => databaseUpdateStoreConfig({ retention: 1_000_001 })).toThrow(/retention/)

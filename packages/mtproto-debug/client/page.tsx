@@ -13,19 +13,34 @@ import {
   ActionError,
   ConfirmAction,
   LiveContent,
+  Modal,
+  formatBytes,
   useAction,
 } from 'cordis-webui-react/components'
 import { useCapturePages, type CaptureFilters } from './capture.js'
+import {
+  deleteRecording,
+  listRecordings,
+  recordingDownloadUrl,
+  saveRecording,
+  type RecordingSummary,
+} from './recordings.js'
 import { copyText, formatMs, sameOriginPath } from 'cordis-webui-react/utils'
 export default function CapturePage(props: PageProps) {
   const rpc = useRpc<MtprotoDebugData>(props.entryId)
   const action = useAction()
+  const save = useAction()
+  const recordingsAction = useAction()
   const [filters, setFilters] = useState<CaptureFilters>({})
   const [expanded, setExpanded] = useState<number | undefined>(undefined)
   const [pane, setPane] = useState<'event' | 'result'>('event')
   const [showFilters, setShowFilters] = useState(false)
   const [flash, setFlash] = useState('')
   const [menu, setMenu] = useState<{ id: number; x: number; y: number }>()
+  const [saveOpen, setSaveOpen] = useState(false)
+  const [recordingsOpen, setRecordingsOpen] = useState(false)
+  const [recordingLabel, setRecordingLabel] = useState('')
+  const [recordings, setRecordings] = useState<RecordingSummary[]>([])
   const list = useRef<HTMLDivElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const capture = useCapturePages(
@@ -140,6 +155,27 @@ export default function CapturePage(props: PageProps) {
     }
     setMenu(undefined)
   }
+  const refreshRecordings = async () => {
+    const loaded = await recordingsAction.run(() =>
+      listRecordings(rpc.data.recordingsApiPath),
+    )
+    if (loaded) setRecordings(loaded)
+  }
+  const submitRecording = () =>
+    void save.run(async () => {
+      const recording = await saveRecording(
+        rpc.data.recordingsApiPath,
+        recordingLabel,
+      )
+      setSaveOpen(false)
+      setRecordingLabel('')
+      setFlash('Saved recording ' + recording.id)
+      await refreshRecordings()
+    })
+  const openRecordings = () => {
+    setRecordingsOpen(true)
+    void refreshRecordings()
+  }
   const chips: { key: keyof CaptureFilters; label: string }[] = []
   if (filters.typeName)
     chips.push({ key: 'typeName', label: 'Only: ' + filters.typeName })
@@ -240,6 +276,23 @@ export default function CapturePage(props: PageProps) {
                   await capture.load('latest')
                 }}
               />
+              <button
+                className="button tonal"
+                disabled={!rpc.ready || !capture.snapshot?.total}
+                onClick={() => {
+                  save.clear()
+                  setSaveOpen(true)
+                }}
+              >
+                Save recording
+              </button>
+              <button
+                className="button outlined"
+                disabled={!rpc.ready}
+                onClick={openRecordings}
+              >
+                Recordings
+              </button>
             </div>
           </header>
           <div className="workbench-toolbar capture-toolbar">
@@ -533,6 +586,119 @@ export default function CapturePage(props: PageProps) {
               </section>
             ) : null}
           </div>
+          {saveOpen ? (
+            <Modal
+              title="Save recording"
+              onClose={() => {
+                if (!save.busy) setSaveOpen(false)
+              }}
+            >
+              <p className="muted">
+                Saves all {capture.snapshot?.total ?? 0} buffered events to a
+                recording file on the server. Capture keeps running.
+              </p>
+              <label className="field">
+                <span>Label (optional)</span>
+                <input
+                  aria-label="Recording label"
+                  value={recordingLabel}
+                  maxLength={120}
+                  placeholder="Bug reproduction"
+                  disabled={save.busy}
+                  onChange={(event) =>
+                    setRecordingLabel(event.currentTarget.value)
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') submitRecording()
+                  }}
+                />
+              </label>
+              <ActionError error={save.error} />
+              <div className="toolbar">
+                <button
+                  className="button filled"
+                  disabled={save.busy}
+                  onClick={submitRecording}
+                >
+                  {save.busy ? 'Saving…' : 'Save'}
+                </button>
+                <button
+                  className="button outlined"
+                  disabled={save.busy}
+                  onClick={() => setSaveOpen(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </Modal>
+          ) : null}
+          {recordingsOpen ? (
+            <Modal
+              title="Saved recordings"
+              onClose={() => setRecordingsOpen(false)}
+            >
+              <ActionError error={recordingsAction.error} />
+              {recordingsAction.busy && !recordings.length ? (
+                <p className="muted">Loading recordings…</p>
+              ) : recordings.length ? (
+                <div className="recording-list">
+                  {recordings.map((recording) => (
+                    <div className="recording-row" key={recording.id}>
+                      <div className="recording-info">
+                        <strong
+                          className="recording-label"
+                          title={recording.id}
+                        >
+                          {recording.label ?? recording.id}
+                        </strong>
+                        <span className="recording-meta">
+                          {recording.eventCount} events ·{' '}
+                          {formatBytes(recording.bytes)} ·{' '}
+                          <time
+                            dateTime={new Date(
+                              recording.createdAt,
+                            ).toISOString()}
+                          >
+                            {recordingTime(recording.createdAt)}
+                          </time>
+                        </span>
+                      </div>
+                      <div className="recording-actions">
+                        <a
+                          className="button outlined recording-download"
+                          href={recordingDownloadUrl(
+                            rpc.data.recordingsApiPath,
+                            recording.id,
+                          )}
+                          download={recording.id + '.json'}
+                        >
+                          Download
+                        </a>
+                        <ConfirmAction
+                          label="Delete"
+                          title="Delete this recording?"
+                          description={
+                            'This removes recording ' +
+                            (recording.label ?? recording.id) +
+                            ' from the server. Saved captures cannot be recovered.'
+                          }
+                          action={async () => {
+                            await deleteRecording(
+                              rpc.data.recordingsApiPath,
+                              recording.id,
+                            )
+                            await refreshRecordings()
+                          }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No saved recordings yet</p>
+              )}
+            </Modal>
+          ) : null}
         </div>
         {menuGroup && menuEvent ? (
           <div
@@ -691,6 +857,19 @@ function clock(timestamp: number): string {
     pad(date.getSeconds()) +
     '.' +
     pad(date.getMilliseconds(), 3)
+  )
+}
+function recordingTime(timestamp: number): string {
+  const date = new Date(timestamp)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return (
+    date.getFullYear() +
+    '-' +
+    pad(date.getMonth() + 1) +
+    '-' +
+    pad(date.getDate()) +
+    ' ' +
+    clock(timestamp)
   )
 }
 function EventDetail(props: {

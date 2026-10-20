@@ -22,6 +22,8 @@ export interface MtprotoDebugData {
   capturing: boolean
   /** Same-origin paginated capture endpoint; history is never broadcast. */
   apiPath: string
+  /** Same-origin endpoint for saving, listing, downloading and deleting recordings. */
+  recordingsApiPath: string
   dropped: number
   maxEvents: number
   /**
