@@ -117,6 +117,13 @@ export default function CapturePage(props: PageProps) {
     window.addEventListener('keydown', key)
     window.addEventListener('resize', close)
     window.addEventListener('scroll', close, true)
+    requestAnimationFrame(() =>
+      menuRef.current
+        ?.querySelector<HTMLButtonElement>(
+          '.capture-menu-item:not(:disabled)',
+        )
+        ?.focus(),
+    )
     return () => {
       window.removeEventListener('pointerdown', outside)
       window.removeEventListener('keydown', key)
@@ -176,8 +183,12 @@ export default function CapturePage(props: PageProps) {
     }
   }
   const menuGroup = menu ? groups.get(menu.id) : undefined
-  const menuEvent = menuGroup?.event
-  const menuResult = menuGroup?.result
+  const menuEvent = menu
+    ? (capture.details.get(menu.id) ?? menuGroup?.event)
+    : undefined
+  const menuResult =
+    menuGroup?.result &&
+    (capture.details.get(menuGroup.result.id) ?? menuGroup.result)
   const selected = expanded === undefined ? undefined : groups.get(expanded)
   const result = selected?.result
   const detail =

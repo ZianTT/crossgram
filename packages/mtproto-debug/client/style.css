@@ -338,3 +338,12 @@
     box-shadow: 0 8px 24px rgb(0 0 0 / 0.2);
   }
 }
+
+@layer components {
+  .filter-chip {
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
