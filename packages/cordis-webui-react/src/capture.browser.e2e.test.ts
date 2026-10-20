@@ -92,6 +92,9 @@ describe('React capture with the real MTProto capture backend', () => {
       )
       await page.goto(ctx.server.baseUrl)
       await waitForConnection(page)
+      await page
+        .context()
+        .grantPermissions(['clipboard-read', 'clipboard-write'])
       expect(requests).toEqual([])
       expect(frames.join('')).not.toContain('ON_DEMAND_ONLY_')
       await openPage(page, 'MTProto capture')
@@ -110,6 +113,25 @@ describe('React capture with the real MTProto capture backend', () => {
       expect(await page.locator('.capture-row').count()).toBeLessThanOrEqual(
         100,
       )
+      // Right-click opens the DevTools-style context menu; filters live in it.
+      await page.locator('.capture-row').first().click({ button: 'right' })
+      await page.getByRole('menu', { name: 'Event actions' }).waitFor()
+      await page.getByRole('menuitem', { name: 'Copy method name' }).click()
+      await page.getByText('Copied method name').waitFor()
+      await page.locator('.capture-row').first().click({ button: 'right' })
+      await page.getByRole('menuitem', { name: 'Filter this connection' }).click()
+      await expect
+        .poll(() => page.locator('.filter-chip').allTextContents())
+        .toEqual(expect.arrayContaining([expect.stringContaining('Conn:')]))
+      await page.getByRole('button', { name: /^Filters/ }).click()
+      await page.getByRole('button', { name: 'Clear all filters' }).click()
+      await expect
+        .poll(() => page.locator('.filter-chip').count())
+        .toBe(0)
+      await page.locator('.capture-row').first().click({ button: 'right' })
+      await page.getByRole('menuitem', { name: 'Copy method name' }).click()
+      await page.getByText('Copied method name').waitFor()
+      await page.getByRole('button', { name: 'Close details' }).click()
       await page
         .locator('.capture-row-header')
         .filter({ hasText: 'messages.getHistory' })
