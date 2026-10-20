@@ -80,6 +80,14 @@ export default function CapturePage(props: PageProps) {
     )
       void capture.load('older')
   }
+  useEffect(() => {
+    // A filtered result can be shorter than the viewport; fill it so the scroll
+    // handler has a chance to continue paging.
+    const element = list.current
+    if (!element || capture.loading || !capture.snapshot?.hasOlder) return
+    if (element.scrollHeight <= element.clientHeight + 1)
+      void capture.load('older')
+  }, [capture.events.length, capture.loading, capture.snapshot?.hasOlder])
   return (
     <>
       <ActionError error={action.error || capture.error} />
