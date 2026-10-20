@@ -10,7 +10,6 @@ import {
   ActionError,
   LiveContent,
   Modal,
-  PageHeader,
   useAction,
   useAsync,
 } from '../components.js'
@@ -26,6 +25,7 @@ export default function DatabasePage(props: PageProps) {
     field: string
     direction: 'asc' | 'desc'
   }>()
+  const [schema, setSchema] = useState(false)
   const [editing, setEditing] = useState<{
     table: TableInfo
     row: any
@@ -50,6 +50,7 @@ export default function DatabasePage(props: PageProps) {
     [rpc.ready, table, offset, size, sort],
   )
   const snapshot = result.error ? undefined : result.data
+  const total = snapshot?.total ?? 0
   const chooseTable = (value: string) => {
     setTable(value)
     setOffset(0)
@@ -57,24 +58,39 @@ export default function DatabasePage(props: PageProps) {
   }
   return (
     <>
-      <PageHeader
-        title="Database"
-        description="Browse your data. Make precise, deliberate changes."
-        actions={
-          <button
-            className="button outlined"
-            disabled={!rpc.ready || result.loading}
-            onClick={() => void result.reload()}
-          >
-            Refresh
-          </button>
-        }
-      />
       <LiveContent ready={rpc.ready}>
-        <div className="panel stack">
-          <div className="toolbar">
+        <div className="workbench database-workbench">
+          <header className="workbench-header">
+            <h1>Database</h1>
+            <span className="workbench-sub">
+              {table || 'No tables'}
+              {snapshot ? ` · ${total} rows` : ''}
+              {current
+                ? ' · primary key ' +
+                  (current.primary.join(', ') || 'none (read-only)')
+                : ''}
+              {result.loading ? ' · reading…' : ''}
+            </span>
+            <div className="workbench-actions">
+              <button
+                className="button outlined"
+                disabled={!current}
+                onClick={() => setSchema(true)}
+              >
+                Schema
+              </button>
+              <button
+                className="button outlined"
+                disabled={!rpc.ready || result.loading}
+                onClick={() => void result.reload()}
+              >
+                Refresh
+              </button>
+            </div>
+          </header>
+          <div className="workbench-toolbar">
             <label className="field">
-              <span>Table</span>
+              <span className="sr-only">Table</span>
               <select
                 aria-label="Table"
                 value={table}
@@ -88,7 +104,7 @@ export default function DatabasePage(props: PageProps) {
               </select>
             </label>
             <label className="field">
-              <span>Rows per page</span>
+              <span className="sr-only">Rows per page</span>
               <select
                 aria-label="Rows per page"
                 value={String(size)}
@@ -104,108 +120,107 @@ export default function DatabasePage(props: PageProps) {
                 ))}
               </select>
             </label>
-            <span className="chip">{snapshot?.total ?? 0} rows</span>
+            <span className="chip">{total} rows</span>
+            {current ? (
+              <span className="muted">
+                {current.fields.length} columns · click a cell to edit
+              </span>
+            ) : null}
           </div>
           <ActionError error={result.error ? String(result.error) : ''} />
-          {!result.loading ? (
-            <>
+          <div className="workbench-body">
+            <div className="workbench-scroll">
               {current ? (
-                <div
-                  className="table-scroll"
-                  tabIndex={0}
-                  aria-label="Database rows"
-                >
-                  <table>
-                    <thead>
-                      <tr>
-                        {current.fields.map((field) => (
-                          <th
-                            key={field.name}
-                            aria-sort={
-                              sort?.field === field.name
-                                ? sort?.direction === 'asc'
-                                  ? 'ascending'
-                                  : 'descending'
-                                : 'none'
-                            }
+                <table className="workbench-table database-table">
+                  <thead>
+                    <tr>
+                      {current.fields.map((field) => (
+                        <th
+                          key={field.name}
+                          aria-sort={
+                            sort?.field === field.name
+                              ? sort?.direction === 'asc'
+                                ? 'ascending'
+                                : 'descending'
+                              : 'none'
+                          }
+                        >
+                          <button
+                            className="table-sort"
+                            onClick={() => {
+                              setOffset(0)
+                              setSort({
+                                field: field.name,
+                                direction:
+                                  sort?.field === field.name &&
+                                  sort?.direction === 'asc'
+                                    ? 'desc'
+                                    : 'asc',
+                              })
+                            }}
                           >
-                            <button
-                              className="table-sort"
-                              onClick={() => {
-                                setOffset(0)
-                                setSort({
-                                  field: field.name,
-                                  direction:
-                                    sort?.field === field.name &&
-                                    sort?.direction === 'asc'
-                                      ? 'desc'
-                                      : 'asc',
-                                })
-                              }}
-                            >
-                              {field.primary ? '⌑ ' : ''}
-                              {field.name}
-                              <small>{field.type}</small>
-                            </button>
-                          </th>
+                            {field.primary ? '⌑ ' : ''}
+                            {field.name}
+                            <small>{field.type}</small>
+                          </button>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(snapshot?.rows ?? []).map((row, index) => (
+                      <tr key={index}>
+                        {current.fields.map((field) => (
+                          <td key={field.name}>
+                            {!field.primary &&
+                            field.type !== 'expr' &&
+                            current.primary.length ? (
+                              <button
+                                className="cell-edit"
+                                disabled={connection.status !== 'connected'}
+                                aria-label={
+                                  'Edit ' +
+                                  field.name +
+                                  ' in row ' +
+                                  current.primary
+                                    .map((key) => displayValue(row[key]))
+                                    .join(', ')
+                                }
+                                onClick={() =>
+                                  setEditing({
+                                    table: current,
+                                    row,
+                                    field,
+                                  })
+                                }
+                              >
+                                {displayValue(row[field.name]).slice(0, 240)}
+                              </button>
+                            ) : (
+                              <span title={displayValue(row[field.name])}>
+                                {displayValue(row[field.name]).slice(0, 240)}
+                              </span>
+                            )}
+                          </td>
                         ))}
                       </tr>
-                    </thead>
-                    <tbody>
-                      {(snapshot?.rows ?? []).map((row, index) => (
-                        <tr key={index}>
-                          {current.fields.map((field) => (
-                            <td key={field.name}>
-                              {!field.primary &&
-                              field.type !== 'expr' &&
-                              current.primary.length ? (
-                                <button
-                                  className="cell-edit"
-                                  disabled={connection.status !== 'connected'}
-                                  aria-label={
-                                    'Edit ' +
-                                    field.name +
-                                    ' in row ' +
-                                    current.primary
-                                      .map((key) => displayValue(row[key]))
-                                      .join(', ')
-                                  }
-                                  onClick={() =>
-                                    setEditing({
-                                      table: current,
-                                      row,
-                                      field,
-                                    })
-                                  }
-                                >
-                                  {displayValue(row[field.name]).slice(0, 240)}
-                                </button>
-                              ) : (
-                                <span title={displayValue(row[field.name])}>
-                                  {displayValue(row[field.name]).slice(0, 240)}
-                                </span>
-                              )}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                    ))}
+                  </tbody>
+                </table>
               ) : null}
-              {!snapshot?.rows.length ? (
+              {!result.loading && !snapshot?.rows.length ? (
                 <p className="empty-note">
-                  <Icon name="database" size={16} />
-                  No rows in this table.
+                  <Icon name="database" size={16} /> No rows in this table.
                 </p>
               ) : null}
-            </>
-          ) : (
-            <div className="loading" role="status">
-              Reading this page…
+              {result.loading ? (
+                <p className="empty-note muted" role="status">
+                  Reading this page…
+                </p>
+              ) : null}
             </div>
-          )}
-          <div className="pagination">
+          </div>
+          <footer className="workbench-footer">
             <button
               className="button outlined"
               disabled={offset === 0 || result.loading}
@@ -213,56 +228,57 @@ export default function DatabasePage(props: PageProps) {
             >
               Previous page
             </button>
-            <span>Page {Math.floor(offset / size) + 1}</span>
+            <span>
+              Page {Math.floor(offset / size) + 1} · {total} rows
+            </span>
             <button
               className="button outlined"
-              disabled={
-                result.loading || offset + size >= (snapshot?.total ?? 0)
-              }
+              disabled={result.loading || offset + size >= total}
               onClick={() => setOffset(offset + size)}
             >
               Next page
             </button>
-          </div>
-          {current ? (
-            <details>
-              <summary>Table schema and primary keys</summary>
-              <p className="muted">
-                Primary key:{' '}
-                {current.primary.join(', ') || 'none; table is read-only'}
-              </p>
-              <div className="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Field</th>
-                      <th>Type</th>
-                      <th>Constraints</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {current.fields.map((field) => (
-                      <tr key={field.name}>
-                        <td>{field.name}</td>
-                        <td>{field.type}</td>
-                        <td>
-                          {[
-                            field.primary && 'Primary',
-                            field.unique && 'Unique',
-                            field.nullable && 'Nullable',
-                          ]
-                            .filter(Boolean)
-                            .join(' · ')}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </details>
-          ) : null}
+          </footer>
         </div>
       </LiveContent>
+      {schema && current ? (
+        <Modal
+          title="Table schema and primary keys"
+          onClose={() => setSchema(false)}
+        >
+          <p className="muted">
+            Primary key: {current.primary.join(', ') || 'none; table is read-only'}
+          </p>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Field</th>
+                  <th>Type</th>
+                  <th>Constraints</th>
+                </tr>
+              </thead>
+              <tbody>
+                {current.fields.map((field) => (
+                  <tr key={field.name}>
+                    <td>{field.name}</td>
+                    <td>{field.type}</td>
+                    <td>
+                      {[
+                        field.primary && 'Primary',
+                        field.unique && 'Unique',
+                        field.nullable && 'Nullable',
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Modal>
+      ) : null}
       {editing ? (
         <EditCell
           edit={editing}

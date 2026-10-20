@@ -24,38 +24,44 @@ export default function HttpPage(props: PageProps) {
   const compose = props.path === '/http/compose'
   return (
     <>
-      <PageHeader
-        title={compose ? 'Request studio' : 'Outbound traffic'}
-        description={
-          compose
-            ? 'Compose, send, and inspect requests through your server.'
-            : 'A live view of the requests your plugins make.'
-        }
-        actions={
-          <button
-            className="button tonal"
-            onClick={() =>
-              navigate(
-                connection.config.uiPath +
-                  (compose ? '/http/history' : '/http/compose'),
-              )
-            }
-          >
-            {compose ? 'View history' : 'Compose request'}
-          </button>
-        }
-      />
+      {compose ? (
+        <PageHeader
+          title="Request studio"
+          description="Compose, send, and inspect requests through your server."
+          actions={
+            <button
+              className="button tonal"
+              onClick={() =>
+                navigate(connection.config.uiPath + '/http/history')
+              }
+            >
+              View history
+            </button>
+          }
+        />
+      ) : null}
       <LiveContent ready={rpc.ready}>
         {compose ? (
           <HttpComposer proxy={rpc.data.proxyBaseUrl} ready={rpc.ready} />
         ) : (
-          <HttpHistory data={rpc.data} />
+          <HttpHistory
+            data={rpc.data}
+            onCompose={() =>
+              navigate(connection.config.uiPath + '/http/compose')
+            }
+          />
         )}
       </LiveContent>
     </>
   )
 }
-function HttpHistory({ data }: { data: Data }) {
+function HttpHistory({
+  data,
+  onCompose,
+}: {
+  data: Data
+  onCompose: () => void
+}) {
   const [search, setSearch] = useState(''),
     [page, setPage] = useState(0),
     [selected, setSelected] = useState<HistoryEntry>()
@@ -72,12 +78,24 @@ function HttpHistory({ data }: { data: Data }) {
     [history, search],
   )
   return (
-    <div className="panel stack">
-      <div className="toolbar">
+    <div className="workbench http-workbench">
+      <header className="workbench-header">
+        <h1>Outbound traffic</h1>
+        <span className="workbench-sub">
+          {history?.length ?? 0} requests · live view of what your plugins call
+        </span>
+        <div className="workbench-actions">
+          <button className="button tonal" onClick={onCompose}>
+            Compose request
+          </button>
+        </div>
+      </header>
+      <div className="workbench-toolbar">
         <label className="field grow">
-          <span>Search requests</span>
+          <span className="sr-only">Search requests</span>
           <input
             type="search"
+            aria-label="Search requests"
             value={search}
             onChange={(event) => {
               setSearch(event.currentTarget.value)
@@ -85,6 +103,7 @@ function HttpHistory({ data }: { data: Data }) {
             }}
           />
         </label>
+        <span className="chip">{rows.length} requests</span>
         <ConfirmAction
           label="Clear history"
           title="Clear outbound history?"
@@ -92,51 +111,53 @@ function HttpHistory({ data }: { data: Data }) {
           action={() => data.clear()}
         />
       </div>
-      <div className="table-scroll" tabIndex={0}>
-        <table>
-          <thead>
-            <tr>
-              <th>Method</th>
-              <th>Destination</th>
-              <th>Status</th>
-              <th>Duration</th>
-              <th>Received</th>
-            </tr>
-          </thead>
-          <tbody>
-            {pageSlice(rows, page).map((row) => (
-              <tr key={row.id}>
-                <td>
-                  <span className="chip">{row.method}</span>
-                </td>
-                <td>
-                  <button
-                    className="cell-edit truncate"
-                    title={row.url}
-                    onClick={() => setSelected(row)}
-                  >
-                    {row.url}
-                  </button>
-                </td>
-                <td>{row.wsStatus ?? (row.statusText || row.status)}</td>
-                <td>
-                  {row.endTime
-                    ? row.endTime - row.startTime + ' ms'
-                    : 'In progress'}
-                </td>
-                <td>{formatBytes(row.bytesIn)}</td>
+      <div className="workbench-body">
+        <div className="workbench-scroll">
+          <table className="workbench-table http-table">
+            <thead>
+              <tr>
+                <th>Method</th>
+                <th>Destination</th>
+                <th>Status</th>
+                <th className="cell-right">Duration</th>
+                <th className="cell-right">Received</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {pageSlice(rows, page).map((row) => (
+                <tr key={row.id}>
+                  <td>
+                    <span className="chip">{row.method}</span>
+                  </td>
+                  <td className="cell-grow">
+                    <button
+                      className="cell-edit"
+                      title={row.url}
+                      onClick={() => setSelected(row)}
+                    >
+                      {row.url}
+                    </button>
+                  </td>
+                  <td>{row.wsStatus ?? (row.statusText || row.status)}</td>
+                  <td className="cell-right">
+                    {row.endTime
+                      ? row.endTime - row.startTime + ' ms'
+                      : 'In progress'}
+                  </td>
+                  <td className="cell-right">{formatBytes(row.bytesIn)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!rows.length ? (
+            <p className="empty-note">
+              <Icon name="traffic" size={16} /> No outbound requests recorded
+              yet.
+            </p>
+          ) : null}
+        </div>
       </div>
-      {!rows.length ? (
-        <p className="empty-note">
-          <Icon name="traffic" size={16} />
-          No outbound requests recorded yet.
-        </p>
-      ) : null}
-      <div className="pagination">
+      <footer className="workbench-footer">
         <button
           className="button outlined"
           disabled={page === 0}
@@ -144,7 +165,9 @@ function HttpHistory({ data }: { data: Data }) {
         >
           Previous page
         </button>
-        <span>{rows.length} requests</span>
+        <span>
+          {rows.length} requests · page {page + 1}
+        </span>
         <button
           className="button outlined"
           disabled={(page + 1) * 50 >= rows.length}
@@ -152,7 +175,7 @@ function HttpHistory({ data }: { data: Data }) {
         >
           Next page
         </button>
-      </div>
+      </footer>
       {selected ? (
         <Modal
           title={selected.method + ' request'}

@@ -13,7 +13,6 @@ import {
   JsonView,
   LiveContent,
   Modal,
-  PageHeader,
   useAction,
   useAsync,
 } from '../components.js'
@@ -137,24 +136,29 @@ export default function LoaderPage(props: PageProps) {
     }
     return depth
   }
+  const configured = entries.length
+  const running = entries.filter((entry) => entry.state === 2).length
   return (
     <>
-      <PageHeader
-        title="Plugins"
-        description="A home for every part of your workspace."
-        actions={
-          <button
-            className="button filled"
-            disabled={connectionState.status !== 'connected'}
-            onClick={() => setAdding(true)}
-          >
-            Add plugin
-          </button>
-        }
-      />
       <ActionError error={action.error} />
       <LiveContent ready={rpc.ready}>
-        <div className="plugin-layout">
+        <div className="workbench plugin-workbench">
+          <header className="workbench-header">
+            <h1>Plugins</h1>
+            <span className="workbench-sub">
+              {configured} configured · {running} running
+            </span>
+            <div className="workbench-actions">
+              <button
+                className="button filled"
+                disabled={connectionState.status !== 'connected'}
+                onClick={() => setAdding(true)}
+              >
+                Add plugin
+              </button>
+            </div>
+          </header>
+          <div className="plugin-layout">
           <aside
             className={
               'panel plugin-list' + (selected && !browse ? ' collapsed' : '')
@@ -252,6 +256,7 @@ export default function LoaderPage(props: PageProps) {
               </div>
             )}
           </section>
+        </div>
         </div>
       </LiveContent>
       {adding ? (

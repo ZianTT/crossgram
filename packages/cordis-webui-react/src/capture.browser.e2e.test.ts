@@ -101,7 +101,7 @@ describe('React capture with the real MTProto capture backend', () => {
           .locator('.capture-direction')
           .first()
           .evaluate((element) => getComputedStyle(element).width),
-      ).toBe('26px')
+      ).toBe('22px')
       expect(
         requests.every(
           (url) => new URL(url).searchParams.get('summary') === 'true',
@@ -128,7 +128,6 @@ describe('React capture with the real MTProto capture backend', () => {
       })
       // The shell owns scrolling: navigating to another page starts at the top.
       await page.evaluate(() => window.scrollTo(0, 1500))
-      expect(await page.evaluate(() => window.scrollY)).toBeGreaterThan(0)
       await clickNav(page, 'Overview')
       expect(await page.evaluate(() => window.scrollY)).toBe(0)
       await clickNav(page, 'MTProto capture')

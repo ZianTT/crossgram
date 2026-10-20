@@ -156,7 +156,11 @@ export function LiveContent({
         Loading live data…
       </div>
     )
-  return <div className={ready ? undefined : 'data-stale'}>{children}</div>
+  return (
+    <div className={'live-content' + (ready ? '' : ' data-stale')}>
+      {children}
+    </div>
+  )
 }
 export interface ModalProps {
   title: string

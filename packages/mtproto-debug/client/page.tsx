@@ -7,7 +7,6 @@ import {
   ActionError,
   ConfirmAction,
   LiveContent,
-  PageHeader,
   useAction,
 } from 'cordis-webui-react/components'
 import { useCapturePages, type CaptureFilters } from './capture.js'
@@ -64,193 +63,281 @@ export default function CapturePage(props: PageProps) {
     url.searchParams.set('limit', '1')
     return url.href
   }
+  const dropped = capture.snapshot?.dropped ?? 0
+  const retained = capture.snapshot?.total ?? capture.events.length
+  const activeFilters =
+    !!filters.typeName || !!filters.excludeName || !!filters.grep
   return (
     <>
-      <PageHeader
-        title="MTProto capture"
-        description="Follow the conversation between your clients and the relay."
-        actions={
-          <>
-            <button
-              className="button filled"
-              disabled={action.busy || !rpc.ready}
-              onClick={() =>
-                void action.run(async () => {
-                  await (rpc.data.capturing
-                    ? rpc.data.pause()
-                    : rpc.data.start())
-                  await capture.load('latest')
-                })
-              }
-            >
-              {rpc.data.capturing ? 'Pause capture' : 'Start capture'}
-            </button>
-            <ConfirmAction
-              label="Clear capture"
-              title="Clear all captured events?"
-              description="The in-memory capture buffer will be cleared. This does not disconnect clients."
-              action={async () => {
-                await rpc.data.clear()
-                setExpanded(undefined)
-                capture.keepDetails([])
-                await capture.load('latest')
-              }}
-            />
-          </>
-        }
-      />
       <ActionError error={action.error || capture.error} />
       <LiveContent ready={rpc.ready}>
-        <section className="panel capture-panel">
-          <div className="capture-toolbar">
+        <div className="workbench capture-workbench">
+          <header className="workbench-header">
+            <h1>MTProto capture</h1>
+            <span className="workbench-sub">
+              {rpc.data.capturing ? 'Capturing' : 'Paused'} ·{' '}
+              {capture.events.length} shown / {retained} retained · {dropped}{' '}
+              dropped
+              {capture.loading ? ' · updating…' : ''}
+            </span>
+            <div className="workbench-actions">
+              <button
+                className="button tonal"
+                aria-pressed={capture.live}
+                onClick={() => capture.setLive(!capture.live)}
+              >
+                {capture.live ? 'Pause live' : 'Follow live'}
+              </button>
+              <button
+                className="button filled"
+                disabled={action.busy || !rpc.ready}
+                onClick={() =>
+                  void action.run(async () => {
+                    await (rpc.data.capturing
+                      ? rpc.data.pause()
+                      : rpc.data.start())
+                    await capture.load('latest')
+                  })
+                }
+              >
+                {rpc.data.capturing ? 'Pause capture' : 'Start capture'}
+              </button>
+              <ConfirmAction
+                label="Clear capture"
+                title="Clear all captured events?"
+                description="The in-memory capture buffer will be cleared. This does not disconnect clients."
+                action={async () => {
+                  await rpc.data.clear()
+                  setExpanded(undefined)
+                  capture.keepDetails([])
+                  await capture.load('latest')
+                }}
+              />
+            </div>
+          </header>
+          <div className="workbench-toolbar">
             <label className="field grow">
-              <span>Search captured events</span>
+              <span className="sr-only">Search captured events</span>
               <input
                 type="search"
                 value={filters.grep ?? ''}
-                placeholder="Method, payload text, connection…"
+                placeholder="Filter by method, payload text, connection…"
                 onChange={(event) =>
                   setFilter('grep', event.currentTarget.value)
                 }
               />
             </label>
-            <button
-              className="button tonal"
-              aria-pressed={capture.live}
-              onClick={() => capture.setLive(!capture.live)}
-            >
-              {capture.live ? 'Pause live view' : 'Follow latest'}
-            </button>
-          </div>
-          <div className="capture-status" role="status">
-            <span
-              className={
-                'status-dot' + (rpc.data.capturing ? ' online' : '')
+            <select
+              aria-label="Direction"
+              value={filters.direction ?? ''}
+              onChange={(event) =>
+                setFilter('direction', event.currentTarget.value)
               }
-            />
-            <span>{rpc.data.capturing ? 'Capturing' : 'Capture paused'}</span>
-            <span className="muted">
-              {capture.events.length} shown / {capture.snapshot?.total ?? 0}{' '}
-              retained · {capture.snapshot?.dropped ?? 0} dropped
-            </span>
-            {capture.loading ? (
-              <span className="muted">Updating…</span>
+            >
+              <option value="">All directions</option>
+              <option value="client->server">Client → server</option>
+              <option value="server->client">Server → client</option>
+            </select>
+            <select
+              aria-label="Phase"
+              value={filters.phase ?? ''}
+              onChange={(event) => setFilter('phase', event.currentTarget.value)}
+            >
+              <option value="">All phases</option>
+              <option>handshake</option>
+              <option>message</option>
+              <option>connection</option>
+            </select>
+            {filters.typeName || filters.excludeName ? (
+              <button
+                className="chip"
+                title="Clear the method type filter"
+                onClick={() =>
+                  setFilters((value) => ({
+                    ...value,
+                    typeName: '',
+                    excludeName: '',
+                  }))
+                }
+              >
+                {filters.typeName
+                  ? 'Only: ' + filters.typeName
+                  : 'Exclude: ' + filters.excludeName}{' '}
+                ×
+              </button>
+            ) : null}
+            {filters.connectionId || filters.since || filters.field ? (
+              <button
+                className="button outlined"
+                onClick={() =>
+                  setFilters((value) => ({
+                    ...value,
+                    connectionId: '',
+                    since: '',
+                    field: '',
+                  }))
+                }
+              >
+                Clear filters
+              </button>
             ) : null}
           </div>
-          <details className="capture-filters">
-            <summary>Advanced filters</summary>
-            <div className="capture-filter-grid">
-              <label className="field">
-                <span>Direction</span>
-                <select
-                  aria-label="Direction"
-                  value={filters.direction ?? ''}
-                  onChange={(event) =>
-                    setFilter('direction', event.currentTarget.value)
-                  }
-                >
-                  <option value="">Both directions</option>
-                  <option value="client->server">Client to server</option>
-                  <option value="server->client">Server to client</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>Phase</span>
-                <select
-                  aria-label="Phase"
-                  value={filters.phase ?? ''}
-                  onChange={(event) =>
-                    setFilter('phase', event.currentTarget.value)
-                  }
-                >
-                  <option value="">All phases</option>
-                  <option>handshake</option>
-                  <option>message</option>
-                  <option>connection</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>Connection ID</span>
-                <input
-                  value={filters.connectionId ?? ''}
-                  onChange={(event) =>
-                    setFilter('connectionId', event.currentTarget.value)
-                  }
-                />
-              </label>
-              <label className="field">
-                <span>Since</span>
-                <input
-                  placeholder="5m, 1h, or a timestamp"
-                  value={filters.since ?? ''}
-                  onChange={(event) =>
-                    setFilter('since', event.currentTarget.value)
-                  }
-                />
-              </label>
-              <label className="field">
-                <span>Exact payload field</span>
-                <input
-                  placeholder="payload.userId=123"
-                  value={filters.field ?? ''}
-                  onChange={(event) =>
-                    setFilter('field', event.currentTarget.value)
-                  }
-                />
-              </label>
+          <div className="workbench-body">
+            <div
+              className="workbench-scroll capture-list"
+              role="list"
+              aria-label="Captured MTProto events"
+            >
+              <table className="workbench-table capture-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Method</th>
+                    <th aria-label="Direction" />
+                    <th className="capture-col-conn">Connection</th>
+                    <th className="capture-col-phase">Phase</th>
+                    <th className="cell-right">Duration</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ids.map((id) => {
+                    const group = groups.get(id)!
+                    const event = capture.details.get(id) ?? group.event
+                    const result = group.result
+                      ? (capture.details.get(group.result.id) ?? group.result)
+                      : undefined
+                    const metrics = getRpcResultMetrics(event, result)
+                    return (
+                      <tr
+                        key={id}
+                        className={
+                          'capture-row' +
+                          (metrics?.state === 'error' ? ' rpc-error' : '')
+                        }
+                        aria-selected={expanded === id}
+                        onClick={(click) => {
+                          if ((click.target as HTMLElement).closest('button'))
+                            return
+                          toggle(id)
+                        }}
+                      >
+                        <td className="capture-time">
+                          <time
+                            dateTime={new Date(event.timestamp).toISOString()}
+                          >
+                            {clock(event.timestamp)}
+                          </time>
+                        </td>
+                        <td className="cell-grow capture-name">
+                          <button
+                            className="capture-row-header"
+                            aria-expanded={expanded === id}
+                            onClick={() => toggle(id)}
+                          >
+                            <span className="capture-row-title">
+                              <strong>{event.name}</strong>
+                            </span>
+                          </button>
+                        </td>
+                        <td>
+                          <span
+                            className="capture-direction"
+                            aria-hidden="true"
+                            title={
+                              event.direction === 'client->server'
+                                ? 'Client → server'
+                                : 'Server → client'
+                            }
+                          >
+                            <Icon
+                              name={
+                                event.direction === 'client->server'
+                                  ? 'arrowUpRight'
+                                  : 'arrowDownLeft'
+                              }
+                              size={12}
+                            />
+                          </span>
+                        </td>
+                        <td className="capture-col-conn">
+                          {event.connectionId}
+                        </td>
+                        <td className="capture-col-phase">{event.phase}</td>
+                        <td className="cell-right capture-duration">
+                          {metrics ? (
+                            <span
+                              className={
+                                metrics.state === 'error' ? 'capture-error' : ''
+                              }
+                            >
+                              {formatMs(metrics.durationMs)}
+                            </span>
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+              {!ids.length && !capture.loading ? (
+                <div className="capture-empty">
+                  <h3>No matching events</h3>
+                  <p className="muted">
+                    Start capture or adjust the filters. Payloads are fetched
+                    only when you open an event.
+                  </p>
+                </div>
+              ) : null}
             </div>
-          </details>
-          {filters.typeName || filters.excludeName ? (
-            <button
-              className="button outlined type-filter"
-              onClick={() =>
-                setFilters((value) => ({
-                  ...value,
-                  typeName: '',
-                  excludeName: '',
-                }))
-              }
-            >
-              {filters.typeName
-                ? 'Only: ' + filters.typeName
-                : 'Exclude: ' + filters.excludeName}{' '}
-              · clear
-            </button>
-          ) : null}
-          <div
-            className="capture-list"
-            role="list"
-            aria-label="Captured MTProto events"
-          >
-            {ids.map((id) => {
-              const group = groups.get(id)!
-              const event = capture.details.get(id) ?? group.event
-              const result = group.result
-                ? (capture.details.get(group.result.id) ?? group.result)
-                : undefined
-              return (
-                <CaptureRow
-                  key={id}
-                  event={event}
-                  result={result}
-                  expanded={expanded === id}
-                  toggle={() => toggle(id)}
-                  filter={filterType}
-                  rawLink={rawLink}
-                />
-              )
-            })}
-            {!ids.length && !capture.loading ? (
-              <div className="capture-empty">
-                <h3>No matching events</h3>
-                <p className="muted">
-                  Start capture or adjust your filters. Payloads are fetched
-                  only when you expand an event.
-                </p>
-              </div>
+            {expanded !== undefined && groups.get(expanded) ? (
+              <section
+                className="capture-inspector"
+                aria-label="Captured event details"
+              >
+                <header className="capture-inspector-header">
+                  <strong>{groups.get(expanded)!.event.name}</strong>
+                  <span className="muted">
+                    #{expanded} · {groups.get(expanded)!.event.connectionId} ·{' '}
+                    {clock(groups.get(expanded)!.event.timestamp)}
+                  </span>
+                  <button
+                    className="icon-button"
+                    aria-label="Close details"
+                    onClick={() => {
+                      setExpanded(undefined)
+                      capture.keepDetails([])
+                    }}
+                  >
+                    <Icon name="x" size={14} />
+                  </button>
+                </header>
+                <div className="capture-inspector-body">
+                  <EventDetail
+                    event={
+                      capture.details.get(expanded) ??
+                      groups.get(expanded)!.event
+                    }
+                    filter={filterType}
+                    rawLink={rawLink}
+                  />
+                  {groups.get(expanded)!.result ? (
+                    <EventDetail
+                      event={
+                        capture.details.get(
+                          groups.get(expanded)!.result!.id,
+                        ) ?? groups.get(expanded)!.result!
+                      }
+                      filter={filterType}
+                      rawLink={rawLink}
+                    />
+                  ) : null}
+                </div>
+              </section>
             ) : null}
           </div>
-          <div className="pagination capture-pagination">
+          <footer className="workbench-footer capture-footer">
             <button
               className="button outlined"
               disabled={
@@ -279,94 +366,28 @@ export default function CapturePage(props: PageProps) {
             >
               Newer
             </button>
-          </div>
-        </section>
+            <span>
+              {capture.events.length} events
+              {activeFilters ? ' · filtered' : ''}
+            </span>
+          </footer>
+        </div>
       </LiveContent>
     </>
   )
 }
-function CaptureRow(props: {
-  event: CapturedMtprotoEvent
-  result?: CapturedMtprotoEvent
-  expanded: boolean
-  toggle: () => void
-  filter: (mode: 'include' | 'exclude', name: string) => void
-  rawLink: (id: number) => string
-}) {
-  const metrics = getRpcResultMetrics(props.event, props.result)
+function clock(timestamp: number): string {
+  const date = new Date(timestamp)
+  const pad = (value: number, length = 2) =>
+    String(value).padStart(length, '0')
   return (
-    <article
-      role="listitem"
-      className={
-        'capture-row' +
-        (metrics?.state === 'error' ? ' rpc-error' : '') +
-        (props.expanded ? ' expanded' : '')
-      }
-    >
-      <button
-        className="capture-row-header"
-        aria-expanded={props.expanded}
-        onClick={props.toggle}
-      >
-        <span className="capture-direction" aria-hidden="true">
-          <Icon
-            name={
-              props.event.direction === 'client->server'
-                ? 'arrowUpRight'
-                : 'arrowDownLeft'
-            }
-            size={14}
-          />
-        </span>
-        <div className="capture-row-title">
-          <strong>{props.event.name}</strong>
-          <small>
-            {props.event.connectionId} ·{' '}
-            {props.event.direction === 'client->server'
-              ? 'Client → server'
-              : 'Server → client'}{' '}
-            · {props.event.phase}
-          </small>
-        </div>
-        <div className="capture-row-meta">
-          <time dateTime={new Date(props.event.timestamp).toISOString()}>
-            {new Date(props.event.timestamp).toLocaleTimeString()}
-          </time>
-          {metrics ? (
-            <span
-              className={'chip ' + (metrics.state === 'error' ? 'error' : '')}
-            >
-              {formatMs(metrics.durationMs)} · {metrics.state}
-            </span>
-          ) : null}
-        </div>
-        <Icon
-          name={props.expanded ? 'chevronDown' : 'chevronRight'}
-          size={15}
-        />
-      </button>
-      {props.result ? (
-        <p className="capture-result">
-          Result: <code>{props.result.name}</code>
-        </p>
-      ) : null}
-      {props.expanded ? (
-        <div className="capture-detail">
-          <EventDetail
-            event={props.event}
-            filter={props.filter}
-            rawLink={props.rawLink}
-          />
-          {props.result ? (
-            <EventDetail
-              event={props.result}
-              filter={props.filter}
-              rawLink={props.rawLink}
-            />
-          ) : null}
-        </div>
-      ) : null}
-    </article>
+    pad(date.getHours()) +
+    ':' +
+    pad(date.getMinutes()) +
+    ':' +
+    pad(date.getSeconds()) +
+    '.' +
+    pad(date.getMilliseconds(), 3)
   )
 }
 function EventDetail(props: {
@@ -379,6 +400,10 @@ function EventDetail(props: {
     <section className="stack event-detail">
       <div className="toolbar">
         <strong className="grow">{props.event.name}</strong>
+        <span className="chip">{props.event.phase}</span>
+        <span className="chip">
+          {props.event.direction === 'client->server' ? '↑' : '↓'}
+        </span>
         <button
           className="button outlined"
           onClick={() => props.filter('include', props.event.name)}
