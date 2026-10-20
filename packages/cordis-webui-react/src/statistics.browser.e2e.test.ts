@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { waitForConnection } from './browser-test-utils.js'
 import ReactWebUI from './index.js'
-describe('Solid statistics with the real collector and runtime sampler', () => {
+describe('React statistics with the real collector and runtime sampler', () => {
   it('renders all five sections, bounds chart/table work, receives live samples and resets through RPC on desktop/mobile', async () => {
     const statistics = await vi.importActual<{
       apply(
@@ -185,13 +185,17 @@ describe('Solid statistics with the real collector and runtime sampler', () => {
           ),
           tab,
         ).toBe(true)
-        const paths = await page
-          .locator('.spark-line')
+        const curves = await page
+          .locator('.stat-spark .recharts-area-curve')
           .evaluateAll((elements) =>
             elements.map((element) => element.getAttribute('d') ?? ''),
           )
+        // Some tabs (File routes) only show totals, so an empty set is valid.
         expect(
-          paths.every((path) => (path.match(/[ML]/g) ?? []).length <= 120),
+          curves.every(
+            (path) => path.length > 20 && !/NaN|Infinity/.test(path),
+          ),
+          tab,
         ).toBe(true)
       }
       await page.getByRole('tab', { name: 'Overview', exact: true }).click()

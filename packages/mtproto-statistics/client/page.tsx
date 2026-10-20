@@ -14,12 +14,12 @@ import {
   PageHeader,
 } from 'cordis-webui-react/components'
 import { displayValue } from 'cordis-webui-react/utils'
+import { DistributionChart, Sparkline, type ChartTone } from './chart.js'
 import {
   distributionSlices,
   formatMs,
   formatPercent,
   formatTimestamp,
-  sparkPath,
   uptime,
 } from './statistics-model.js'
 type Tab = 'overview' | 'rpc' | 'network' | 'files' | 'runtime'
@@ -145,12 +145,14 @@ export function StatisticsDashboard(props: {
               value={formatNumber(points.at(-1)?.rpcCount ?? 0)}
               detail={formatNumber(snapshot.rpc.count) + ' total calls'}
               values={values('rpcCount')}
+              format={formatNumber}
             />
             <Metric
               label="RPC P90"
               value={formatMs(snapshot.rpc.p90Ms)}
               detail={'P99 ' + formatMs(snapshot.rpc.p99Ms)}
               values={values('rpcP90Ms')}
+              format={formatMs}
               tone="tertiary"
             />
             <Metric
@@ -171,6 +173,7 @@ export function StatisticsDashboard(props: {
               values={points.map(
                 (point) => point.receivedBytes + point.sentBytes,
               )}
+              format={(value) => formatBytes(value) + '/s'}
             />
             <Metric
               label="Active connections"
@@ -180,6 +183,7 @@ export function StatisticsDashboard(props: {
                 ' lifetime connections'
               }
               values={values('activeConnections')}
+              format={formatNumber}
             />
             <Metric
               label="CPU"
@@ -190,6 +194,7 @@ export function StatisticsDashboard(props: {
                 '%'
               }
               values={values('cpuPercent')}
+              format={(value) => value.toFixed(1) + '%'}
               tone="tertiary"
             />
             <Metric
@@ -202,6 +207,7 @@ export function StatisticsDashboard(props: {
                 formatBytes(runtime.heapTotalBytes)
               }
               values={values('rssBytes')}
+              format={formatBytes}
             />
           </div>
           <StatsTable
@@ -611,26 +617,20 @@ function Metric(props: {
   value: string
   detail?: string
   values?: number[]
-  tone?: string
+  tone?: ChartTone
+  format?: (value: number) => string
 }) {
-  const path = useMemo(() => sparkPath(props.values ?? []), [props.values])
   return (
     <article className={'panel stat-metric tone-' + (props.tone ?? 'primary')}>
       <span className="eyebrow">{props.label}</span>
       <strong>{props.value}</strong>
       <p>{props.detail}</p>
-      {props.values?.length ? (
-        <svg
-          className="stat-spark"
-          viewBox="0 0 300 72"
-          preserveAspectRatio="none"
-          role="img"
-          aria-label={props.label + ' history'}
-        >
-          <path d={path + ' L300,72 L0,72 Z'} className="spark-fill" />
-          <path d={path} className="spark-line" />
-        </svg>
-      ) : null}
+      <Sparkline
+        values={props.values}
+        tone={props.tone}
+        label={props.label}
+        format={props.format}
+      />
     </article>
   )
 }
@@ -638,39 +638,10 @@ function Distribution(props: {
   title: string
   slices: { label: string; value: number }[]
 }) {
-  const total = props.slices.reduce(
-    (sum, slice) => sum + Math.max(0, slice.value),
-    0,
-  )
   return (
     <section className="panel stack">
       <h2>{props.title}</h2>
-      <div className="distribution-bars">
-        {props.slices
-          .filter((slice) => slice.value > 0)
-          .map((slice, index) => (
-            <div className="distribution-row" key={slice.label + ':' + index}>
-              <div>
-                <span title={slice.label}>{slice.label}</span>
-                <strong>
-                  {formatNumber(slice.value)}{' '}
-                  <small>
-                    {formatPercent(total ? slice.value / total : 0)}
-                  </small>
-                </strong>
-              </div>
-              <div className="distribution-track">
-                <span
-                  className={'distribution-tone-' + (index % 3)}
-                  style={{
-                    width: (total ? (slice.value / total) * 100 : 0) + '%',
-                  }}
-                />
-              </div>
-            </div>
-          ))}
-        {total ? null : <p className="muted">No observations yet.</p>}
-      </div>
+      <DistributionChart slices={props.slices} />
     </section>
   )
 }
