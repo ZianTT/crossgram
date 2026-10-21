@@ -106,8 +106,47 @@ describe('capture transport', () => {
     capture.keepDetails([])
     expect(capture.details.size).toBe(0)
   })
-  it('accumulates older pages while keeping live following enabled', async () => {
+  it('keeps an in-flight payload fetch alive when the window pages underneath it', async () => {
     const { capture } = harness()
+    await vi.advanceTimersByTimeAsync(0)
+    const first = capture.events[0]
+    let resolveDetail!: (value: Response) => void
+    transport.mockImplementation((url: string) => {
+      const params = new URL(url).searchParams
+      if (params.get('id'))
+        return new Promise<Response>((done) => {
+          resolveDetail = done
+        })
+      return Promise.resolve(
+        Response.json(
+          queryCapture(
+            { capturing: true, dropped: 0, maxEvents: 2000, events: rows },
+            parseCaptureQuery(params),
+          ),
+        ),
+      )
+    })
+    capture.keepDetails([first.id])
+    const pending = capture.loadDetails(first)
+    await vi.advanceTimersByTimeAsync(0)
+    await capture.load('older')
+    expect(capture.events[0].id).toBe(51)
+    resolveDetail(
+      Response.json(
+        queryCapture(
+          { capturing: true, dropped: 0, maxEvents: 2000, events: rows },
+          parseCaptureQuery(
+            new URLSearchParams({ id: String(first.id), limit: '1' }),
+          ),
+        ),
+      ),
+    )
+    await pending
+    expect(capture.details.get(first.id)?.payload).toEqual({
+      secret: 'payload-' + first.id,
+    })
+  })
+  it('accumulates older pages while keeping live following enabled', async () => {    const { capture } = harness()
     await vi.advanceTimersByTimeAsync(0)
     expect(capture.events).toHaveLength(100)
     await capture.load('older')

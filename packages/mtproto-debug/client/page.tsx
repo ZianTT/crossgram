@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -14,35 +15,50 @@ import {
   ConfirmAction,
   LiveContent,
   Modal,
+  Notice,
   formatBytes,
   useAction,
 } from 'cordis-webui-react/components'
 import { useCapturePages, type CaptureFilters } from './capture.js'
 import {
+  currentLogDownloadUrl,
   deleteRecording,
   listRecordings,
   recordingDownloadUrl,
   saveRecording,
-  type RecordingSummary,
+  type SavedLogs,
 } from './recordings.js'
 import { copyText, formatMs, sameOriginPath } from 'cordis-webui-react/utils'
+
+/** Distance from the bottom that still counts as "tailing the newest event". */
+const TAIL_BOTTOM_SLACK_PX = 24
+/** Distance from the top that starts loading the previous page of events. */
+const OLDER_TRIGGER_PX = 80
+
+type SaveMenu = { id: number, x: number, y: number }
+
 export default function CapturePage(props: PageProps) {
   const rpc = useRpc<MtprotoDebugData>(props.entryId)
   const action = useAction()
   const save = useAction()
-  const recordingsAction = useAction()
+  const logs = useAction()
   const [filters, setFilters] = useState<CaptureFilters>({})
   const [expanded, setExpanded] = useState<number | undefined>(undefined)
   const [pane, setPane] = useState<'event' | 'result'>('event')
   const [showFilters, setShowFilters] = useState(false)
   const [flash, setFlash] = useState('')
-  const [menu, setMenu] = useState<{ id: number; x: number; y: number }>()
+  const [menu, setMenu] = useState<SaveMenu>()
+  const [moreOpen, setMoreOpen] = useState(false)
+  const [clearOpen, setClearOpen] = useState(false)
   const [saveOpen, setSaveOpen] = useState(false)
-  const [recordingsOpen, setRecordingsOpen] = useState(false)
-  const [recordingLabel, setRecordingLabel] = useState('')
-  const [recordings, setRecordings] = useState<RecordingSummary[]>([])
+  const [logsOpen, setLogsOpen] = useState(false)
+  const [logName, setLogName] = useState('')
+  const [savedLogs, setSavedLogs] = useState<SavedLogs>()
+  const [follow, setFollow] = useState(true)
+  const [newCount, setNewCount] = useState(0)
   const list = useRef<HTMLDivElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const moreRef = useRef<HTMLDivElement>(null)
   const capture = useCapturePages(
     rpc.data.apiPath,
     filters,
@@ -56,7 +72,13 @@ export default function CapturePage(props: PageProps) {
       ),
     [capture.events],
   )
-  const ids = useMemo(() => [...groups.keys()].reverse(), [groups])
+  // The list tails the buffer: oldest event on top, newest at the bottom, so an
+  // arriving event never pushes what the operator is reading out of place.
+  const ids = useMemo(() => [...groups.keys()], [groups])
+  const newestId = ids.at(-1)
+  const followRef = useRef(follow)
+  const newestSeen = useRef<number | undefined>(undefined)
+  followRef.current = follow
   useEffect(() => {
     if (expanded !== undefined && !groups.has(expanded)) {
       setExpanded(undefined)
@@ -94,29 +116,62 @@ export default function CapturePage(props: PageProps) {
   }
   const filtersKey = JSON.stringify(filters)
   useEffect(() => {
-    // A new filter starts a new window; keep the list at the newest event.
-    list.current?.scrollTo({ top: 0 })
+    // A new filter starts a new window at the newest event.
+    setExpanded(undefined)
+    capture.keepDetails([])
+    setFollow(true)
+    setNewCount(0)
+    requestAnimationFrame(() => {
+      if (list.current) list.current.scrollTop = list.current.scrollHeight
+    })
+    // `capture` is a stable imperative handle; only the filter identity matters.
   }, [filtersKey])
+  const tailToLatest = useCallback(() => {
+    setFollow(true)
+    setNewCount(0)
+    requestAnimationFrame(() => {
+      const element = list.current
+      if (element) element.scrollTop = element.scrollHeight
+    })
+  }, [])
   const onScroll = () => {
     const element = list.current
-    if (!element || capture.loading || !capture.snapshot?.hasOlder) return
-    if (
-      element.scrollTop + element.clientHeight >=
-      element.scrollHeight - 240
-    )
-      void capture.load('older')
+    if (!element) return
+    const atBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight <=
+      TAIL_BOTTOM_SLACK_PX
+    if (atBottom !== followRef.current) {
+      followRef.current = atBottom
+      setFollow(atBottom)
+      if (atBottom) {
+        setNewCount(0)
+        newestSeen.current = newestId
+      } else newestSeen.current ??= newestId
+    }
+    if (element.scrollTop <= OLDER_TRIGGER_PX)
+      if (capture.snapshot?.hasOlder && !capture.loading) void capture.load('older')
   }
   useEffect(() => {
-    // A filtered result can be shorter than the viewport; fill it so the scroll
-    // handler has a chance to continue paging.
+    const element = list.current
+    if (!element || newestId === undefined) return
+    if (followRef.current) {
+      element.scrollTop = element.scrollHeight
+      newestSeen.current = newestId
+    } else if (newestSeen.current !== undefined) {
+      setNewCount(ids.filter((id) => id > newestSeen.current!).length)
+    }
+    // `ids` changes identity on every page, so scroll only when the tail moved.
+  }, [newestId])
+  useEffect(() => {
+    // A filtered window can be shorter than the viewport; keep paging so the
+    // scroll handler has somewhere to go.
     const element = list.current
     if (!element || capture.loading || !capture.snapshot?.hasOlder) return
-    if (element.scrollHeight <= element.clientHeight + 1)
-      void capture.load('older')
+    if (element.scrollHeight <= element.clientHeight + 1) void capture.load('older')
   }, [capture.events.length, capture.loading, capture.snapshot?.hasOlder])
   useEffect(() => {
     if (!flash) return
-    const timer = setTimeout(() => setFlash(''), 1800)
+    const timer = setTimeout(() => setFlash(''), 2200)
     return () => clearTimeout(timer)
   }, [flash])
   useEffect(() => {
@@ -128,10 +183,19 @@ export default function CapturePage(props: PageProps) {
     const key = (event: KeyboardEvent) => {
       if (event.key === 'Escape') close()
     }
+    // Opening the menu selects the event, which can resize the list and emit a
+    // scroll as the browser keeps the selected row in view. Ignore scrolls from
+    // that first layout, and only react to the list itself: scrolling inside the
+    // menu (a keyboard focus or a long menu) must not dismiss it.
+    const opened = performance.now()
+    const scrolled = () => {
+      if (performance.now() - opened > 150) close()
+    }
+    const target = list.current
     window.addEventListener('pointerdown', outside)
     window.addEventListener('keydown', key)
     window.addEventListener('resize', close)
-    window.addEventListener('scroll', close, true)
+    target?.addEventListener('scroll', scrolled)
     requestAnimationFrame(() =>
       menuRef.current
         ?.querySelector<HTMLButtonElement>(
@@ -143,9 +207,24 @@ export default function CapturePage(props: PageProps) {
       window.removeEventListener('pointerdown', outside)
       window.removeEventListener('keydown', key)
       window.removeEventListener('resize', close)
-      window.removeEventListener('scroll', close, true)
+      target?.removeEventListener('scroll', scrolled)
     }
   }, [menu])
+  useEffect(() => {
+    if (!moreOpen) return
+    const outside = (event: PointerEvent) => {
+      if (!moreRef.current?.contains(event.target as Node)) setMoreOpen(false)
+    }
+    const key = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMoreOpen(false)
+    }
+    window.addEventListener('pointerdown', outside)
+    window.addEventListener('keydown', key)
+    return () => {
+      window.removeEventListener('pointerdown', outside)
+      window.removeEventListener('keydown', key)
+    }
+  }, [moreOpen])
   const copy = async (label: string, value: string) => {
     try {
       await copyText(value)
@@ -155,40 +234,57 @@ export default function CapturePage(props: PageProps) {
     }
     setMenu(undefined)
   }
-  const refreshRecordings = async () => {
-    const loaded = await recordingsAction.run(() =>
+  const refreshLogs = async () => {
+    const loaded = await logs.run(() =>
       listRecordings(rpc.data.recordingsApiPath),
     )
-    if (loaded) setRecordings(loaded)
+    if (loaded) setSavedLogs(loaded)
   }
-  const submitRecording = () =>
+  useEffect(() => {
+    if (!rpc.ready) return
+    void refreshLogs()
+    // Load the saved-log index once per page, mostly for the header count.
+  }, [rpc.ready])
+  const openSave = (name?: string) => {
+    save.clear()
+    setLogName(name ?? '')
+    setSaveOpen(true)
+    if (!savedLogs) void refreshLogs()
+  }
+  const openMenuFor = (id: number, x: number, y: number) => {
+    if (expanded !== id) select(id)
+    setMoreOpen(false)
+    setMenu({ id, x, y })
+  }
+  const submitLog = () =>
     void save.run(async () => {
       const recording = await saveRecording(
         rpc.data.recordingsApiPath,
-        recordingLabel,
+        logName,
       )
       setSaveOpen(false)
-      setRecordingLabel('')
-      setFlash('Saved recording ' + recording.id)
-      await refreshRecordings()
+      setLogName('')
+      setFlash('Saved log ' + (recording.label ?? recording.fileName))
+      setLogsOpen(true)
+      await refreshLogs()
     })
-  const openRecordings = () => {
-    setRecordingsOpen(true)
-    void refreshRecordings()
+  const openLogs = () => {
+    logs.clear()
+    setLogsOpen(true)
+    void refreshLogs()
   }
-  const chips: { key: keyof CaptureFilters; label: string }[] = []
+  const total = capture.snapshot?.total ?? 0
+  const shown = capture.events.length
+  const maxEvents = rpc.data.maxEvents ?? 0
+  const dropped = rpc.data.dropped ?? 0
+  const recordingCount = savedLogs?.recordings.length ?? 0
+  const chips: { key: keyof CaptureFilters, label: string }[] = []
   if (filters.typeName)
     chips.push({ key: 'typeName', label: 'Only: ' + filters.typeName })
   if (filters.excludeName)
-    chips.push({
-      key: 'excludeName',
-      label: 'Exclude: ' + filters.excludeName,
-    })
+    chips.push({ key: 'excludeName', label: 'Exclude: ' + filters.excludeName })
   if (filters.connectionId)
-    chips.push({
-      key: 'connectionId',
-      label: 'Conn: ' + filters.connectionId,
-    })
+    chips.push({ key: 'connectionId', label: 'Connection: ' + filters.connectionId })
   if (filters.since)
     chips.push({ key: 'since', label: 'Since: ' + filters.since })
   if (filters.field)
@@ -233,81 +329,143 @@ export default function CapturePage(props: PageProps) {
       : selected
         ? (capture.details.get(selected.event.id) ?? selected.event)
         : undefined
+  const filtered = !!chips.length || !!filters.direction || !!filters.phase || !!filters.grep
   return (
     <>
-      <ActionError error={action.error || capture.error} />
+      <ActionError error={action.error} />
       <LiveContent ready={rpc.ready}>
         <div className="workbench capture-workbench">
-          <header className="workbench-header">
-            <h1>MTProto capture</h1>
-            <span className="workbench-sub">
-              {rpc.data.capturing ? 'Capturing' : 'Paused'}
-              {capture.loading ? ' · loading events…' : ''}
-            </span>
-            <div className="workbench-actions">
-              <button
-                className="button tonal"
-                aria-pressed={capture.live}
-                onClick={() => capture.setLive(!capture.live)}
+          <header className="workbench-header capture-header">
+            <div className="capture-heading">
+              <h1>MTProto capture</h1>
+              <span
+                className={
+                  'capture-state ' + (rpc.data.capturing ? 'live' : 'paused')
+                }
               >
-                {capture.live ? 'Pause live' : 'Follow live'}
-              </button>
+                <span className="capture-state-dot" aria-hidden="true" />
+                {rpc.data.capturing ? 'Capturing' : 'Capture paused'}
+              </span>
+            </div>
+            <span className="workbench-sub capture-metrics">
+              {total.toLocaleString()} retained
+              <span className="capture-dot" aria-hidden="true">·</span>
+              {maxEvents.toLocaleString()} max
+              <span className="capture-dot" aria-hidden="true">·</span>
+              {dropped.toLocaleString()} dropped
+            </span>
+            <div className="workbench-actions capture-actions">
               <button
                 className="button filled"
                 disabled={action.busy || !rpc.ready}
+                aria-label={
+                  rpc.data.capturing ? 'Pause capture' : 'Resume capture'
+                }
+                title={
+                  rpc.data.capturing
+                    ? 'Stop recording new events into the buffer'
+                    : 'Start recording events into the buffer'
+                }
                 onClick={() =>
                   void action.run(async () => {
                     await (rpc.data.capturing
                       ? rpc.data.pause()
                       : rpc.data.start())
                     await capture.load('latest')
+                    tailToLatest()
                   })
                 }
               >
-                {rpc.data.capturing ? 'Pause capture' : 'Start capture'}
-              </button>
-              <ConfirmAction
-                label="Clear capture"
-                title="Clear all captured events?"
-                description="The in-memory capture buffer will be cleared. This does not disconnect clients."
-                action={async () => {
-                  await rpc.data.clear()
-                  select(undefined)
-                  await capture.load('latest')
-                }}
+                <Icon
+                name={rpc.data.capturing ? 'pause' : 'play'}
+                size={12}
               />
+                <span className="capture-label">
+                  {rpc.data.capturing ? 'Pause capture' : 'Resume capture'}
+                </span>
+              </button>
               <button
                 className="button tonal"
-                disabled={!rpc.ready || !capture.snapshot?.total}
-                onClick={() => {
-                  save.clear()
-                  setSaveOpen(true)
-                }}
+                disabled={!rpc.ready || !total}
+                aria-label="Save log"
+                title={
+                  total
+                    ? 'Save the buffered events as a log on the server'
+                    : 'Nothing to save yet'
+                }
+                onClick={() => openSave()}
               >
-                Save recording
+                <Icon name="save" size={13} />
+                <span className="capture-label">Save log</span>
               </button>
               <button
                 className="button outlined"
                 disabled={!rpc.ready}
-                onClick={openRecordings}
+                aria-label="Saved logs"
+                title="Browse logs saved on the server"
+                onClick={openLogs}
               >
-                Recordings
+                <Icon name="logs" size={13} />
+                <span className="capture-label">Saved logs</span>
+                {recordingCount ? (
+                  <span className="capture-count" aria-hidden="true">
+                    {recordingCount}
+                  </span>
+                ) : null}
               </button>
+              <div className="capture-more" ref={moreRef}>
+                <button
+                  className="icon-button"
+                  aria-label="More capture actions"
+                  aria-haspopup="menu"
+                  aria-expanded={moreOpen}
+                  onClick={() => setMoreOpen(!moreOpen)}
+                >
+                  <Icon name="ellipsis" size={15} />
+                </button>
+                {moreOpen ? (
+                  <div className="capture-menu capture-menu-right" role="menu">
+                    <button
+                      className="capture-menu-item"
+                      role="menuitem"
+                      disabled={!total}
+                      onClick={() => {
+                        setMoreOpen(false)
+                        setClearOpen(true)
+                      }}
+                    >
+                      Clear capture buffer…
+                    </button>
+                    <button
+                      className="capture-menu-item"
+                      role="menuitem"
+                      onClick={() => {
+                        setMoreOpen(false)
+                        void capture.load('latest')
+                      }}
+                    >
+                      Reload newest events
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             </div>
           </header>
           <div className="workbench-toolbar capture-toolbar">
-            <label className="field grow">
-              <span className="sr-only">Search captured events</span>
+            <label className="field capture-search">
+              <Icon name="search" size={13} className="capture-search-icon" />
               <input
                 type="search"
+                aria-label="Filter captured events"
                 value={filters.grep ?? ''}
-                placeholder="Filter by method, payload text, connection…"
+                placeholder="Filter by method, payload, connection…"
                 onChange={(event) =>
                   setFilter('grep', event.currentTarget.value)
                 }
               />
             </label>
             <select
+              className="capture-select"
               aria-label="Direction"
               value={filters.direction ?? ''}
               onChange={(event) =>
@@ -319,37 +477,31 @@ export default function CapturePage(props: PageProps) {
               <option value="server->client">Server → client</option>
             </select>
             <select
+              className="capture-select"
               aria-label="Phase"
               value={filters.phase ?? ''}
               onChange={(event) => setFilter('phase', event.currentTarget.value)}
             >
               <option value="">All phases</option>
-              <option>handshake</option>
-              <option>message</option>
-              <option>connection</option>
+              <option value="handshake">Handshake</option>
+              <option value="message">Message</option>
+              <option value="connection">Connection</option>
             </select>
             <button
-              className="button outlined"
+              className={'button ' + (showFilters ? 'tonal' : 'outlined')}
               aria-expanded={showFilters}
+              aria-label="Filters"
               onClick={() => setShowFilters(!showFilters)}
             >
-              Filters{chips.length ? ' · ' + chips.length : ''}
+              <Icon name="filter" size={13} />
+              <span className="capture-label">
+                Filters{chips.length ? ' · ' + chips.length : ''}
+              </span>
             </button>
-            {chips.map((chip) => (
-              <button
-                key={chip.key}
-                className="chip filter-chip"
-                title={'Remove filter: ' + chip.label}
-                onClick={() => setFilter(chip.key, '')}
-              >
-                {chip.label} <span aria-hidden="true">×</span>
-              </button>
-            ))}
           </div>
           {showFilters ? (
             <div className="workbench-toolbar capture-filter-panel">
               <label className="field">
-                <span className="sr-only">Connection ID</span>
                 <input
                   aria-label="Connection ID"
                   placeholder="Connection ID"
@@ -360,7 +512,6 @@ export default function CapturePage(props: PageProps) {
                 />
               </label>
               <label className="field">
-                <span className="sr-only">Since</span>
                 <input
                   aria-label="Since"
                   placeholder="Since (5m, 1h, timestamp)"
@@ -371,7 +522,6 @@ export default function CapturePage(props: PageProps) {
                 />
               </label>
               <label className="field">
-                <span className="sr-only">Payload field</span>
                 <input
                   aria-label="Payload field"
                   placeholder="Field (payload.userId=123)"
@@ -381,16 +531,32 @@ export default function CapturePage(props: PageProps) {
                   }
                 />
               </label>
+              <span className="muted capture-filter-hint">
+                Filters apply live. Right-click an event to filter by its
+                method or connection.
+              </span>
+            </div>
+          ) : null}
+          {chips.length ? (
+            <div className="workbench-toolbar capture-chip-row">
+              {chips.map((chip) => (
+                <button
+                  key={chip.key}
+                  className="chip filter-chip"
+                  title={'Remove filter: ' + chip.label}
+                  aria-label={'Remove filter: ' + chip.label}
+                  onClick={() => setFilter(chip.key, '')}
+                >
+                  {chip.label}
+                  <Icon name="close" size={11} />
+                </button>
+              ))}
               <button
-                className="button outlined"
+                className="button outlined capture-chip-clear"
                 onClick={() => setFilters({})}
               >
-                Clear all filters
+                Clear filters
               </button>
-              <span className="muted">
-                Filters apply live. Method and connection filters are also in
-                each row's context menu.
-              </span>
             </div>
           ) : null}
           <div className="workbench-body capture-body">
@@ -406,12 +572,12 @@ export default function CapturePage(props: PageProps) {
               <table className="workbench-table capture-table">
                 <thead>
                   <tr>
-                    <th>Time</th>
+                    <th className="capture-col-time">Time</th>
                     <th>Method</th>
-                    <th aria-label="Direction" />
                     <th className="capture-col-conn">Connection</th>
-                    <th className="capture-col-phase">Phase</th>
-                    <th className="cell-right">Duration</th>
+                    <th className="cell-right capture-col-duration">
+                      Duration
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -437,19 +603,14 @@ export default function CapturePage(props: PageProps) {
                         }}
                         onContextMenu={(event) => {
                           event.preventDefault()
-                          if (expanded !== id) select(id)
-                          setMenu({
-                            id,
-                            x: event.clientX,
-                            y: event.clientY,
-                          })
+                          openMenuFor(id, event.clientX, event.clientY)
                         }}
                       >
                         <td className="capture-time">
                           <time
                             dateTime={new Date(event.timestamp).toISOString()}
                           >
-                            {clock(event.timestamp)}
+                            {formatClock(event.timestamp)}
                           </time>
                         </td>
                         <td className="cell-grow capture-name">
@@ -460,40 +621,59 @@ export default function CapturePage(props: PageProps) {
                               select(expanded === id ? undefined : id)
                             }
                           >
-                            <span className="capture-row-title">
-                              <strong>{event.name}</strong>
+                            <span
+                              className={
+                                'capture-direction ' +
+                                (event.direction === 'client->server'
+                                  ? 'outgoing'
+                                  : 'incoming')
+                              }
+                              aria-hidden="true"
+                              title={
+                                event.direction === 'client->server'
+                                  ? 'Client → server'
+                                  : 'Server → client'
+                              }
+                            >
+                              <Icon
+                                name={
+                                  event.direction === 'client->server'
+                                    ? 'arrowUpRight'
+                                    : 'arrowDownLeft'
+                                }
+                                size={12}
+                              />
                             </span>
+                            <strong>{event.name}</strong>
+                            {event.phase === 'message' ? null : (
+                              <span className="chip capture-phase">
+                                {event.phase}
+                              </span>
+                            )}
+                            {metrics?.state === 'error' ? (
+                              <span className="chip capture-badge-error">
+                                error
+                              </span>
+                            ) : null}
+                            {metrics?.state === 'slow' ? (
+                              <span className="chip capture-badge-slow">
+                                slow
+                              </span>
+                            ) : null}
                           </button>
                         </td>
-                        <td>
-                          <span
-                            className="capture-direction"
-                            aria-hidden="true"
-                            title={
-                              event.direction === 'client->server'
-                                ? 'Client → server'
-                                : 'Server → client'
-                            }
-                          >
-                            <Icon
-                              name={
-                                event.direction === 'client->server'
-                                  ? 'arrowUpRight'
-                                  : 'arrowDownLeft'
-                              }
-                              size={12}
-                            />
-                          </span>
-                        </td>
-                        <td className="capture-col-conn">
+                        <td className="capture-col-conn capture-conn">
                           {event.connectionId}
                         </td>
-                        <td className="capture-col-phase">{event.phase}</td>
                         <td className="cell-right capture-duration">
                           {metrics ? (
                             <span
                               className={
-                                metrics.state === 'error' ? 'capture-error' : ''
+                                metrics.state === 'error'
+                                  ? 'capture-error'
+                                  : metrics.state === 'slow'
+                                    ? 'capture-slow'
+                                    : undefined
                               }
                             >
                               {formatMs(metrics.durationMs)}
@@ -509,20 +689,67 @@ export default function CapturePage(props: PageProps) {
               </table>
               {!ids.length && !capture.loading ? (
                 <div className="capture-empty">
-                  <h3>No matching events</h3>
+                  <Icon
+                    name={total ? 'search' : 'terminal'}
+                    size={20}
+                    className="capture-empty-icon"
+                  />
+                  <h3>{total ? 'No events match' : 'Nothing captured yet'}</h3>
                   <p className="muted">
-                    Start capture or adjust the filters. Payloads are fetched
-                    only when you open an event.
+                    {total
+                      ? 'No event in the retained buffer matches the current filters.'
+                      : rpc.data.capturing
+                        ? 'Events show up here as soon as a client talks to the relay.'
+                        : 'Capture is paused, so nothing new is being recorded.'}
                   </p>
+                  {total && filtered ? (
+                    <button
+                      className="button outlined"
+                      onClick={() => setFilters({})}
+                    >
+                      Clear filters
+                    </button>
+                  ) : null}
+                  {!total && !rpc.data.capturing ? (
+                    <button
+                      className="button filled"
+                      onClick={() =>
+                        void action.run(async () => {
+                          await rpc.data.start()
+                          await capture.load('latest')
+                        })
+                      }
+                    >
+                      Resume capture
+                    </button>
+                  ) : null}
                 </div>
               ) : null}
               {capture.loading && ids.length ? (
-                <p className="capture-more muted" role="status">
-                  Loading older events…
+                <p className="capture-list-note muted" role="status">
+                  Loading events…
                 </p>
               ) : null}
               {!capture.snapshot?.hasOlder && ids.length ? (
-                <p className="capture-more muted">End of retained capture.</p>
+                <p className="capture-list-note muted">
+                  Start of retained capture
+                </p>
+              ) : null}
+              {!follow ? (
+                <button
+                  className="capture-jump"
+                  onClick={tailToLatest}
+                  aria-label={
+                    newCount
+                      ? newCount + ' new events, jump to latest'
+                      : 'Jump to latest events'
+                  }
+                >
+                  <Icon name="arrowDownLeft" size={13} />
+                  {newCount
+                    ? newCount + (newCount === 1 ? ' new event' : ' new events')
+                    : 'Jump to latest'}
+                </button>
               ) : null}
             </div>
             {selected && detail ? (
@@ -531,11 +758,36 @@ export default function CapturePage(props: PageProps) {
                 aria-label="Captured event details"
               >
                 <header className="capture-inspector-header">
-                  <strong>{detail.name}</strong>
-                  <span className="muted">
-                    #{detail.id} · {detail.connectionId} ·{' '}
-                    {clock(detail.timestamp)}
-                  </span>
+                  <a
+                    className="capture-inspector-name"
+                    href={rawLink(detail.id)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="Open the raw event JSON"
+                  >
+                    {detail.name}
+                    <Icon name="external" size={11} />
+                  </a>
+                  <div className="capture-inspector-meta">
+                    <span>#{detail.id}</span>
+                    <span>{formatClock(detail.timestamp)}</span>
+                    <span className="capture-conn">
+                      {detail.connectionId || 'no connection'}
+                    </span>
+                    {getRpcResultMetrics(
+                      selected.event,
+                      selected.result,
+                    ) ? (
+                      <span>
+                        {formatMs(
+                          getRpcResultMetrics(
+                            selected.event,
+                            selected.result,
+                          )!.durationMs,
+                        )}
+                      </span>
+                    ) : null}
+                  </div>
                   {selected.result ? (
                     <div
                       className="segmented capture-panes"
@@ -548,7 +800,7 @@ export default function CapturePage(props: PageProps) {
                         className={pane === 'event' ? 'selected' : undefined}
                         onClick={() => setPane('event')}
                       >
-                        Event
+                        Request
                       </button>
                       <button
                         role="tab"
@@ -569,59 +821,95 @@ export default function CapturePage(props: PageProps) {
                     aria-label="Close details"
                     onClick={() => select(undefined)}
                   >
-                    <Icon name="x" size={14} />
+                    <Icon name="close" size={14} />
                   </button>
                 </header>
                 <div className="capture-inspector-body">
                   <EventDetail
                     event={detail}
-                    filter={filterType}
-                    onConnection={(connectionId) =>
-                      setFilter('connectionId', connectionId)
-                    }
                     onCopy={(label, value) => void copy(label, value)}
+                    onMenu={(rect) =>
+                      openMenuFor(detail.id, rect.left, rect.bottom)
+                    }
                     rawLink={rawLink}
                   />
                 </div>
               </section>
             ) : null}
           </div>
+          <div className="workbench-footer capture-footer">
+            <span className="capture-footer-left">
+              {shown.toLocaleString()} of {total.toLocaleString()} events
+              {filtered ? ' (filtered)' : ''}
+            </span>
+            <span className="capture-footer-tail">
+              {capture.loading
+                ? 'Loading…'
+                : follow
+                  ? 'Tailing newest events'
+                  : 'Scrolled back · new events are kept'}
+            </span>
+          </div>
           {saveOpen ? (
             <Modal
-              title="Save recording"
+              title="Save log"
               onClose={() => {
                 if (!save.busy) setSaveOpen(false)
               }}
             >
               <p className="muted">
-                Saves all {capture.snapshot?.total ?? 0} buffered events to a
-                recording file on the server. Capture keeps running.
+                Writes all {total.toLocaleString()} buffered events to a JSON
+                log on the server. Capture keeps running while the log is
+                written.
               </p>
               <label className="field">
-                <span>Label (optional)</span>
+                <span>Log name (optional)</span>
                 <input
-                  aria-label="Recording label"
-                  value={recordingLabel}
+                  aria-label="Log name"
+                  value={logName}
                   maxLength={120}
-                  placeholder="Bug reproduction"
+                  placeholder="dialogs-bug"
                   disabled={save.busy}
-                  onChange={(event) =>
-                    setRecordingLabel(event.currentTarget.value)
-                  }
+                  onChange={(event) => setLogName(event.currentTarget.value)}
                   onKeyDown={(event) => {
-                    if (event.key === 'Enter') submitRecording()
+                    if (event.key === 'Enter') submitLog()
                   }}
                 />
+                <small className="field-hint">
+                  Used in the file name; a timestamp keeps names unique.
+                </small>
               </label>
+              <dl className="capture-facts">
+                <div>
+                  <dt>Events</dt>
+                  <dd>{total.toLocaleString()}</dd>
+                </div>
+                <div>
+                  <dt>Server folder</dt>
+                  <dd>
+                    <code>{savedLogs?.directory ?? 'Loading…'}</code>
+                  </dd>
+                </div>
+              </dl>
               <ActionError error={save.error} />
               <div className="toolbar">
                 <button
                   className="button filled"
-                  disabled={save.busy}
-                  onClick={submitRecording}
+                  disabled={save.busy || !total}
+                  onClick={submitLog}
                 >
-                  {save.busy ? 'Saving…' : 'Save'}
+                  {save.busy ? 'Saving…' : 'Save on server'}
                 </button>
+                <a
+                  className="button tonal"
+                  href={currentLogDownloadUrl(
+                    rpc.data.recordingsApiPath,
+                    logName,
+                  )}
+                >
+                  <Icon name="download" size={13} />
+                  Download
+                </a>
                 <button
                   className="button outlined"
                   disabled={save.busy}
@@ -632,74 +920,175 @@ export default function CapturePage(props: PageProps) {
               </div>
             </Modal>
           ) : null}
-          {recordingsOpen ? (
+          {logsOpen ? (
             <Modal
-              title="Saved recordings"
-              onClose={() => setRecordingsOpen(false)}
+              title="Saved logs"
+              onClose={() => setLogsOpen(false)}
+              className="capture-logs-modal"
             >
-              <ActionError error={recordingsAction.error} />
-              {recordingsAction.busy && !recordings.length ? (
-                <p className="muted">Loading recordings…</p>
-              ) : recordings.length ? (
+              <p className="muted capture-logs-note">
+                {savedLogs?.directory
+                  ? 'Stored on the server in '
+                  : 'Saved capture logs live on the server'}
+                {savedLogs?.directory ? (
+                  <code>{savedLogs.directory}</code>
+                ) : null}
+              </p>
+              <ActionError error={logs.error} />
+              {logs.busy && !savedLogs ? (
+                <p className="muted">Loading saved logs…</p>
+              ) : savedLogs?.recordings.length ? (
                 <div className="recording-list">
-                  {recordings.map((recording) => (
-                    <div className="recording-row" key={recording.id}>
-                      <div className="recording-info">
-                        <strong
-                          className="recording-label"
-                          title={recording.id}
-                        >
-                          {recording.label ?? recording.id}
-                        </strong>
-                        <span className="recording-meta">
-                          {recording.eventCount} events ·{' '}
-                          {formatBytes(recording.bytes)} ·{' '}
-                          <time
-                            dateTime={new Date(
-                              recording.createdAt,
-                            ).toISOString()}
+                  {savedLogs.recordings.map((recording) => {
+                    const name = recording.label ?? recording.fileName
+                    return (
+                      <div className="recording-row" key={recording.id}>
+                        <div className="recording-info">
+                          <strong className="recording-label" title={recording.id}>
+                            {name}
+                          </strong>
+                          <span className="recording-meta">
+                            {recording.label ? (
+                              <>
+                                <code>{recording.fileName}</code>
+                                <span aria-hidden="true"> · </span>
+                              </>
+                            ) : null}
+                            {recording.eventCount.toLocaleString()} events
+                            <span aria-hidden="true"> · </span>
+                            {formatBytes(recording.bytes)}
+                            <span aria-hidden="true"> · </span>
+                            <time
+                              dateTime={new Date(
+                                recording.createdAt,
+                              ).toISOString()}
+                            >
+                              {formatLogTime(recording.createdAt)}
+                            </time>
+                          </span>
+                        </div>
+                        <div className="recording-actions">
+                          <button
+                            className="icon-button"
+                            aria-label={'Copy file path for ' + name}
+                            title="Copy file path"
+                            onClick={() =>
+                              void copy(
+                                'file path',
+                                joinPath(
+                                  savedLogs.directory,
+                                  recording.fileName,
+                                ),
+                              )
+                            }
                           >
-                            {recordingTime(recording.createdAt)}
-                          </time>
-                        </span>
-                      </div>
-                      <div className="recording-actions">
-                        <a
-                          className="button outlined recording-download"
-                          href={recordingDownloadUrl(
-                            rpc.data.recordingsApiPath,
-                            recording.id,
-                          )}
-                          download={recording.id + '.json'}
-                        >
-                          Download
-                        </a>
-                        <ConfirmAction
-                          label="Delete"
-                          title="Delete this recording?"
-                          description={
-                            'This removes recording ' +
-                            (recording.label ?? recording.id) +
-                            ' from the server. Saved captures cannot be recovered.'
-                          }
-                          action={async () => {
-                            await deleteRecording(
+                            <Icon name="copy" size={13} />
+                          </button>
+                          <a
+                            className="button outlined recording-download"
+                            href={recordingDownloadUrl(
                               rpc.data.recordingsApiPath,
                               recording.id,
-                            )
-                            await refreshRecordings()
-                          }}
-                        />
+                            )}
+                            download={recording.fileName}
+                            aria-label={'Download ' + name}
+                          >
+                            Download
+                          </a>
+                          <ConfirmAction
+                            label="Delete"
+                            title="Delete this log?"
+                            description={
+                              'This removes ' +
+                              recording.fileName +
+                              ' from the server. Saved logs cannot be recovered.'
+                            }
+                            action={async () => {
+                              await deleteRecording(
+                                rpc.data.recordingsApiPath,
+                                recording.id,
+                              )
+                              await refreshLogs()
+                            }}
+                          />
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               ) : (
-                <p className="muted">No saved recordings yet</p>
+                <div className="capture-empty capture-empty-inline">
+                  <Icon name="save" size={18} className="capture-empty-icon" />
+                  <h3>No saved logs yet</h3>
+                  <p className="muted">
+                    Save the capture buffer to keep it after the in-memory
+                    window is cleared or the relay restarts.
+                  </p>
+                </div>
               )}
+              <div className="toolbar">
+                <button
+                  className="button outlined"
+                  disabled={logs.busy}
+                  onClick={() => void refreshLogs()}
+                >
+                  <Icon name="refresh" size={13} />
+                  Refresh
+                </button>
+                <button
+                  className="button filled"
+                  disabled={!total}
+                  onClick={() => {
+                    setLogsOpen(false)
+                    openSave()
+                  }}
+                >
+                  Save current buffer
+                </button>
+              </div>
+            </Modal>
+          ) : null}
+          {clearOpen ? (
+            <Modal
+              title="Clear capture buffer?"
+              onClose={() => setClearOpen(false)}
+            >
+              <p>
+                Drops the {total.toLocaleString()} buffered events. Connected
+                clients stay connected and capture keeps running.
+              </p>
+              <div className="toolbar">
+                <button
+                  className="button danger"
+                  disabled={action.busy}
+                  onClick={() =>
+                    void action.run(async () => {
+                      await rpc.data.clear()
+                      select(undefined)
+                      setClearOpen(false)
+                      setNewCount(0)
+                      await capture.load('latest')
+                    })
+                  }
+                >
+                  {action.busy ? 'Clearing…' : 'Clear capture'}
+                </button>
+                <button
+                  className="button outlined"
+                  disabled={action.busy}
+                  onClick={() => setClearOpen(false)}
+                >
+                  Cancel
+                </button>
+              </div>
             </Modal>
           ) : null}
         </div>
+        {capture.error ? (
+          <div className="capture-error-toast">
+            <Notice tone="error">{capture.error}</Notice>
+          </div>
+        ) : null}
         {menuGroup && menuEvent ? (
           <div
             ref={menuRef}
@@ -707,8 +1096,8 @@ export default function CapturePage(props: PageProps) {
             role="menu"
             aria-label="Event actions"
             style={{
-              left: Math.min(menu!.x, globalThis.innerWidth - 240),
-              top: Math.min(menu!.y, globalThis.innerHeight - 320),
+              left: Math.min(menu!.x, globalThis.innerWidth - 248),
+              top: Math.min(menu!.y, globalThis.innerHeight - 340),
             }}
             onKeyDown={(event) => {
               if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
@@ -739,6 +1128,7 @@ export default function CapturePage(props: PageProps) {
             <button
               className="capture-menu-item"
               role="menuitem"
+              disabled={!menuEvent.connectionId}
               onClick={() => void copy('connection ID', menuEvent.connectionId)}
             >
               Copy connection ID
@@ -809,9 +1199,9 @@ export default function CapturePage(props: PageProps) {
                 setMenu(undefined)
               }}
             >
-              Filter this connection
+              Only this connection
             </button>
-            {chips.length ? (
+            {filtered ? (
               <button
                 className="capture-menu-item"
                 role="menuitem"
@@ -845,21 +1235,22 @@ export default function CapturePage(props: PageProps) {
     </>
   )
 }
-function clock(timestamp: number): string {
+
+export function joinPath(directory: string, fileName: string): string {
+  const separator = directory.includes('\\') ? '\\' : '/'
+  return directory.replace(/[\\/]+$/, '') + separator + fileName
+}
+
+export function formatClock(timestamp: number, withMillis = true): string {
   const date = new Date(timestamp)
   const pad = (value: number, length = 2) =>
     String(value).padStart(length, '0')
-  return (
-    pad(date.getHours()) +
-    ':' +
-    pad(date.getMinutes()) +
-    ':' +
-    pad(date.getSeconds()) +
-    '.' +
-    pad(date.getMilliseconds(), 3)
-  )
+  const base =
+    pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds())
+  return withMillis ? base + '.' + pad(date.getMilliseconds(), 3) : base
 }
-function recordingTime(timestamp: number): string {
+
+export function formatLogTime(timestamp: number): string {
   const date = new Date(timestamp)
   const pad = (value: number) => String(value).padStart(2, '0')
   return (
@@ -869,48 +1260,31 @@ function recordingTime(timestamp: number): string {
     '-' +
     pad(date.getDate()) +
     ' ' +
-    clock(timestamp)
+    formatClock(timestamp, false)
   )
 }
+
 function EventDetail(props: {
   event: CapturedMtprotoEvent
-  filter: (mode: 'include' | 'exclude', name: string) => void
-  onConnection: (connectionId: string) => void
   onCopy: (label: string, value: string) => void
+  onMenu: (rect: { left: number, bottom: number }) => void
   rawLink: (id: number) => string
 }) {
+  const fields = [
+    ['Event', props.event.id],
+    ['Message', props.event.messageId],
+    ['Request', props.event.requestMessageId],
+    ['Sequence', props.event.seqNo],
+    ['Session', props.event.sessionId],
+    ['Auth key', props.event.authKeyId],
+  ].filter(([, value]) => value !== undefined && value !== null && value !== '')
   return (
     <section className="event-detail">
       <div className="event-detail-toolbar">
         <button
-          className="button outlined"
-          onClick={() => props.filter('include', props.event.name)}
-        >
-          Only this type
-        </button>
-        <button
-          className="button outlined"
-          onClick={() => props.filter('exclude', props.event.name)}
-        >
-          Exclude this type
-        </button>
-        <button
-          className="button outlined"
-          disabled={!props.event.connectionId}
-          onClick={() => props.onConnection(props.event.connectionId)}
-        >
-          Filter connection
-        </button>
-        <a
-          className="button outlined"
-          href={props.rawLink(props.event.id)}
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Raw event
-        </a>
-        <button
-          className="button tonal"
+          className="icon-button"
+          aria-label="Copy payload"
+          title="Copy payload JSON"
           disabled={props.event.payloadOmitted}
           onClick={() =>
             props.onCopy(
@@ -919,39 +1293,68 @@ function EventDetail(props: {
             )
           }
         >
-          Copy payload
+          <Icon name="copy" size={13} />
         </button>
         <button
-          className="button tonal"
-          onClick={() => props.onCopy('method name', props.event.name)}
+          className="icon-button"
+          aria-label="Copy event JSON"
+          title="Copy the whole event as JSON"
+          onClick={() =>
+            props.onCopy('event JSON', JSON.stringify(props.event, null, 2))
+          }
         >
-          Copy method
+          <Icon name="code" size={13} />
         </button>
-        <span className="chip">{props.event.phase}</span>
-        <span className="chip">
-          {props.event.direction === 'client->server'
-            ? '↑ request'
-            : '↓ response'}
+        <a
+          className="icon-button"
+          aria-label="Open raw event"
+          title="Open the raw event JSON"
+          href={props.rawLink(props.event.id)}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <Icon name="external" size={13} />
+        </a>
+        <span className="capture-toolbar-sep" aria-hidden="true" />
+        <button
+          className="icon-button"
+          aria-label="Event actions"
+          title="Filters, copy actions"
+          aria-haspopup="menu"
+          onClick={(event) => {
+            const rect = event.currentTarget.getBoundingClientRect()
+            props.onMenu({ left: rect.left, bottom: rect.bottom + 4 })
+          }}
+        >
+          <Icon name="ellipsis" size={14} />
+        </button>
+        <span
+          className={
+            'chip capture-direction-chip ' +
+            (props.event.direction === 'client->server'
+              ? 'outgoing'
+              : 'incoming')
+          }
+        >
+          {props.event.direction === 'client->server' ? 'request' : 'response'}
         </span>
+        <span className="chip">{props.event.phase}</span>
       </div>
-      <dl className="event-metadata">
-        {Object.entries({
-          'Event ID': props.event.id,
-          'Message ID': props.event.messageId,
-          'Request ID': props.event.requestMessageId,
-          Sequence: props.event.seqNo,
-          'Auth key': props.event.authKeyId,
-          Session: props.event.sessionId,
-        }).map(([key, value]) => (
-          <div key={key}>
-            <dt>{key}</dt>
-            <dd>
-              <code>{value ?? '—'}</code>
-            </dd>
-          </div>
-        ))}
-      </dl>
-      <ActionError error={props.event.error || ''} />
+      {fields.length ? (
+        <dl className="event-metadata">
+          {fields.map(([key, value]) => (
+            <div key={String(key)}>
+              <dt>{key}</dt>
+              <dd>
+                <code>{String(value)}</code>
+              </dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
+      {props.event.error ? (
+        <ActionError error={props.event.error} />
+      ) : null}
       {props.event.payloadOmitted ? (
         <p className="muted event-detail-loading" role="status">
           <Icon name="refresh" size={15} /> Loading payload…
@@ -962,6 +1365,7 @@ function EventDetail(props: {
     </section>
   )
 }
+
 type JsonKind =
   | 'object'
   | 'array'
@@ -970,6 +1374,7 @@ type JsonKind =
   | 'boolean'
   | 'null'
   | 'other'
+
 function kindOf(value: unknown): JsonKind {
   if (value === null) return 'null'
   if (Array.isArray(value)) return 'array'
@@ -986,6 +1391,7 @@ function kindOf(value: unknown): JsonKind {
       return 'other'
   }
 }
+
 function previewOf(value: unknown): string {
   const kind = kindOf(value)
   if (kind === 'array') return 'Array(' + (value as unknown[]).length + ')'
@@ -1000,9 +1406,11 @@ function previewOf(value: unknown): string {
   if (kind === 'other') return String(value)
   return String(value)
 }
+
 function primitiveClass(kind: JsonKind): string {
   return 'json-value json-' + kind
 }
+
 function JsonNode(props: {
   name?: string
   value: unknown
@@ -1116,6 +1524,7 @@ function JsonNode(props: {
     </>
   )
 }
+
 export function JsonTree({ value }: { value: unknown }) {
   return (
     <div className="json-tree" role="tree" aria-label="Payload">
@@ -1123,3 +1532,5 @@ export function JsonTree({ value }: { value: unknown }) {
     </div>
   )
 }
+
+

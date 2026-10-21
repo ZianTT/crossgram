@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  currentLogDownloadUrl,
   deleteRecording,
   listRecordings,
   recordingDownloadUrl,
@@ -7,8 +8,10 @@ import {
 } from './recordings.js'
 const endpoint = '/api/mtproto-debug/recordings'
 const id = 'mtproto-20261020-100000-000-abcdef'
+const directory = 'D:\\data\\mtproto-debug-recordings'
 const summary = {
   id,
+  fileName: 'e2e-recording-' + id + '.json',
   label: 'e2e-recording',
   createdAt: 1_760_000_000_000,
   eventCount: 2,
@@ -28,10 +31,15 @@ afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
 })
-describe('recordings transport', () => {
-  it('lists recordings from the same-origin endpoint', async () => {
-    transport.mockResolvedValue(Response.json({ recordings: [summary] }))
-    await expect(listRecordings(endpoint)).resolves.toEqual([summary])
+describe('saved log transport', () => {
+  it('lists saved logs with the storage directory', async () => {
+    transport.mockResolvedValue(
+      Response.json({ recordings: [summary], directory }),
+    )
+    await expect(listRecordings(endpoint)).resolves.toEqual({
+      recordings: [summary],
+      directory,
+    })
     expect(transport).toHaveBeenCalledTimes(1)
     const [url, init] = transport.mock.calls[0]
     expect(url).toBe(absolute(endpoint))
@@ -62,10 +70,7 @@ describe('recordings transport', () => {
   })
   it('surfaces the server error message instead of the status', async () => {
     transport.mockResolvedValue(
-      Response.json(
-        { error: 'No captured events to save' },
-        { status: 409 },
-      ),
+      Response.json({ error: 'No captured events to save' }, { status: 409 }),
     )
     await expect(saveRecording(endpoint, 'x')).rejects.toThrow(
       'No captured events to save',
@@ -74,8 +79,12 @@ describe('recordings transport', () => {
   it('falls back to the HTTP status for a non-JSON error body', async () => {
     transport.mockResolvedValue(new Response('bad gateway', { status: 502 }))
     await expect(listRecordings(endpoint)).rejects.toThrow(
-      'Could not load recordings: HTTP 502 (bad gateway)',
+      'Could not load saved logs: HTTP 502 (bad gateway)',
     )
+  })
+  it('rejects a list payload without a directory', async () => {
+    transport.mockResolvedValue(Response.json({ recordings: [summary] }))
+    await expect(listRecordings(endpoint)).rejects.toThrow('invalid response')
   })
   it('rejects a success payload that does not match the contract', async () => {
     transport.mockResolvedValue(Response.json({ ok: true }))
@@ -89,9 +98,22 @@ describe('recordings transport', () => {
     expect(init.method).toBe('DELETE')
   })
   it('builds download URLs on the same endpoint', () => {
-    expect(recordingDownloadUrl(endpoint, id)).toBe(absolute(endpoint + '/' + id))
+    expect(recordingDownloadUrl(endpoint, id)).toBe(
+      absolute(endpoint + '/' + id),
+    )
     expect(recordingDownloadUrl(endpoint + '/', 'a b/c')).toBe(
       absolute(endpoint + '/' + encodeURIComponent('a b/c')),
+    )
+  })
+  it('builds the unsaved snapshot download URL with an optional label', () => {
+    expect(currentLogDownloadUrl(endpoint)).toBe(
+      absolute(endpoint + '/current'),
+    )
+    expect(currentLogDownloadUrl(endpoint + '/', '  dialogs bug  ')).toBe(
+      absolute(endpoint + '/current?label=dialogs+bug'),
+    )
+    expect(currentLogDownloadUrl(endpoint, '   ')).toBe(
+      absolute(endpoint + '/current'),
     )
   })
   it('aborts a stalled request after the timeout budget', async () => {

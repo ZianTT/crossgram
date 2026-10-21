@@ -123,7 +123,6 @@ export function useCapturePages(
     generation.current++
     for (const controller of controllers.current) controller.abort()
     controllers.current.clear()
-    detailJobs.current.clear()
     clearTimeout(followTimer.current)
     followPending.current = false
     setLoading(false)
@@ -134,7 +133,10 @@ export function useCapturePages(
       detail = false,
     ): Promise<MtprotoCaptureSnapshot> => {
       const controller = new AbortController()
-      controllers.current.add(controller)
+      // Payload fetches are independent of the visible window: paging or
+      // following must not abort the detail an operator just opened. They are
+      // still discarded when `wantedDetails` changes.
+      if (!detail) controllers.current.add(controller)
       const timeout = setTimeout(() => controller.abort(), 10_000)
       try {
         const url = new URL(sameOriginPath(endpointRef.current!))
@@ -296,29 +298,21 @@ export function useCapturePages(
       if (!event.payloadOmitted || detailsRef.current.has(event.id)) return
       const pending = detailJobs.current.get(event.id)
       if (pending) return pending
-      const current = generation.current
       const task = (async () => {
         try {
           const result = await request(
             new URLSearchParams({ id: String(event.id), limit: '1' }),
             true,
           )
-          if (
-            !active.current ||
-            current !== generation.current ||
-            !wantedDetails.current.has(event.id)
-          )
-            return
+          // A payload fetch outlives the window that started it; only the
+          // current selection may store its result.
+          if (!active.current || !wantedDetails.current.has(event.id)) return
           const detail = result.events.find((item) => item.id === event.id)
           if (!detail)
             throw new Error('This event has expired from the capture buffer.')
           setDetails((value) => new Map(value).set(event.id, detail))
         } catch (cause) {
-          if (
-            active.current &&
-            current === generation.current &&
-            wantedDetails.current.has(event.id)
-          )
+          if (active.current && wantedDetails.current.has(event.id))
             setError(cause instanceof Error ? cause.message : String(cause))
         }
       })()

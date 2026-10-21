@@ -13,8 +13,9 @@ import {
   clickNav,
 } from './browser-test-utils.js'
 import type { MtprotoDebugEvent } from '../../mtproto/src/debug.js'
+
 describe('React capture with the real MTProto capture backend', () => {
-  it('keeps large payloads off sockets, lazily fetches details, groups RPC results, saves/lists/downloads/deletes recordings, filters/pages, reconnects and cleans up on mobile navigation', async () => {
+  it('tails the capture, saves/lists/downloads/deletes logs, filters, pages, inspects RPC results, reconnects and cleans up on mobile navigation', async () => {
     const recordingsPath = await mkdtemp(
       join(tmpdir(), 'crossgram-mtproto-recordings-'),
     )
@@ -111,7 +112,7 @@ describe('React capture with the real MTProto capture backend', () => {
           .locator('.capture-direction')
           .first()
           .evaluate((element) => getComputedStyle(element).width),
-      ).toBe('22px')
+      ).toBe('16px')
       expect(
         requests.every(
           (url) => new URL(url).searchParams.get('summary') === 'true',
@@ -120,77 +121,113 @@ describe('React capture with the real MTProto capture backend', () => {
       expect(await page.locator('.capture-row').count()).toBeLessThanOrEqual(
         100,
       )
-      // Saving writes a full recording file server-side, off the WebSocket.
-      await page
-        .getByRole('button', { name: 'Save recording', exact: true })
-        .click()
-      const saveDialog = page.getByRole('dialog', { name: 'Save recording' })
-      await saveDialog.waitFor()
-      await saveDialog.getByLabel('Recording label').fill('e2e-recording')
-      await saveDialog.getByRole('button', { name: 'Save', exact: true }).click()
-      await page.getByText(/^Saved recording mtproto-/).waitFor()
-      const savedId = (
-        await page.locator('.capture-flash').textContent()
-      )!.replace('Saved recording ', '')
-      const recordingFiles = (await readdir(recordingsPath)).filter(
-        (name) => name.endsWith('.json') && !name.endsWith('.meta.json'),
-      )
-      expect(recordingFiles).toEqual([savedId + '.json'])
-      const recording = JSON.parse(
-        await readFile(join(recordingsPath, savedId + '.json'), 'utf8'),
-      )
-      expect(recording.format).toBe('crossgram.mtproto-capture')
-      expect(recording.version).toBe(1)
-      expect(recording.events).toHaveLength(252)
+      // The list tails the buffer: the newest event is the last row and the
+      // list is already scrolled to the bottom without any user action.
+      await expect
+        .poll(() =>
+          page.locator('.capture-row-header strong').last().textContent(),
+        )
+        .toBe('messages.getHistory')
       expect(
-        recording.events.some((event: { payload?: unknown }) =>
+        await page.locator('.capture-list').evaluate((element) => ({
+          atBottom:
+            element.scrollHeight - element.scrollTop - element.clientHeight <=
+            24,
+          scrollable: element.scrollHeight > element.clientHeight,
+        })),
+      ).toEqual({ atBottom: true, scrollable: true })
+
+      // A log can be downloaded without saving it on the server.
+      await page
+        .getByRole('button', { name: 'Save log', exact: true })
+        .click()
+      const saveDialog = page.getByRole('dialog', { name: 'Save log' })
+      await saveDialog.waitFor()
+      await saveDialog.getByLabel('Log name').fill('e2e-log')
+      await expect
+        .poll(() => saveDialog.locator('.capture-facts dd').first().textContent())
+        .toBe('252')
+      const unsavedDownload = page.waitForEvent('download')
+      await saveDialog
+        .getByRole('link', { name: 'Download', exact: true })
+        .click()
+      const unsaved = await unsavedDownload
+      expect(unsaved.suggestedFilename()).toMatch(
+        /^e2e-log-\d{8}-\d{6}\.json$/,
+      )
+      const unsavedLog = JSON.parse(
+        await readFile((await unsaved.path())!, 'utf8'),
+      )
+      expect(unsavedLog.format).toBe('crossgram.mtproto-capture')
+      expect(unsavedLog.events).toHaveLength(252)
+      expect(
+        unsavedLog.events.some((event: { payload?: unknown }) =>
           JSON.stringify(event.payload ?? '').includes('ON_DEMAND_ONLY_'),
         ),
       ).toBe(true)
-      const meta = JSON.parse(
-        await readFile(join(recordingsPath, savedId + '.meta.json'), 'utf8'),
-      )
-      expect(meta).toMatchObject({
-        id: savedId,
-        label: 'e2e-recording',
-        eventCount: recording.events.length,
-      })
-      expect(frames.join('')).not.toContain('ON_DEMAND_ONLY_')
-      // The recordings dialog lists, downloads and deletes the saved capture.
-      await page
-        .getByRole('button', { name: 'Recordings', exact: true })
+      // Saving writes a full log file server-side, off the WebSocket.
+      await saveDialog
+        .getByRole('button', { name: 'Save on server', exact: true })
         .click()
-      const recordingsDialog = page.getByRole('dialog', {
-        name: 'Saved recordings',
-      })
-      await recordingsDialog.waitFor()
-      const row = recordingsDialog.locator('.recording-row')
+      await page.getByText(/^Saved log e2e-log$/).waitFor()
+      const recordingFiles = (await readdir(recordingsPath)).filter(
+        (name) => name.endsWith('.json') && !name.endsWith('.meta.json'),
+      )
+      expect(recordingFiles).toHaveLength(1)
+      const fileName = recordingFiles[0]!
+      expect(fileName).toMatch(/^e2e-log-mtproto-.+\.json$/)
+      const recording = JSON.parse(
+        await readFile(join(recordingsPath, fileName), 'utf8'),
+      )
+      expect(recording.format).toBe('crossgram.mtproto-capture')
+      expect(recording.version).toBe(1)
+      expect(recording.label).toBe('e2e-log')
+      expect(recording.events).toHaveLength(252)
+      expect(frames.join('')).not.toContain('ON_DEMAND_ONLY_')
+      // Saving opens the saved-log browser, which shows the file name, size
+      // and lets the operator download or delete the file.
+      const logsDialog = page.getByRole('dialog', { name: 'Saved logs' })
+      await logsDialog.waitFor()
+      const row = logsDialog.locator('.recording-row')
       await row.waitFor()
       expect(await row.locator('.recording-label').textContent()).toBe(
-        'e2e-recording',
+        'e2e-log',
       )
-      expect(await row.locator('.recording-meta').textContent()).toContain(
-        recording.events.length + ' events',
-      )
+      const meta = await row.locator('.recording-meta').textContent()
+      expect(meta).toContain(fileName)
+      expect(meta).toContain('252 events')
+      expect(
+        (await logsDialog.locator('.capture-logs-note').textContent()) ?? '',
+      ).toContain(recordingsPath)
       const downloadPromise = page.waitForEvent('download')
-      await row.locator('.recording-download').click()
+      await row
+        .getByRole('link', { name: 'Download e2e-log', exact: true })
+        .click()
       const download = await downloadPromise
-      expect(download.suggestedFilename()).toBe(savedId + '.json')
+      expect(download.suggestedFilename()).toBe(fileName)
       const downloaded = JSON.parse(
         await readFile((await download.path())!, 'utf8'),
       )
       expect(downloaded.format).toBe(recording.format)
       expect(downloaded.events).toHaveLength(recording.events.length)
+      await page
+        .context()
+        .grantPermissions(['clipboard-read', 'clipboard-write'])
+      await row
+        .getByRole('button', { name: 'Copy file path for e2e-log' })
+        .click()
+      await page.getByText('Copied file path').waitFor()
+      expect(
+        await page.evaluate(() => navigator.clipboard.readText()),
+      ).toContain(fileName)
       await row.getByRole('button', { name: 'Delete', exact: true }).click()
-      const confirm = page.getByRole('dialog', {
-        name: 'Delete this recording?',
-      })
+      const confirm = page.getByRole('dialog', { name: 'Delete this log?' })
       await confirm.waitFor()
       await confirm
         .getByRole('button', { name: 'Delete', exact: true })
         .click()
       await expect
-        .poll(() => recordingsDialog.locator('.recording-row').count())
+        .poll(() => logsDialog.locator('.recording-row').count())
         .toBe(0)
       await expect
         .poll(async () =>
@@ -199,25 +236,30 @@ describe('React capture with the real MTProto capture backend', () => {
           ),
         )
         .toEqual([])
-      await recordingsDialog
+      await logsDialog
         .getByRole('button', { name: 'Close dialog' })
         .click()
+
       // Right-click opens the DevTools-style context menu; filters live in it.
-      await page.locator('.capture-row').first().click({ button: 'right' })
+      await page.locator('.capture-row').last().click({ button: 'right' })
       await page.getByRole('menu', { name: 'Event actions' }).waitFor()
       await page.getByRole('menuitem', { name: 'Copy method name' }).click()
       await page.getByText('Copied method name').waitFor()
-      await page.locator('.capture-row').first().click({ button: 'right' })
-      await page.getByRole('menuitem', { name: 'Filter this connection' }).click()
+      await page.locator('.capture-row').last().click({ button: 'right' })
+      await page
+        .getByRole('menuitem', { name: 'Only this connection' })
+        .click()
       await expect
         .poll(() => page.locator('.filter-chip').allTextContents())
-        .toEqual(expect.arrayContaining([expect.stringContaining('Conn:')]))
-      await page.getByRole('button', { name: /^Filters/ }).click()
-      await page.getByRole('button', { name: 'Clear all filters' }).click()
+        .toEqual(expect.arrayContaining([expect.stringContaining('Connection:')]))
+      await expect
+        .poll(() => page.locator('.capture-row').count())
+        .toBeLessThanOrEqual(8)
+      await page.getByRole('button', { name: 'Clear filters', exact: true }).click()
       await expect
         .poll(() => page.locator('.filter-chip').count())
         .toBe(0)
-      await page.locator('.capture-row').first().click({ button: 'right' })
+      await page.locator('.capture-row').last().click({ button: 'right' })
       await page.getByRole('menuitem', { name: 'Copy method name' }).click()
       await page.getByText('Copied method name').waitFor()
       await page.getByRole('button', { name: 'Close details' }).click()
@@ -255,30 +297,66 @@ describe('React capture with the real MTProto capture backend', () => {
       expect(requests.some((url) => new URL(url).searchParams.has('id'))).toBe(
         true,
       )
-      // The list pages itself: scrolling to the end requests older events.
+      // Scrolling back reveals the jump-to-latest affordance and keeps paging
+      // towards older events.
       const initialRows = await page.locator('.capture-row').count()
       await page.locator('.capture-list').evaluate((element) => {
-        element.scrollTop = element.scrollHeight
+        element.scrollTop = 0
       })
       await expect
         .poll(() => page.locator('.capture-row').count())
         .toBeGreaterThan(initialRows)
-      await page.locator('.capture-row-header').last().click()
+      await page.locator('.capture-jump').waitFor()
+      for (let index = 0; index < 3; index++)
+        emitDebug({
+          direction: 'client->server',
+          phase: 'message',
+          connectionId: 'tail',
+          timestamp: Date.now(),
+          payload: { _: 'test.tail' + index },
+        })
+      await expect
+        .poll(() => page.locator('.capture-jump').textContent())
+        .toContain('3 new events')
+      await page.locator('.capture-jump').click()
+      await expect.poll(() => page.locator('.capture-jump').count()).toBe(0)
+      // Payloads for list rows are fetched only when an event is opened.
+      await page
+        .locator('.capture-row-header')
+        .filter({ hasText: 'test.call' })
+        .first()
+        .click()
       await page
         .getByText(/ON_DEMAND_ONLY_/)
         .first()
         .waitFor()
       expect(frames.join('')).not.toContain('ON_DEMAND_ONLY_')
-      await page.getByLabel('Search captured events').fill('test.call15')
+      await page.getByLabel('Filter captured events').fill('test.call15')
       await expect
-        .poll(() => page.locator('.capture-row-title strong').allTextContents())
+        .poll(() => page.locator('.capture-row-header strong').allTextContents())
         .toEqual(expect.arrayContaining(['test.call15']))
-      await page.getByLabel('Search captured events').fill('')
+      await page.getByLabel('Filter captured events').fill('')
+      // On a wide viewport the inspector sits beside the list instead of below.
+      await page.setViewportSize({ width: 1440, height: 900 })
+      await page.locator('.capture-row-header').last().click()
+      await page.locator('.capture-inspector').waitFor()
+      const listBox = (await page.locator('.capture-list').boundingBox())!
+      const inspectorBox = (await page
+        .locator('.capture-inspector')
+        .boundingBox())!
+      expect(inspectorBox.x).toBeGreaterThan(listBox.x + listBox.width - 1)
+      if (process.env.WEBUI_SCREENSHOTS) {
+        await page.screenshot({
+          path: join(process.env.WEBUI_SCREENSHOTS, 'solid-capture-desktop.png'),
+          animations: 'disabled',
+        })
+      }
+      await page.setViewportSize({ width: 390, height: 844 })
       await page
         .getByRole('button', { name: 'Pause capture', exact: true })
         .click()
       await page
-        .getByRole('button', { name: 'Start capture', exact: true })
+        .getByRole('button', { name: 'Resume capture', exact: true })
         .waitFor()
       await expectReconnectWithoutReload(page, ui)
       expect(
@@ -287,17 +365,21 @@ describe('React capture with the real MTProto capture backend', () => {
         ),
       ).toBe(true)
       await page
+        .getByRole('button', { name: 'More capture actions' })
+        .click()
+      await page.getByRole('menuitem', { name: 'Clear capture buffer…' }).click()
+      const clearDialog = page.getByRole('dialog', {
+        name: 'Clear capture buffer?',
+      })
+      await clearDialog.waitFor()
+      await clearDialog
         .getByRole('button', { name: 'Clear capture', exact: true })
         .click()
-      await page
-        .getByRole('dialog')
-        .getByRole('button', { name: 'Clear capture', exact: true })
-        .click()
-      await page.getByRole('heading', { name: 'No matching events' }).waitFor()
-      // Nothing is buffered anymore, so saving a recording is disabled.
+      await page.getByRole('heading', { name: 'Nothing captured yet' }).waitFor()
+      // Nothing is buffered anymore, so saving a log is disabled.
       expect(
         await page
-          .getByRole('button', { name: 'Save recording', exact: true })
+          .getByRole('button', { name: 'Save log', exact: true })
           .isDisabled(),
       ).toBe(true)
       await clickNav(page, 'Overview')
@@ -312,5 +394,6 @@ describe('React capture with the real MTProto capture backend', () => {
       disposeMtproto()
       await rm(recordingsPath, { recursive: true, force: true })
     }
-  }, 60_000)
+  }, 90_000)
 })
+

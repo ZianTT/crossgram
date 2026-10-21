@@ -3,10 +3,25 @@ import { readResponse, sameOriginPath } from 'cordis-webui-react/utils'
 /** Same budget as the capture pages; recordings are small JSON documents. */
 export const RECORDING_TIMEOUT_MS = 10_000
 const MAX_RECORDING_RESPONSE_BYTES = 1024 * 1024
+/** The saved-log index plus the server folder it is stored in. */
+export interface SavedLogs {
+  directory: string
+  recordings: RecordingSummary[]
+}
 /** `id` is appended as a single encoded path segment, never as a query value. */
 function recordingUrl(endpoint: string, id?: string): string {
   const base = sameOriginPath(endpoint).replace(/\/+$/, '')
   return id === undefined ? base : base + '/' + encodeURIComponent(id)
+}
+/**
+ * The unsaved snapshot endpoint: the same self-describing document as a saved
+ * log, written straight to the browser as an attachment.
+ */
+export function currentLogDownloadUrl(endpoint: string, label?: string): string {
+  const url = new URL(recordingUrl(endpoint) + '/current')
+  const trimmed = label?.trim()
+  if (trimmed) url.searchParams.set('label', trimmed)
+  return url.href
 }
 function httpError(text: string, status: number, failure: string): string {
   try {
@@ -54,16 +69,17 @@ async function requestJson(
 }
 export async function listRecordings(
   endpoint: string,
-): Promise<RecordingSummary[]> {
+): Promise<SavedLogs> {
   const payload = await requestJson(
     recordingUrl(endpoint),
-    'Could not load recordings',
+    'Could not load saved logs',
     { method: 'GET' },
   )
   const recordings = (payload as { recordings?: unknown }).recordings
-  if (!Array.isArray(recordings))
-    throw new Error('Could not load recordings: invalid response')
-  return recordings as RecordingSummary[]
+  const directory = (payload as { directory?: unknown }).directory
+  if (!Array.isArray(recordings) || typeof directory !== 'string')
+    throw new Error('Could not load saved logs: invalid response')
+  return { recordings: recordings as RecordingSummary[], directory }
 }
 export async function saveRecording(
   endpoint: string,
@@ -72,7 +88,7 @@ export async function saveRecording(
   const trimmed = label?.trim()
   const payload = await requestJson(
     recordingUrl(endpoint),
-    'Could not save recording',
+    'Could not save log',
     {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -85,7 +101,7 @@ export async function saveRecording(
     typeof recording !== 'object' ||
     typeof (recording as RecordingSummary).id !== 'string'
   )
-    throw new Error('Could not save recording: invalid response')
+    throw new Error('Could not save log: invalid response')
   return recording as RecordingSummary
 }
 export async function deleteRecording(
@@ -94,15 +110,16 @@ export async function deleteRecording(
 ): Promise<string> {
   const payload = await requestJson(
     recordingUrl(endpoint, id),
-    'Could not delete recording',
+    'Could not delete log',
     { method: 'DELETE' },
   )
   const deleted = (payload as { deleted?: unknown }).deleted
   if (typeof deleted !== 'string')
-    throw new Error('Could not delete recording: invalid response')
+    throw new Error('Could not delete log: invalid response')
   return deleted
 }
 export function recordingDownloadUrl(endpoint: string, id: string): string {
   return recordingUrl(endpoint, id)
 }
 export type { RecordingSummary } from '../src/recordings.js'
+

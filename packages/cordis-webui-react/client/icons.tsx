@@ -29,6 +29,8 @@ import {
   Minus,
   Network,
   Palette,
+  Pause,
+  Play,
   Plug,
   Plus,
   Puzzle,
@@ -71,6 +73,8 @@ const icons = {
   account: CircleUser,
   settings: Settings2,
   palette: Palette,
+  pause: Pause,
+  play: Play,
   menu: Menu,
   close: X,
   chevronRight: ChevronRight,
@@ -168,3 +172,4 @@ export function Icon({
     />
   )
 }
+
