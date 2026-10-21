@@ -54,9 +54,14 @@ describe('MTProto debug Cordis entry', () => {
       { method: 'get', path: '/api/mtproto-debug/events' },
       { method: 'get', path: '/api/mtproto-debug/recordings' },
       { method: 'post', path: '/api/mtproto-debug/recordings' },
+      { method: 'get', path: '/api/mtproto-debug/recordings/current' },
       { method: 'get', path: '/api/mtproto-debug/recordings/:id' },
       { method: 'delete', path: '/api/mtproto-debug/recordings/:id' },
     ])
+    // `current` must be matched before the `:id` download route.
+    const paths = routes.map(route => route.path)
+    expect(paths.indexOf('/api/mtproto-debug/recordings/current'))
+      .toBeLessThan(paths.indexOf('/api/mtproto-debug/recordings/:id'))
     expect(data.capturing).toBe(true)
     expect(listeners.size).toBe(1)
 

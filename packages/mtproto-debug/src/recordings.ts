@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { CapturedMtprotoEvent } from './types.js'
 
@@ -10,10 +10,14 @@ export const RECORDING_VERSION = 1
 export const DEFAULT_RECORDINGS_PATH = './data/mtproto-debug-recordings'
 export const DEFAULT_RECORDINGS_API_PATH = '/api/mtproto-debug/recordings'
 export const MAX_RECORDING_LABEL_LENGTH = 120
+/** 标签在文件名里保留的最大长度；超出部分截断，避免触及各平台文件名上限。 */
+export const MAX_RECORDING_SLUG_LENGTH = 64
 
 const RECORDING_ID = /^mtproto-\d{8}-\d{6}-\d{3}-[0-9a-f]{6}$/
 const META_SUFFIX = '.meta.json'
 const JSON_SUFFIX = '.json'
+/** 前导/尾随的 `-` 与 `.` 既不美观也可能产生隐藏文件或 `..`，一律裁掉。 */
+const SLUG_EDGE = /^[-.]+|[-.]+$/g
 
 export interface CaptureRecording {
   format: typeof RECORDING_FORMAT
@@ -30,6 +34,8 @@ export interface CaptureRecording {
 export interface RecordingSummary {
   id: string
   label?: string
+  /** On-disk file name inside the recordings directory; carries the label slug. */
+  fileName: string
   createdAt: number
   eventCount: number
   dropped: number
@@ -56,6 +62,16 @@ export interface SaveRecordingInput {
   dropped: number
   maxEvents: number
   label?: unknown
+}
+
+export interface BuildRecordingDocumentInput {
+  createdAt: number
+  /** Normalized here, so every caller accepts raw user input. */
+  label?: unknown
+  capturing: boolean
+  dropped: number
+  maxEvents: number
+  events: readonly CapturedMtprotoEvent[]
 }
 
 /** 基于 `ctx.baseUrl` 解析配置里的相对路径；非文件 URL 退回工作目录。 */
@@ -102,6 +118,45 @@ export function normalizeRecordingLabel(value: unknown): string | undefined {
   return label
 }
 
+/** 把用户标签变成文件名安全片段；保留 `[A-Za-z0-9._-]`，其余连续片段折成一个 `-`。 */
+export function slugifyRecordingLabel(label: string): string {
+  const collapsed = label.replace(/[^A-Za-z0-9._-]+/g, '-').replace(SLUG_EDGE, '')
+  if (!collapsed) return ''
+  return collapsed.slice(0, MAX_RECORDING_SLUG_LENGTH).replace(SLUG_EDGE, '')
+}
+
+/** 磁盘文件名：标签片段在前、id 在后，因此同 slug 的不同录制不会互相覆盖。 */
+export function recordingFileName(label: string | undefined, id: string): string {
+  const slug = label ? slugifyRecordingLabel(label) : ''
+  return slug ? `${slug}-${id}${JSON_SUFFIX}` : id + JSON_SUFFIX
+}
+
+/** `GET .../current` 的附件名（不落盘）；stamp 为 UTC 的 `yyyymmdd-hhmmss`。 */
+export function recordingAttachmentFileName(label: string | undefined, now = Date.now()): string {
+  const slug = label ? slugifyRecordingLabel(label) : ''
+  return `${slug || 'mtproto-capture'}-${timestampStamp(now)}${JSON_SUFFIX}`
+}
+
+/** 组装自描述文档；保存与「下载当前缓冲」共用，保证两条路径产出同一种格式。 */
+export function buildRecordingDocument(input: BuildRecordingDocumentInput): CaptureRecording {
+  const label = normalizeRecordingLabel(input.label)
+  return {
+    format: RECORDING_FORMAT,
+    version: RECORDING_VERSION,
+    createdAt: input.createdAt,
+    ...(label ? { label } : {}),
+    capturing: input.capturing,
+    dropped: input.dropped,
+    maxEvents: input.maxEvents,
+    events: [...input.events],
+  }
+}
+
+function timestampStamp(now: number): string {
+  const [date, time] = new Date(now).toISOString().slice(0, 19).split('T')
+  return `${date.replaceAll('-', '')}-${time.replaceAll(':', '')}`
+}
+
 /** 录制文件的读写与元数据维护；所有可变状态都在磁盘上，重启后仍可列出。 */
 export class RecordingStore {
   constructor(
@@ -109,24 +164,27 @@ export class RecordingStore {
     readonly maxRecordings = 50,
   ) {}
 
+  /** Absolute directory holding the json recordings and their meta sidecars. */
+  get directory(): string {
+    return resolve(this.root)
+  }
+
   async save(input: SaveRecordingInput, now = Date.now()): Promise<RecordingSummary> {
     if (!input.events.length) throw new RecordingError(409, 'No captured events to save')
     const id = createRecordingId(now)
-    const label = normalizeRecordingLabel(input.label)
-    const recording: CaptureRecording = {
-      format: RECORDING_FORMAT,
-      version: RECORDING_VERSION,
+    const recording = buildRecordingDocument({
       createdAt: now,
-      ...(label ? { label } : {}),
+      label: input.label,
       capturing: input.capturing,
       dropped: input.dropped,
       maxEvents: input.maxEvents,
-      events: [...input.events],
-    }
+      events: input.events,
+    })
     const text = JSON.stringify(recording)
     const summary: RecordingSummary = {
       id,
-      ...(label ? { label } : {}),
+      ...(recording.label ? { label: recording.label } : {}),
+      fileName: recordingFileName(recording.label, id),
       createdAt: now,
       eventCount: input.events.length,
       dropped: input.dropped,
@@ -136,7 +194,7 @@ export class RecordingStore {
       bytes: Buffer.byteLength(text),
     }
     await mkdir(this.root, { recursive: true, mode: 0o700 })
-    const filename = this.dataPath(id)
+    const filename = join(this.root, summary.fileName)
     await atomicWrite(filename, text)
     try {
       await atomicWrite(this.metaPath(id), JSON.stringify(summary))
@@ -165,7 +223,11 @@ export class RecordingStore {
       try {
         const value: unknown = JSON.parse(await readFile(join(this.root, entry), 'utf8'))
         if (!isRecordingSummary(value) || value.id !== id) continue
-        summaries.push(value)
+        // Metas written before labelled file names existed have no fileName.
+        summaries.push({
+          ...value,
+          fileName: isSafeFileName(value.fileName) ? value.fileName : id + JSON_SUFFIX,
+        })
       } catch {
         // 单个损坏的元数据不应让整个列表不可用；录制本体仍可单独下载。
       }
@@ -177,14 +239,21 @@ export class RecordingStore {
 
   async readText(id: string): Promise<string> {
     this.assertId(id)
+    const filename = await this.dataPath(id)
     try {
-      return await readFile(this.dataPath(id), 'utf8')
+      return await readFile(filename, 'utf8')
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         throw new RecordingError(404, `Recording ${id} not found`)
       }
       throw error
     }
+  }
+
+  /** On-disk name of a saved recording; the download and delete routes both use it. */
+  async fileName(id: string): Promise<string> {
+    this.assertId(id)
+    return (await this.storedFileName(id)) ?? id + JSON_SUFFIX
   }
 
   async read(id: string): Promise<CaptureRecording> {
@@ -203,20 +272,34 @@ export class RecordingStore {
 
   async remove(id: string): Promise<void> {
     this.assertId(id)
+    const filename = await this.dataPath(id)
     try {
-      await stat(this.dataPath(id))
+      await stat(filename)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         throw new RecordingError(404, `Recording ${id} not found`)
       }
       throw error
     }
-    await rm(this.dataPath(id), { force: true })
+    await rm(filename, { force: true })
     await rm(this.metaPath(id), { force: true })
   }
 
-  private dataPath(id: string): string {
-    return join(this.root, id + JSON_SUFFIX)
+  /** Resolve the payload through the meta sidecar, because its name carries the label. */
+  private async dataPath(id: string): Promise<string> {
+    return join(this.root, (await this.storedFileName(id)) ?? id + JSON_SUFFIX)
+  }
+
+  private async storedFileName(id: string): Promise<string | undefined> {
+    try {
+      const value: unknown = JSON.parse(await readFile(this.metaPath(id), 'utf8'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+      const fileName = (value as { fileName?: unknown }).fileName
+      return typeof fileName === 'string' && isSafeFileName(fileName) ? fileName : undefined
+    } catch {
+      // Missing or corrupt meta: fall back to the legacy unlabelled name.
+      return undefined
+    }
   }
 
   private metaPath(id: string): string {
@@ -257,8 +340,19 @@ function isRecordingSummary(value: unknown): value is RecordingSummary {
     && typeof summary.maxEvents === 'number'
     && typeof summary.bytes === 'number'
     && (summary.label === undefined || typeof summary.label === 'string')
+    // Legacy metas predate labelled file names; list() fills the fallback in.
+    && (summary.fileName === undefined || typeof summary.fileName === 'string')
     && (summary.firstTimestamp === undefined || typeof summary.firstTimestamp === 'number')
     && (summary.lastTimestamp === undefined || typeof summary.lastTimestamp === 'number')
+}
+
+/** Meta files come from disk, so never join a name that could escape the directory. */
+function isSafeFileName(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value !== '.' && value !== '..'
+    && value.endsWith(JSON_SUFFIX)
+    && basename(value) === value
 }
 
 async function atomicWrite(filename: string, text: string): Promise<void> {

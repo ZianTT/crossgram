@@ -7,7 +7,7 @@ import { appendChunkedEvents, flattenChunks, replaceChunks, resolveChunkSize, ty
 import { CaptureQueryError, parseCaptureQuery, queryCapture } from './capture-api.js'
 import {
   DEFAULT_RECORDINGS_API_PATH, DEFAULT_RECORDINGS_PATH, RecordingError, RecordingStore,
-  normalizeRecordingLabel, resolveConfiguredPath,
+  buildRecordingDocument, normalizeRecordingLabel, recordingAttachmentFileName, resolveConfiguredPath,
 } from './recordings.js'
 import type { CapturedMtprotoEvent, MtprotoDebugData } from './types.js'
 import enUS from './locales/en-US.yml'
@@ -129,8 +129,9 @@ export function apply(ctx: Context, config: Config = {}): void {
   // 也能直接被脚本调用，且录制本体永远不会经过 WebSocket。
   ctx.server.get(recordingsApiPath, async (_req, res) => {
     try {
+      flush()
       res.headers.set('cache-control', 'no-store')
-      res.json({ recordings: await store.list() })
+      res.json({ recordings: await store.list(), directory: store.directory })
     } catch (error) {
       sendRecordingError(res, error)
     }
@@ -154,12 +155,37 @@ export function apply(ctx: Context, config: Config = {}): void {
       sendRecordingError(res, error)
     }
   })
+  // 下载当前内存缓冲但不落盘。必须注册在 `/:id` 之前，否则 `current` 会被当成录制 id。
+  ctx.server.get(`${recordingsApiPath}/current`, async (req, res) => {
+    try {
+      const label = normalizeRecordingLabel(req.query.get('label'))
+      flush()
+      const createdAt = Date.now()
+      const document = buildRecordingDocument({
+        createdAt,
+        label,
+        capturing: data.capturing,
+        dropped: data.dropped,
+        maxEvents: data.maxEvents,
+        events: flattenChunks(chunks),
+      })
+      res.headers.set('content-type', 'application/json; charset=utf-8')
+      res.headers.set(
+        'content-disposition',
+        `attachment; filename="${recordingAttachmentFileName(label, createdAt)}"`,
+      )
+      res.headers.set('cache-control', 'no-store')
+      res.json(document)
+    } catch (error) {
+      sendRecordingError(res, error)
+    }
+  })
   ctx.server.get(`${recordingsApiPath}/:id`, async (req, res) => {
     try {
       const { id } = req.params as { id: string }
       const text = await store.readText(id)
       res.headers.set('content-type', 'application/json; charset=utf-8')
-      res.headers.set('content-disposition', `attachment; filename="${id}.json"`)
+      res.headers.set('content-disposition', `attachment; filename="${await store.fileName(id)}"`)
       res.headers.set('cache-control', 'no-store')
       res.text(text)
     } catch (error) {
@@ -225,10 +251,12 @@ export {
   type CaptureSource, type MtprotoCaptureFilters, type MtprotoCaptureSnapshot,
 } from './capture-api.js'
 export {
-  createRecordingId, DEFAULT_RECORDINGS_API_PATH, DEFAULT_RECORDINGS_PATH, isRecordingId,
-  MAX_RECORDING_LABEL_LENGTH, normalizeRecordingLabel, RECORDING_FORMAT, RECORDING_VERSION,
-  RecordingError, RecordingStore, resolveConfiguredPath,
-  type CaptureRecording, type RecordingSummary, type SaveRecordingInput,
+  buildRecordingDocument, createRecordingId, DEFAULT_RECORDINGS_API_PATH, DEFAULT_RECORDINGS_PATH,
+  isRecordingId, MAX_RECORDING_LABEL_LENGTH, MAX_RECORDING_SLUG_LENGTH, normalizeRecordingLabel,
+  RECORDING_FORMAT, RECORDING_VERSION, recordingAttachmentFileName, recordingFileName,
+  RecordingError, RecordingStore, resolveConfiguredPath, slugifyRecordingLabel,
+  type BuildRecordingDocumentInput, type CaptureRecording, type RecordingSummary,
+  type SaveRecordingInput,
 } from './recordings.js'
 
 function normalizeApiPath(value: string): string {
