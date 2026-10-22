@@ -289,13 +289,17 @@ describe('scheduled message RPCs', () => {
     })
     expect(created).toMatchObject({
       _: 'updates',
-      updates: [{ _: 'updateNewScheduledMessage', message: { message: 'send this later' } }],
+      updates: [
+        { _: 'updateMessageID', randomId: Long.fromNumber(41) },
+        { _: 'updateNewScheduledMessage', message: { message: 'send this later' } },
+      ],
     })
 
     const listedMessages = await listScheduled()
     expect(listedMessages).toHaveLength(1)
     const scheduledMessage = listedMessages[0]
     expect(scheduledMessage).toMatchObject({ message: 'send this later', out: true })
+    expect((created as tl.RawUpdates).updates[0]).toMatchObject({ id: scheduledMessage.id })
 
     const row = (await scheduled.list(session.platformSessionId, 'alice'))[0]
     const delivered = await rpc.deliverScheduled(row)
@@ -323,8 +327,10 @@ describe('scheduled message RPCs', () => {
       _: 'messages.sendScheduledMessages', peer, id: [scheduledId],
     })
     expect(sent.at(-1)?.parts[0]).toMatchObject({ type: 'text', text: 'right now' })
-    expect((result._ === 'updates' ? result.updates : [])
-      .some((update) => update._ === 'updateDeleteScheduledMessages')).toBe(true)
+    const resultUpdates = result._ === 'updates' ? result.updates : []
+    expect(resultUpdates.some((update) => update._ === 'updateDeleteScheduledMessages')).toBe(true)
+    // randomId 已在定时时确认，不能再对普通历史发一次 updateMessageID。
+    expect(resultUpdates.some((update) => update._ === 'updateMessageID')).toBe(false)
     expect(await scheduled.list(session.platformSessionId, 'alice')).toHaveLength(0)
   })
 
@@ -335,7 +341,8 @@ describe('scheduled message RPCs', () => {
       randomId: Long.fromNumber(91), scheduleDate: nowSeconds() + 300,
       replyTo: { _: 'inputReplyToMessage', replyToMsgId: 1234 },
     })
-    const update = (created._ === 'updates' ? created.updates : [])[0] as tl.RawUpdateNewScheduledMessage
+    const update = (created._ === 'updates' ? created.updates : [])
+      .find((item) => item._ === 'updateNewScheduledMessage') as tl.RawUpdateNewScheduledMessage
     const listed = (await listScheduled())[0]
     for (const message of [update.message as tl.RawMessage, listed]) {
       expect(message.replyTo).toMatchObject({ _: 'messageReplyHeader', replyToMsgId: 1234 })

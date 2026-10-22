@@ -1390,7 +1390,8 @@ export class DialogRpc {
           throw error
         }
         const sentUpdates = sent._ === 'updates' ? sent.updates : []
-        updates.push(...sentUpdates)
+        // randomId 在定时创建时已经确认过，这里再带 `updateMessageID` 会被客户端套到早已删除的占位上。
+        updates.push(...sentUpdates.filter((update) => update._ !== 'updateMessageID'))
         const newId = sentUpdates
           .map((update) => update._ === 'updateNewMessage' || update._ === 'updateNewChannelMessage'
             ? update.message.id
@@ -1522,10 +1523,15 @@ export class DialogRpc {
     this._onScheduledChange?.()
     return {
       _: 'updates',
-      updates: [{
-        _: 'updateNewScheduledMessage',
-        message: this._scheduledMessageTl(row, conversation),
-      }],
+      updates: [
+        // 客户端只靠 `updateMessageID` 把本地「发送中」的定时占位消息升级为服务端消息；
+        // 缺了它占位会一直转圈，`getScheduledHistory` 再插入一份带对勾的副本，发送后也删不掉占位。
+        { _: 'updateMessageID', id: tlMessageId, randomId: req.randomId },
+        {
+          _: 'updateNewScheduledMessage',
+          message: this._scheduledMessageTl(row, conversation),
+        },
+      ],
       users: [this._makeSelfUser()],
       chats: conversation.kind === 'direct' ? [] : [this._makeChat(conversation)],
       date: Math.floor(Date.now() / 1_000), seq: 0,
