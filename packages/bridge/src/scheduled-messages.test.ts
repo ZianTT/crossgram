@@ -231,6 +231,7 @@ async function createRpcFixture(platformSessionId: string) {
     credentials: {}, metadata: { firstName: 'Self' },
   }
   const sent: IMMessageInput[] = []
+  const control = { failNext: false }
   const platform: IMPlatform = {
     capabilities: {
       history: true,
@@ -239,6 +240,10 @@ async function createRpcFixture(platformSessionId: string) {
     },
     async subscribe() { return () => {} },
     async sendMessage(_session, conversation, content) {
+      if (control.failNext) {
+        control.failNext = false
+        throw new Error('platform offline')
+      }
       sent.push(content)
       return {
         id: `sent-${sent.length}`, conversationId: conversation.id, senderId: 'self',
@@ -272,7 +277,7 @@ async function createRpcFixture(platformSessionId: string) {
     })
     return ('messages' in listed ? listed.messages : []) as tl.RawMessage[]
   }
-  return { database, scheduled, session, sent, rpc, peer, listScheduled }
+  return { database, scheduled, session, sent, control, rpc, peer, listScheduled }
 }
 
 describe('scheduled message RPCs', () => {
@@ -336,5 +341,89 @@ describe('scheduled message RPCs', () => {
       expect(message.replyTo).toMatchObject({ _: 'messageReplyHeader', replyToMsgId: 1234 })
       expect((message.replyTo as tl.RawMessageReplyHeader).replyToScheduled).toBeFalsy()
     }
+  })
+
+  it('does not send again a row the dispatcher is already sending', async () => {
+    const { scheduled, session, sent, rpc, peer, listScheduled } = await createRpcFixture('rpc-session-race')
+    await rpc.sendMessage({
+      _: 'messages.sendMessage', peer, message: 'due now',
+      randomId: Long.fromNumber(101), scheduleDate: nowSeconds() - 1,
+    })
+    const scheduledId = (await listScheduled())[0].id
+    const [row] = await scheduled.list(session.platformSessionId, 'alice')
+    expect(await scheduled.claim(row.id, 'dispatcher', nowSeconds())).toBe(true)
+
+    const result = await rpc.sendScheduledMessages({
+      _: 'messages.sendScheduledMessages', peer, id: [scheduledId],
+    })
+    expect(sent).toHaveLength(0)
+    expect(result).toMatchObject({
+      _: 'updates',
+      updates: [{ _: 'updateDeleteScheduledMessages', messages: [] }],
+    })
+    expect(await scheduled.get(row.id)).toMatchObject({ status: 'sending', leaseOwner: 'dispatcher' })
+  })
+
+  it('leaves nothing for the dispatcher after sending now', async () => {
+    const { scheduled, session, sent, rpc, peer, listScheduled } = await createRpcFixture('rpc-session-sent')
+    await rpc.sendMessage({
+      _: 'messages.sendMessage', peer, message: 'only once',
+      randomId: Long.fromNumber(102), scheduleDate: nowSeconds() + 1,
+    })
+    const scheduledId = (await listScheduled())[0].id
+    const [row] = await scheduled.list(session.platformSessionId, 'alice')
+    const result = await rpc.sendScheduledMessages({
+      _: 'messages.sendScheduledMessages', peer, id: [scheduledId],
+    })
+    const deleteUpdate = (result._ === 'updates' ? result.updates : [])
+      .find((update) => update._ === 'updateDeleteScheduledMessages') as tl.RawUpdateDeleteScheduledMessages
+    expect(deleteUpdate.messages).toEqual([scheduledId])
+    expect(deleteUpdate.sentMessages).toHaveLength(1)
+    expect(await scheduled.get(row.id)).toMatchObject({ status: 'sent' })
+
+    const dispatched: ScheduledMessage[] = []
+    const dispatcher = new ScheduledMessageDispatcher(scheduled, async (message) => {
+      dispatched.push(message)
+      return 1
+    }, { now: () => (nowSeconds() + 10) * 1_000, schedule: recordingScheduler().schedule })
+    await dispatcher.sweep()
+    dispatcher.stop()
+    expect(dispatched).toHaveLength(0)
+    expect(sent).toHaveLength(1)
+  })
+
+  it('releases the row when sending now fails', async () => {
+    const { scheduled, session, control, rpc, peer, listScheduled } = await createRpcFixture('rpc-session-fail')
+    await rpc.sendMessage({
+      _: 'messages.sendMessage', peer, message: 'retry me',
+      randomId: Long.fromNumber(103), scheduleDate: nowSeconds() + 600,
+    })
+    const scheduledId = (await listScheduled())[0].id
+    const [row] = await scheduled.list(session.platformSessionId, 'alice')
+    control.failNext = true
+    await expect(rpc.sendScheduledMessages({
+      _: 'messages.sendScheduledMessages', peer, id: [scheduledId],
+    })).rejects.toThrow()
+    expect(await scheduled.get(row.id)).toMatchObject({
+      status: 'pending', attempts: 0, leaseOwner: null, lastError: 'platform offline',
+    })
+    expect(await listScheduled()).toHaveLength(1)
+  })
+
+  it('lets the user resend a parked failed row by hand', async () => {
+    const { scheduled, session, sent, rpc, peer, listScheduled } = await createRpcFixture('rpc-session-parked')
+    await rpc.sendMessage({
+      _: 'messages.sendMessage', peer, message: 'gave up',
+      randomId: Long.fromNumber(104), scheduleDate: nowSeconds() - 60,
+    })
+    const scheduledId = (await listScheduled())[0].id
+    const [row] = await scheduled.list(session.platformSessionId, 'alice')
+    await scheduled.reschedule(row.id, 7, nowSeconds(), 'failed', 'platform offline')
+
+    await rpc.sendScheduledMessages({
+      _: 'messages.sendScheduledMessages', peer, id: [scheduledId],
+    })
+    expect(sent.at(-1)?.parts[0]).toMatchObject({ type: 'text', text: 'gave up' })
+    expect(await scheduled.get(row.id)).toMatchObject({ status: 'sent', lastError: null })
   })
 })

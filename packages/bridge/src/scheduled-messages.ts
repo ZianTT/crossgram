@@ -145,7 +145,21 @@ export class ScheduledMessageStore {
   ): Promise<boolean> {
     // `@cordisjs/plugin-database` 的 `set()` 实现是先 SELECT 再 UPDATE，进程内两个认领者
     // 可能同时看到同一行。因此按数据库实例串行化认领；租约字段仍负责兜底崩溃的发送者。
-    return serializeClaim(this._database, () => this._claimUnlocked(messageId, owner, now, leaseMs))
+    return serializeClaim(this._database, () => this._claimUnlocked(messageId, owner, now, leaseMs, false))
+  }
+
+  /**
+   * 「立即发送」时认领一行：不看 `nextAttemptAt`，已搁置的 failed 行也可以手动重发。
+   *
+   * 与 `claim()` 共用同一把锁和同一套租约，保证调度器和立即发送不会同时发出同一条消息。
+   */
+  async claimNow(
+    messageId: number,
+    owner: string,
+    now: number,
+    leaseMs = SCHEDULED_MESSAGE_LEASE_MS,
+  ): Promise<boolean> {
+    return serializeClaim(this._database, () => this._claimUnlocked(messageId, owner, now, leaseMs, true))
   }
 
   private async _claimUnlocked(
@@ -153,6 +167,7 @@ export class ScheduledMessageStore {
     owner: string,
     now: number,
     leaseMs: number,
+    ignoreDue: boolean,
   ): Promise<boolean> {
     const claimLease = {
       status: 'sending' as const,
@@ -161,10 +176,17 @@ export class ScheduledMessageStore {
       updatedAt: new Date(),
     }
     // 拆成两次条件更新而不是一个 `$or`：到期的 pending 行，以及租约已过期的 sending 行。
-    const due = await this._database.set('mtproto_scheduled_state', {
-      messageId, status: 'pending', nextAttemptAt: { $lte: now },
-    }, claimLease)
-    if (writeCount(due) > 0) return true
+    if (ignoreDue) {
+      for (const status of ['pending', 'failed'] as const) {
+        const result = await this._database.set('mtproto_scheduled_state', { messageId, status }, claimLease)
+        if (writeCount(result) > 0) return true
+      }
+    } else {
+      const due = await this._database.set('mtproto_scheduled_state', {
+        messageId, status: 'pending', nextAttemptAt: { $lte: now },
+      }, claimLease)
+      if (writeCount(due) > 0) return true
+    }
     const expired = await this._database.set('mtproto_scheduled_state', {
       messageId, status: 'sending', leaseUntil: { $lt: now },
     }, claimLease)
@@ -178,6 +200,17 @@ export class ScheduledMessageStore {
       leaseOwner: null,
       leaseUntil: null,
       lastError: null,
+      updatedAt: new Date(),
+    })
+  }
+
+  /** 立即发送失败时释放认领，恢复成认领前的状态，不计入重试次数。 */
+  async release(messageId: number, status: ScheduledMessageStatus, error?: string): Promise<void> {
+    await this._database.set('mtproto_scheduled_state', { messageId }, {
+      status,
+      leaseOwner: null,
+      leaseUntil: null,
+      lastError: error ?? null,
       updatedAt: new Date(),
     })
   }

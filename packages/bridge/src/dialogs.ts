@@ -1358,8 +1358,8 @@ export class DialogRpc {
   /**
    * 立即发送定时消息。
    *
-   * 每一行都走普通发送路径，产生的消息会像正常发送一样落库和推送；
-   * 之后再把这些定时条目从客户端可见列表中移除。
+   * 每一行先经 `claimNow()` 认领再走普通发送路径，产生的消息会像正常发送一样落库和推送，
+   * 之后标记为 sent 并从客户端可见列表中移除。调度器正在发送的行会被跳过，交给调度器推送删除。
    */
   async sendScheduledMessages(
     req: tl.messages.RawSendScheduledMessagesRequest,
@@ -1372,26 +1372,43 @@ export class DialogRpc {
     )
     if (!rows.length) throw new RpcError(400, 'MESSAGE_ID_INVALID')
     const updates: tl.TypeUpdate[] = []
+    const removedIds: number[] = []
     const sentIds: number[] = []
-    for (const row of rows) {
-      const sent = await this._sendMessage(this._scheduledSendRequest(row))
-      const sentUpdates = sent._ === 'updates' ? sent.updates : []
-      updates.push(...sentUpdates)
-      const newId = sentUpdates
-        .map((update) => update._ === 'updateNewMessage' || update._ === 'updateNewChannelMessage'
-          ? update.message.id
-          : undefined)
-        .find((id): id is number => id !== undefined)
-      if (newId !== undefined) sentIds.push(newId)
-      await this._scheduled.cancel(
-        this._session.platformSessionId, conversation.id, row.tlMessageId,
-      )
+    const owner = `send-now-${this._session.platformSessionId}`
+    try {
+      for (const row of rows) {
+        const now = Math.floor(Date.now() / 1_000)
+        if (!await this._scheduled.claimNow(row.id, owner, now)) continue
+        let sent: tl.TypeUpdates
+        try {
+          sent = await this._sendMessage(this._scheduledSendRequest(row))
+        } catch (error) {
+          await this._scheduled.release(
+            row.id, row.status === 'failed' ? 'failed' : 'pending',
+            error instanceof Error ? error.message : String(error),
+          )
+          throw error
+        }
+        const sentUpdates = sent._ === 'updates' ? sent.updates : []
+        updates.push(...sentUpdates)
+        const newId = sentUpdates
+          .map((update) => update._ === 'updateNewMessage' || update._ === 'updateNewChannelMessage'
+            ? update.message.id
+            : undefined)
+          .find((id): id is number => id !== undefined)
+        if (newId !== undefined) sentIds.push(newId)
+        await this._scheduled.markSent(row.id, newId)
+        removedIds.push(row.tlMessageId)
+      }
+    } finally {
+      this._onScheduledChange?.()
     }
-    this._onScheduledChange?.()
     updates.push({
       _: 'updateDeleteScheduledMessages',
       peer: this._conversationPeer(conversation),
-      messages: rows.map((row) => row.tlMessageId),
+      messages: removedIds,
+      // sent_messages 必须与 messages 一一对应，有缺失时整体省略。
+      sentMessages: sentIds.length && sentIds.length === removedIds.length ? sentIds : undefined,
     })
     return {
       _: 'updates', updates,
