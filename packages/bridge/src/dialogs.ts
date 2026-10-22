@@ -1549,7 +1549,7 @@ export class DialogRpc {
       entities: (row.entities ?? undefined) as unknown as tl.TypeMessageEntity[] | undefined,
       out: true,
       replyTo: row.replyToMsgId
-        ? { _: 'messageReplyHeader', replyToScheduled: true, replyToMsgId: row.replyToMsgId }
+        ? { _: 'messageReplyHeader', replyToMsgId: row.replyToMsgId }
         : undefined,
     }
   }

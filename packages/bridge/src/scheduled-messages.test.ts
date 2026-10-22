@@ -222,52 +222,62 @@ describe('scheduled timer cap', () => {
   })
 })
 
+async function createRpcFixture(platformSessionId: string) {
+  const database = await createDatabase()
+  const store = new MessageStore(database)
+  const scheduled = new ScheduledMessageStore(database)
+  const session = {
+    platformSessionId, platformId: 'rpc-platform', userId: 'self',
+    credentials: {}, metadata: { firstName: 'Self' },
+  }
+  const sent: IMMessageInput[] = []
+  const platform: IMPlatform = {
+    capabilities: {
+      history: true,
+      send: { text: true, images: false, files: false, mixed: false, maxTextLength: 4096, maxMedia: 0 },
+      conversations: { groups: false, channels: false, subchannels: false },
+    },
+    async subscribe() { return () => {} },
+    async sendMessage(_session, conversation, content) {
+      sent.push(content)
+      return {
+        id: `sent-${sent.length}`, conversationId: conversation.id, senderId: 'self',
+        timestamp: Math.floor(Date.now() / 1_000), outgoing: true, content,
+      }
+    },
+    async getDialogs() {
+      return {
+        dialogs: [{
+          conversation: { id: 'alice', kind: 'direct' as const, title: 'Alice' },
+          unreadCount: 0,
+        }],
+      }
+    },
+    async getHistory() { return { messages: [] } },
+    async getUser(_session, id) {
+      return id === 'alice' ? { id, firstName: 'Alice' } : null
+    },
+    async getContacts() { return { users: [{ id: 'alice', firstName: 'Alice' }] } },
+  } as unknown as IMPlatform
+  const rpc = new DialogRpc(
+    platform, session, store, undefined, undefined, 1, undefined, undefined, undefined,
+    undefined, undefined, undefined, undefined, undefined, undefined, 1, undefined,
+    undefined, undefined, undefined, undefined, scheduled,
+  )
+  await rpc.getContacts()
+  const peer = { _: 'inputPeerUser' as const, userId: rpc.peerTlId('alice'), accessHash: Long.ZERO }
+  const listScheduled = async (): Promise<tl.RawMessage[]> => {
+    const listed = await rpc.getScheduledHistory({
+      _: 'messages.getScheduledHistory', peer, hash: Long.ZERO,
+    })
+    return ('messages' in listed ? listed.messages : []) as tl.RawMessage[]
+  }
+  return { database, scheduled, session, sent, rpc, peer, listScheduled }
+}
+
 describe('scheduled message RPCs', () => {
   it('creates, lists, delivers and deletes a scheduled text message', async () => {
-    const database = await createDatabase()
-    const store = new MessageStore(database)
-    const scheduled = new ScheduledMessageStore(database)
-    const session = {
-      platformSessionId: 'rpc-session', platformId: 'rpc-platform', userId: 'self',
-      credentials: {}, metadata: { firstName: 'Self' },
-    }
-    let lastInput: IMMessageInput | undefined
-    const platform: IMPlatform = {
-      capabilities: {
-        history: true,
-        send: { text: true, images: false, files: false, mixed: false, maxTextLength: 4096, maxMedia: 0 },
-        conversations: { groups: false, channels: false, subchannels: false },
-      },
-      async subscribe() { return () => {} },
-      async sendMessage(_session, conversation, content) {
-        lastInput = content
-        return {
-          id: String(Date.now()), conversationId: conversation.id, senderId: 'self',
-          timestamp: Math.floor(Date.now() / 1_000), outgoing: true, content,
-        }
-      },
-      async getDialogs() {
-        return {
-          dialogs: [{
-            conversation: { id: 'alice', kind: 'direct' as const, title: 'Alice' },
-            unreadCount: 0,
-          }],
-        }
-      },
-      async getHistory() { return { messages: [] } },
-      async getUser(_session, id) {
-        return id === 'alice' ? { id, firstName: 'Alice' } : null
-      },
-      async getContacts() { return { users: [{ id: 'alice', firstName: 'Alice' }] } },
-    } as unknown as IMPlatform
-    const rpc = new DialogRpc(
-      platform, session, store, undefined, undefined, 1, undefined, undefined, undefined,
-      undefined, undefined, undefined, undefined, undefined, undefined, 1, undefined,
-      undefined, undefined, undefined, undefined, scheduled,
-    )
-    await rpc.getContacts()
-    const aliceId = rpc.peerTlId('alice')
-    const peer = { _: 'inputPeerUser' as const, userId: aliceId, accessHash: Long.ZERO }
+    const { scheduled, session, sent, rpc, peer, listScheduled } = await createRpcFixture('rpc-session')
     const created = await rpc.sendMessage({
       _: 'messages.sendMessage', peer, message: 'send this later',
       randomId: Long.fromNumber(41), scheduleDate: nowSeconds() + 120,
@@ -277,18 +287,14 @@ describe('scheduled message RPCs', () => {
       updates: [{ _: 'updateNewScheduledMessage', message: { message: 'send this later' } }],
     })
 
-    const listed = await rpc.getScheduledHistory({
-      _: 'messages.getScheduledHistory', peer, hash: Long.ZERO,
-    })
-    expect(listed).toMatchObject({ _: 'messages.messages' })
-    const listedMessages = 'messages' in listed ? listed.messages : []
+    const listedMessages = await listScheduled()
     expect(listedMessages).toHaveLength(1)
-    const scheduledMessage = listedMessages[0] as tl.RawMessage
+    const scheduledMessage = listedMessages[0]
     expect(scheduledMessage).toMatchObject({ message: 'send this later', out: true })
 
     const row = (await scheduled.list(session.platformSessionId, 'alice'))[0]
     const delivered = await rpc.deliverScheduled(row)
-    expect(lastInput?.parts[0]).toMatchObject({ type: 'text', text: 'send this later' })
+    expect(sent.at(-1)?.parts[0]).toMatchObject({ type: 'text', text: 'send this later' })
     expect(delivered.sentTlMessageId).toBeGreaterThan(0)
 
     const deleted = await rpc.deleteScheduledMessages({
@@ -302,62 +308,33 @@ describe('scheduled message RPCs', () => {
   })
 
   it('sends a scheduled message immediately when asked', async () => {
-    const database = await createDatabase()
-    const store = new MessageStore(database)
-    const scheduled = new ScheduledMessageStore(database)
-    const session = {
-      platformSessionId: 'rpc-session-2', platformId: 'rpc-platform', userId: 'self',
-      credentials: {}, metadata: { firstName: 'Self' },
-    }
-    let lastInput: IMMessageInput | undefined
-    const platform: IMPlatform = {
-      capabilities: {
-        history: true,
-        send: { text: true, images: false, files: false, mixed: false, maxTextLength: 4096, maxMedia: 0 },
-        conversations: { groups: false, channels: false, subchannels: false },
-      },
-      async subscribe() { return () => {} },
-      async sendMessage(_session, conversation, content) {
-        lastInput = content
-        return {
-          id: String(Date.now()), conversationId: conversation.id, senderId: 'self',
-          timestamp: Math.floor(Date.now() / 1_000), outgoing: true, content,
-        }
-      },
-      async getDialogs() {
-        return {
-          dialogs: [{
-            conversation: { id: 'alice', kind: 'direct' as const, title: 'Alice' },
-            unreadCount: 0,
-          }],
-        }
-      },
-      async getHistory() { return { messages: [] } },
-      async getUser(_session, id) { return { id, firstName: id } },
-      async getContacts() { return { users: [{ id: 'alice', firstName: 'Alice' }] } },
-    } as unknown as IMPlatform
-    const rpc = new DialogRpc(
-      platform, session, store, undefined, undefined, 1, undefined, undefined, undefined,
-      undefined, undefined, undefined, undefined, undefined, undefined, 1, undefined,
-      undefined, undefined, undefined, undefined, scheduled,
-    )
-    await rpc.getContacts()
-    const peer = { _: 'inputPeerUser' as const, userId: rpc.peerTlId('alice'), accessHash: Long.ZERO }
+    const { scheduled, session, sent, rpc, peer, listScheduled } = await createRpcFixture('rpc-session-2')
     await rpc.sendMessage({
       _: 'messages.sendMessage', peer, message: 'right now',
       randomId: Long.fromNumber(77), scheduleDate: nowSeconds() + 600,
     })
-    const listed = await rpc.getScheduledHistory({
-      _: 'messages.getScheduledHistory', peer, hash: Long.ZERO,
-    })
-    const listedMessages = 'messages' in listed ? listed.messages : []
-    const scheduledId = (listedMessages[0] as tl.RawMessage).id
-    const sent = await rpc.sendScheduledMessages({
+    const scheduledId = (await listScheduled())[0].id
+    const result = await rpc.sendScheduledMessages({
       _: 'messages.sendScheduledMessages', peer, id: [scheduledId],
     })
-    expect(lastInput?.parts[0]).toMatchObject({ type: 'text', text: 'right now' })
-    expect((sent._ === 'updates' ? sent.updates : [])
+    expect(sent.at(-1)?.parts[0]).toMatchObject({ type: 'text', text: 'right now' })
+    expect((result._ === 'updates' ? result.updates : [])
       .some((update) => update._ === 'updateDeleteScheduledMessages')).toBe(true)
     expect(await scheduled.list(session.platformSessionId, 'alice')).toHaveLength(0)
+  })
+
+  it('points a scheduled reply at the ordinary message it quotes', async () => {
+    const { rpc, peer, listScheduled } = await createRpcFixture('rpc-session-reply')
+    const created = await rpc.sendMessage({
+      _: 'messages.sendMessage', peer, message: 'reply later',
+      randomId: Long.fromNumber(91), scheduleDate: nowSeconds() + 300,
+      replyTo: { _: 'inputReplyToMessage', replyToMsgId: 1234 },
+    })
+    const update = (created._ === 'updates' ? created.updates : [])[0] as tl.RawUpdateNewScheduledMessage
+    const listed = (await listScheduled())[0]
+    for (const message of [update.message as tl.RawMessage, listed]) {
+      expect(message.replyTo).toMatchObject({ _: 'messageReplyHeader', replyToMsgId: 1234 })
+      expect((message.replyTo as tl.RawMessageReplyHeader).replyToScheduled).toBeFalsy()
+    }
   })
 })
