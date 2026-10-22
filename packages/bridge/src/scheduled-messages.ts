@@ -5,26 +5,25 @@ import type {
 } from './models.js'
 import type { IMConversationKind, JsonValue } from './platform.js'
 
-/** How long one dispatcher may hold a row before another pass may steal it. */
+/** 一个调度器持有某行的租约时长，超时后其他轮次可以抢占。 */
 export const SCHEDULED_MESSAGE_LEASE_MS = 60_000
 /**
- * Node timers cannot wait longer than 2^31-1 ms (about 24.8 days) and fire
- * immediately when they overflow, so long schedule dates are truncated and
- * re-armed when the truncated timer wakes.
+ * 单个定时器的最长等待（24 小时）。Node 定时器最多只能等 2^31-1 ms（约 24.8 天），
+ * 溢出会立即触发，所以较远的定时时间会被截断，截断的定时器醒来后再重新挂载。
  */
 export const SCHEDULED_MESSAGE_MAX_DELAY_MS = 24 * 60 * 60 * 1_000
-/** Retry delays after a failed send; the sixth failure parks the row. */
+/** 发送失败后的重试间隔；第七次失败后把该行置为 failed 搁置。 */
 export const SCHEDULED_MESSAGE_RETRY_MS = [
   30_000, 120_000, 600_000, 3_600_000, 21_600_000, 86_400_000,
 ]
-/** How often the safety sweep looks for rows the timer missed. */
+/** 兜底扫描的间隔，用来捞回定时器漏掉的行。 */
 export const SCHEDULED_MESSAGE_FALLBACK_MS = 120_000
-/** Rows claimed by one pass; keeps one burst from blocking the event loop. */
+/** 单轮最多认领的行数，避免一次突发堵住事件循环。 */
 export const SCHEDULED_MESSAGE_BATCH = 50
 
 export type ScheduledMessageStatus = ScheduledMessageStateRow['status']
 
-/** One scheduled message joined with its scheduling state. */
+/** 一条定时消息与其调度状态 join 后的结果。 */
 export interface ScheduledMessage extends ScheduledMessageRow {
   dueAt: number
   status: ScheduledMessageStatus
@@ -45,17 +44,15 @@ export interface CreateScheduledMessageInput {
   text: string
   entities?: JsonValue[] | null
   replyToMsgId?: number
-  /** Absolute send time in Unix seconds. */
+  /** 绝对发送时间，Unix 秒。 */
   dueAt: number
   randomId: string
 }
 
 /**
- * Durable half of scheduled messages.
+ * 定时消息的持久化部分。
  *
- * The message body and its scheduling state live in separate tables: editing a
- * body never touches the state machine, and retries/leases never rewrite the
- * body.
+ * 消息内容和调度状态分表存放：编辑内容不会碰状态机，重试/租约也不会改写内容。
  */
 export class ScheduledMessageStore {
   constructor(private readonly _database: Database) {}
@@ -117,7 +114,7 @@ export class ScheduledMessageStore {
     return row
   }
 
-  /** Earliest row that may still be sent, across every session. */
+  /** 所有会话中最早的、仍可能发送的行。 */
   async nextPending(now = Math.floor(Date.now() / 1_000)): Promise<ScheduledMessage | undefined> {
     const states = await this._database.select('mtproto_scheduled_state', { status: 'pending' })
       .execute()
@@ -125,7 +122,7 @@ export class ScheduledMessageStore {
     return rows.sort((left, right) => left.nextAttemptAt - right.nextAttemptAt)[0]
   }
 
-  /** Rows due at `now`, oldest first. */
+  /** 在 `now` 时已到期的行，按时间从早到晚。 */
   async due(now: number, limit = SCHEDULED_MESSAGE_BATCH): Promise<ScheduledMessage[]> {
     const states = await this._database.select('mtproto_scheduled_state', { status: 'pending' })
       .execute()
@@ -135,11 +132,10 @@ export class ScheduledMessageStore {
   }
 
   /**
-   * Atomically move one due row to `sending`.
+   * 把一条到期的行切到 `sending`（认领）。
    *
-   * A single conditional UPDATE is the portable lock: SQLite has no
-   * `SELECT ... FOR UPDATE SKIP LOCKED`, and this statement is atomic on every
-   * supported driver. `modified === 1` means this process won the row.
+   * 用条件 UPDATE 充当可移植的锁：SQLite 没有 `SELECT ... FOR UPDATE SKIP LOCKED`。
+   * 写入计数大于 0 表示本进程抢到了这一行。
    */
   async claim(
     messageId: number,
@@ -147,9 +143,8 @@ export class ScheduledMessageStore {
     now: number,
     leaseMs = SCHEDULED_MESSAGE_LEASE_MS,
   ): Promise<boolean> {
-    // `@cordisjs/plugin-database` implements `set()` as SELECT-then-UPDATE, so
-    // two in-process claimers can both observe the same row. Serialize claims
-    // per database instance; the lease columns still guard crashed senders.
+    // `@cordisjs/plugin-database` 的 `set()` 实现是先 SELECT 再 UPDATE，进程内两个认领者
+    // 可能同时看到同一行。因此按数据库实例串行化认领；租约字段仍负责兜底崩溃的发送者。
     return serializeClaim(this._database, () => this._claimUnlocked(messageId, owner, now, leaseMs))
   }
 
@@ -165,8 +160,7 @@ export class ScheduledMessageStore {
       leaseUntil: now + Math.ceil(leaseMs / 1_000),
       updatedAt: new Date(),
     }
-    // Two single-statement conditional updates instead of one `$or`: each is a
-    // plain `UPDATE ... WHERE` and therefore atomic on every driver.
+    // 拆成两次条件更新而不是一个 `$or`：到期的 pending 行，以及租约已过期的 sending 行。
     const due = await this._database.set('mtproto_scheduled_state', {
       messageId, status: 'pending', nextAttemptAt: { $lte: now },
     }, claimLease)
@@ -188,7 +182,7 @@ export class ScheduledMessageStore {
     })
   }
 
-  /** Put a row back for a later attempt (or park it after too many). */
+  /** 把一行放回去等待下次尝试（失败次数过多时搁置）。 */
   async reschedule(
     messageId: number,
     attempts: number,
@@ -224,7 +218,7 @@ export class ScheduledMessageStore {
     return modified > 0
   }
 
-  /** Rows whose lease expired while their sender was running (crash recovery). */
+  /** 把发送途中租约过期的行放回 pending（崩溃恢复）。 */
   async requeueExpired(now: number): Promise<number> {
     const result = await this._database.set('mtproto_scheduled_state', {
       status: 'sending',
@@ -271,7 +265,7 @@ export class ScheduledMessageStore {
 
 const claimLocks = new WeakMap<object, Promise<void>>()
 
-/** Run `fn` after every earlier claim on the same database settled. */
+/** 等同一数据库上之前的认领全部结束后再执行 `fn`。 */
 async function serializeClaim<T>(key: object, fn: () => Promise<T>): Promise<T> {
   const previous = claimLocks.get(key) ?? Promise.resolve()
   let release!: () => void
@@ -291,17 +285,15 @@ export interface ScheduledDispatcherOptions {
   maxDelayMs?: number
   leaseMs?: number
   now?: () => number
-  /** Injected in tests; production uses `cron` + `setTimeout`. */
+  /** 测试中注入；生产环境使用 `cron` + `setTimeout`。 */
   schedule?: (dueMs: number, callback: () => void) => () => void
 }
 
 /**
- * Arms one timer for the earliest due message and falls back to a periodic
- * sweep.
+ * 只为最早到期的消息挂一个定时器，另有周期性扫描兜底。
  *
- * Polling every second is unnecessary: the timer fires exactly at the due
- * second, and the sweep exists for restart, clock jumps and a throwing
- * callback. Both paths go through `claim()`, so they cannot double-send.
+ * 不需要每秒轮询：定时器会在到期那一秒触发，扫描只负责重启、时钟跳变和回调抛错等情况。
+ * 两条路径都经过 `claim()`，不会重复发送。
  */
 export class ScheduledMessageDispatcher {
   private readonly _owner: string
@@ -350,10 +342,9 @@ export class ScheduledMessageDispatcher {
   }
 
   /**
-   * Re-arm only when the new earliest row is earlier than the armed one.
+   * 只有新的最早行比当前已挂载的更早时才重新挂载。
    *
-   * Re-arming on every change is harmless but wakes the process for nothing;
-   * equal or later dates leave the current timer alone.
+   * 每次变更都重挂虽然无害，但会白白唤醒进程；相同或更晚的时间保持当前定时器不动。
    */
   async rescan(): Promise<void> {
     if (this._stopped) return
@@ -367,7 +358,7 @@ export class ScheduledMessageDispatcher {
     this._arm(next)
   }
 
-  /** Claim and send everything that is due, then re-arm. */
+  /** 认领并发送所有到期的行，然后重新挂载。 */
   async sweep(): Promise<void> {
     if (this._stopped) return
     this._clearTimer()
@@ -405,7 +396,7 @@ export class ScheduledMessageDispatcher {
     this._armedAt = message.nextAttemptAt
     const delay = message.nextAttemptAt * 1_000 - this._now()
     if (delay > this._maxDelayMs) {
-      // Re-arm when the truncated wait expires; the row is still in the future.
+      // 截断的等待结束后重新挂载；该行仍在未来。
       const timer = setTimeout(() => { void this.sweep() }, this._maxDelayMs)
       timer.unref?.()
       this._cancelTimer = () => clearTimeout(timer)
@@ -430,17 +421,17 @@ export class ScheduledMessageDispatcher {
 }
 
 /**
- * Clamp one timer wait to what Node can represent.
+ * 把单次定时器等待限制在 Node 能表示的范围内。
  *
- * `setTimeout` fires immediately when the delay exceeds 2^31-1 ms, so a date
- * months away must be cut down and re-armed when the truncated wait expires.
+ * 延迟超过 2^31-1 ms 时 `setTimeout` 会立即触发，所以几个月后的时间必须截断，
+ * 等截断的等待结束后再重新挂载。
  */
 export function clampScheduleDelay(delayMs: number, maxMs = SCHEDULED_MESSAGE_MAX_DELAY_MS): number {
   if (!Number.isFinite(delayMs)) return maxMs
   return Math.min(Math.max(0, Math.trunc(delayMs)), maxMs)
 }
 
-/** Drivers report a conditional UPDATE as `matched` or `modified`. */
+/** 不同驱动用 `matched` 或 `modified` 报告条件 UPDATE 的结果。 */
 function writeCount(result: { modified?: number, matched?: number }): number {
   return result.modified ?? result.matched ?? 0
 }
@@ -448,8 +439,8 @@ function writeCount(result: { modified?: number, matched?: number }): number {
 function defaultSchedule(): (dueMs: number, callback: () => void) => () => void {
   return (dueMs, callback) => {
     const delay = clampScheduleDelay(dueMs - Date.now())
-    // Very short waits are not worth a cron job; `cron` also rounds dates to
-    // whole seconds, which would make sub-second tests and immediate rows late.
+    // 很短的等待不值得开 cron job；而且 `cron` 会把时间取整到秒，
+    // 导致亚秒级的测试和需立即发送的行延迟。
     if (delay < 1_000) {
       const timer = setTimeout(callback, Math.max(0, delay))
       timer.unref?.()

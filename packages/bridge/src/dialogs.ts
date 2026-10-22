@@ -1356,11 +1356,10 @@ export class DialogRpc {
   }
 
   /**
-   * Send scheduled messages now.
+   * 立即发送定时消息。
    *
-   * Each row goes through the ordinary send path, so the resulting message is
-   * persisted and published exactly like a normal send; the scheduled entries
-   * are then removed from the client-visible list.
+   * 每一行都走普通发送路径，产生的消息会像正常发送一样落库和推送；
+   * 之后再把这些定时条目从客户端可见列表中移除。
    */
   async sendScheduledMessages(
     req: tl.messages.RawSendScheduledMessagesRequest,
@@ -1428,10 +1427,10 @@ export class DialogRpc {
   }
 
   /**
-   * Deliver one stored row when its time comes (called by the dispatcher).
+   * 到时间后投递一条已存储的行（由调度器调用）。
    *
-   * The peer is rebuilt from the stored conversation id rather than from the
-   * creating client's input peer, so a restart cannot leave a stale peer behind.
+   * peer 按存储的会话 ID 重建，而不是用创建时客户端传入的 input peer，
+   * 这样重启后也不会留下过期的 peer。
    */
   async deliverScheduled(message: ScheduledMessage): Promise<{
     sentTlMessageId?: number
