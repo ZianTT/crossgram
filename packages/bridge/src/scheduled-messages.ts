@@ -175,22 +175,17 @@ export class ScheduledMessageStore {
       leaseUntil: now + Math.ceil(leaseMs / 1_000),
       updatedAt: new Date(),
     }
-    // 拆成两次条件更新而不是一个 `$or`：到期的 pending 行，以及租约已过期的 sending 行。
-    if (ignoreDue) {
-      for (const status of ['pending', 'failed'] as const) {
-        const result = await this._database.set('mtproto_scheduled_state', { messageId, status }, claimLease)
-        if (writeCount(result) > 0) return true
-      }
-    } else {
-      const due = await this._database.set('mtproto_scheduled_state', {
-        messageId, status: 'pending', nextAttemptAt: { $lte: now },
-      }, claimLease)
-      if (writeCount(due) > 0) return true
-    }
-    const expired = await this._database.set('mtproto_scheduled_state', {
-      messageId, status: 'sending', leaseUntil: { $lt: now },
+    // 可认领：到期的 pending 行（立即发送时不看到期时间，也包括 failed），以及租约已过期的 sending 行。
+    const result = await this._database.set('mtproto_scheduled_state', {
+      messageId,
+      $or: [
+        ignoreDue
+          ? { $or: [{ status: 'pending' }, { status: 'failed' }] }
+          : { status: 'pending', nextAttemptAt: { $lte: now } },
+        { status: 'sending', leaseUntil: { $lt: now } },
+      ],
     }, claimLease)
-    return writeCount(expired) > 0
+    return writeCount(result) > 0
   }
 
   async markSent(messageId: number, sentTlMessageId?: number): Promise<void> {
@@ -239,16 +234,13 @@ export class ScheduledMessageStore {
       platformSessionId, platformConversationId, tlMessageId,
     })
     if (!message) return false
-    let modified = 0
-    for (const status of ['pending', 'sending', 'failed'] as const) {
-      const result = await this._database.set('mtproto_scheduled_state', {
-        messageId: message.id, status,
-      }, {
-        status: 'cancelled', leaseOwner: null, leaseUntil: null, updatedAt: new Date(),
-      })
-      modified += writeCount(result)
-    }
-    return modified > 0
+    const result = await this._database.set('mtproto_scheduled_state', {
+      messageId: message.id,
+      $or: [{ status: 'pending' }, { status: 'sending' }, { status: 'failed' }],
+    }, {
+      status: 'cancelled', leaseOwner: null, leaseUntil: null, updatedAt: new Date(),
+    })
+    return writeCount(result) > 0
   }
 
   /** 把发送途中租约过期的行放回 pending（崩溃恢复）。 */
