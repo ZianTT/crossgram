@@ -3,12 +3,9 @@ import { inflateRawSync, unzipSync } from 'node:zlib'
 export const MAX_PACKED_DATA_UNPACKED_SIZE = 16 * 1024 * 1024
 
 /**
- * Decompresses the payload carried by gzip_packed.
- *
- * Telegram documents this envelope as gzip, but TDLib builds in the wild can
- * send a zlib wrapper or a raw DEFLATE stream. unzipSync handles gzip and zlib;
- * the raw inflater is deliberately only a fallback. Both paths enforce the
- * same output cap so a small transport envelope cannot expand without bound.
+ * 解压 `gzip_packed` 载荷。
+ * 协议文档规定为 gzip，但部分 TDLib 客户端会发送 zlib 或裸 DEFLATE 流；
+ * 因此先尝试 `unzipSync`（兼容 gzip/zlib），失败后回退到 `inflateRawSync`，并统一限制解压后大小防止内存炸弹。
  */
 export function unpackPackedData(packedData: Uint8Array): Uint8Array {
   const options = { maxOutputLength: MAX_PACKED_DATA_UNPACKED_SIZE }

@@ -5,32 +5,16 @@ import { Bytes, read, write, type ISyncWritable } from '@fuman/io'
 import { reclaimReceiveBuffer } from './receive-buffer.js'
 import { u8 } from '@fuman/utils'
 
-/**
- * Server-side implementations of the MTProto TCP transports that mtcute does
- * not export as ready-to-use server codecs.
- *
- * mtcute's `ObfuscatedPacketCodec` is written for the *client* side — its
- * `tag()` method generates the random 64-byte init header. On the server we
- * receive that header instead of generating it, so we derive the AES-CTR keys
- * from it (see {@link createServerObfuscation}) rather than making our own.
- */
-
 const EMPTY_TAG = new Uint8Array(0)
 
 /**
- * Abridged transport codec (client tag `0xef`).
- *
- * mtcute only exports `IntermediatePacketCodec` and
- * `PaddedIntermediatePacketCodec`, so we implement abridged here since
- * Telegram Desktop / TDLib forks may negotiate it inside obfuscation.
- *
- * Frame format: a length header (in 4-byte words) followed by the payload.
- *   - length < 0x7f: single byte `length`
- *   - length >= 0x7f: byte `0x7f` then 3-byte little-endian `length`
+ * Abridged 传输层编解码器（客户端首字节标识 `0xef`）。
+ * 帧格式：长度头（以 4 字节字为单位）+ 载荷。
+ *   - 长度 < 0x7f：单字节 `length`
+ *   - 长度 >= 0x7f：`0x7f` + 3 字节小端 `length`
  */
 export class AbridgedPacketCodec implements IPacketCodec {
   tag(): Uint8Array {
-    // Never sent by the server; present to satisfy IPacketCodec.
     return new Uint8Array([0xef])
   }
 
@@ -39,12 +23,7 @@ export class AbridgedPacketCodec implements IPacketCodec {
     if (reader.available < 1) return null
 
     const firstByte = reader.readSync(1)[0]
-    // Telegram clients set bit 7 on the abridged length marker when they ask
-    // for a transport-level quick acknowledgement. It is not part of the
-    // packet length. In particular, a short 74-word frame is encoded as 0xca,
-    // not as the four-byte-length marker. Treating the unmasked value as the
-    // marker makes the following three ciphertext bytes look like a huge
-    // length and stalls the connection until the client reconnects.
+    // 客户端请求 quick ack 时会置位 abridged 长度字节的最高位（bit 7），计算帧长时需掩去。
     const lengthMarker = firstByte & 0x7f
     let length: number
     let headerSize: number
@@ -87,11 +66,7 @@ export class AbridgedPacketCodec implements IPacketCodec {
   reset(): void {}
 }
 
-/**
- * Server-side obfuscated transport codec. Wraps an inner codec (intermediate,
- * padded-intermediate or abridged) and transparently AES-CTR de/encrypts the
- * byte stream, using the keys derived from the client's init header.
- */
+/** 服务端混淆传输层编解码器：在外层做 AES-CTR 流加解密，内层委托给具体的协议分帧器 */
 export class ServerObfuscatedCodec implements IPacketCodec {
   private _decodeBuf = Bytes.alloc()
 
@@ -118,11 +93,9 @@ export class ServerObfuscatedCodec implements IPacketCodec {
   }
 
   private _finishDecode(frame: Uint8Array | null): Uint8Array | null {
-    // Standard codecs return owned frames. Preserve the IPacketCodec contract
-    // for a codec returning a view too: compaction must not overwrite its frame.
+    // 若内层解码器返回了共享底层 buffer 的视图，需在压缩缓冲区前拷贝一份
     if (frame && frame.buffer === this._decodeBuf.result().buffer) frame = new Uint8Array(frame)
-    // Avoid repeatedly shifting the entire suffix of a batch of many frames.
-    // Compact only when the inner decoder needs more input, or the batch is empty.
+    // 仅在等待更多数据或缓冲区已排空时回收，避免批量解帧时反复搬移尾部数据
     if (frame === null || this._decodeBuf.available === 0) {
       this._decodeBuf = reclaimReceiveBuffer(this._decodeBuf, 16 * 1024)
     }
@@ -150,7 +123,6 @@ function allEqual(bytes: Uint8Array, value: number): boolean {
   return bytes[0] === value && bytes[1] === value && bytes[2] === value && bytes[3] === value
 }
 
-/** Pick the inner codec that matches the 4-byte protocol tag from the header. */
 function selectInnerCodec(tag: Uint8Array, crypto: ICryptoProvider, log: Logger): IPacketCodec {
   if (allEqual(tag, 0xdd)) {
     const codec = new PaddedIntermediatePacketCodec()
@@ -167,24 +139,9 @@ function selectInnerCodec(tag: Uint8Array, crypto: ICryptoProvider, log: Logger)
 }
 
 /**
- * Set up server-side obfuscation from a client's 64-byte init header.
- *
- * The client (mtcute / TDLib / Telegram Desktop) builds the header roughly as:
- *   - `header[8:40]`  encrypt key   (client → server)
- *   - `header[40:56]` encrypt IV
- *   - `reverse(header[8:56])[0:32]`  decrypt key (server → client)
- *   - `reverse(header[8:56])[32:48]` decrypt IV
- *   - `header[56:60]` inner protocol tag (encrypted in the last 8 bytes on the wire)
- *
- * It then AES-CTR-encrypts the whole 64-byte header with its *encrypt* cipher
- * and replaces bytes `[56:64]` with the encrypted version before sending.
- *
- * On the server we therefore:
- *   - build our *decryptor* from the client's encrypt key/IV,
- *   - build our *encryptor* from the client's (reversed) decrypt key/IV,
- *   - advance the decryptor over the full 64-byte header so its keystream is in
- *     sync with the client's encryptor, and recover the inner protocol tag from
- *     the decrypted `[56:60]`.
+ * 从客户端发送的 64 字节混淆握手头派生服务端 AES-CTR 编解码器。
+ * 握手头布局：`[8:40]` 客户端加密 key，`[40:56]` 加密 IV；将 `[8:56]` 逆序后前 32 字节为服务端加密 key、后 16 字节为 IV。
+ * 客户端发送前用自身加密器加密了 `[56:64]`，因此服务端解密器需先推进完整 64 字节以同步密钥流，并从解密后的 `[56:60]` 取出内层协议标识。
  */
 export function createServerObfuscation(
   header: Uint8Array,
@@ -201,13 +158,9 @@ export function createServerObfuscation(
   const decryptKey = reversed.subarray(0, 32)
   const decryptIv = reversed.subarray(32, 48)
 
-  // Names are from the client's perspective: what the client encrypts we
-  // decrypt, and vice versa. The boolean flag is a no-op for CTR mode.
   const decryptor = crypto.createAesCtr(encryptKey, encryptIv, false)
   const encryptor = crypto.createAesCtr(decryptKey, decryptIv, true)
 
-  // Advance the decryptor over the whole header (the client's encryptor also
-  // processed 64 bytes), and recover the inner protocol tag from [56:60].
   const decryptedHeader = decryptor.process(header)
   const innerTag = decryptedHeader.subarray(56, 60)
 

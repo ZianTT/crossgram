@@ -29,12 +29,9 @@ extern "C" {
 #define CROSSGRAM_TGCALLS_SHIM_MAX_RTC_SERVERS 16u
 #define CROSSGRAM_TGCALLS_SHIM_MAX_SIGNAL_BYTES 32768u
 
-/** Opaque full session handle. */
 typedef struct crossgram_tgcalls_shim crossgram_tgcalls_shim;
-/** Opaque fixed-capacity PCM bridge handle. */
 typedef struct crossgram_tgcalls_pcm_bridge crossgram_tgcalls_pcm_bridge;
 
-/** Stable fixed-width values for the versioned C ABI. */
 typedef uint32_t crossgram_tgcalls_shim_status;
 typedef uint32_t crossgram_tgcalls_endpoint_type;
 typedef uint32_t crossgram_tgcalls_protocol_version;
@@ -58,16 +55,13 @@ typedef uint32_t crossgram_tgcalls_protocol_version;
 #define CROSSGRAM_TGCALLS_PROTOCOL_V0 UINT32_C(0)
 #define CROSSGRAM_TGCALLS_PROTOCOL_V1 UINT32_C(1)
 
-/**
- * A non-owning UTF-8 view. It is copied synchronously by session creation and
- * must not contain an embedded NUL. It is used for endpoint host names only.
- */
+/** 非拥有型 UTF-8 视图（由会话创建过程同步拷贝，不得包含内嵌 NUL）。 */
 typedef struct crossgram_tgcalls_string_view {
   const char* data;
   uint32_t length;
 } crossgram_tgcalls_string_view;
 
-/** One typed Telegram call endpoint. Both host views may be empty, but not both. */
+/** 单个 Telegram 通话端点；`ipv4` 与 `ipv6` 不可同时为空。 */
 typedef struct crossgram_tgcalls_endpoint {
   int64_t id;
   crossgram_tgcalls_string_view ipv4;
@@ -77,7 +71,6 @@ typedef struct crossgram_tgcalls_endpoint {
   uint8_t peer_tag[16];
 } crossgram_tgcalls_endpoint;
 
-/** One STUN/TURN server consumed by InstanceImpl's WebRTC ICE allocator. */
 typedef struct crossgram_tgcalls_rtc_server {
   uint8_t id;
   crossgram_tgcalls_string_view host;
@@ -88,11 +81,7 @@ typedef struct crossgram_tgcalls_rtc_server {
   uint8_t is_tcp;
 } crossgram_tgcalls_rtc_server;
 
-/**
- * Public, non-secret transport options. Fields are copied synchronously.
- * Boolean fields are exactly zero or one; initialization/receive timeouts are
- * milliseconds, with zero meaning the upstream default.
- */
+/** 传输与音频处理参数；布尔字段仅允许 `0` 或 `1`，超时单位为毫秒（`0` 表示使用上游默认值）。 */
 typedef struct crossgram_tgcalls_session_config {
   uint32_t initialization_timeout_ms;
   uint32_t receive_timeout_ms;
@@ -104,28 +93,18 @@ typedef struct crossgram_tgcalls_session_config {
   crossgram_tgcalls_protocol_version protocol_version;
 } crossgram_tgcalls_session_config;
 
-/**
- * The key is exactly 256 bytes of Telegram call authentication material. The
- * session copies it synchronously and wipes its copy during terminal teardown.
- */
+/** 256 字节 Telegram 通话鉴权密钥；会话在创建时同步拷贝并在销毁时擦除。 */
 typedef struct crossgram_tgcalls_session_auth {
   const uint8_t* key;
   uint32_t key_length;
   uint8_t is_outgoing;
 } crossgram_tgcalls_session_auth;
 
-/**
- * Called by an upstream network thread when it has opaque signaling payload.
- * `data` is valid only for this call; the receiver must copy it synchronously.
- * The callback must not call any session API or block on session teardown.
- */
+/** 上游网络线程产生出站信令时触发；`data` 仅在本次调用内有效，回调内不得重入任何会话 API。 */
 typedef void (*crossgram_tgcalls_outbound_signaling_callback)(
     void* context, const uint8_t* data, uint32_t length);
 
-/**
- * Reports a terminal or API failure category. The callback is synchronous,
- * receives no sensitive data, and must neither throw nor re-enter the session.
- */
+/** 同步上报致命或 API 错误码；回调不得抛出异常或重入会话。 */
 typedef void (*crossgram_tgcalls_error_callback)(
     void* context, crossgram_tgcalls_shim_status status);
 
@@ -135,17 +114,11 @@ typedef struct crossgram_tgcalls_session_callbacks {
   crossgram_tgcalls_error_callback error;
 } crossgram_tgcalls_session_callbacks;
 
-/** Returns the ABI version implemented by this library. */
 CROSSGRAM_TGCALLS_SHIM_API uint32_t crossgram_tgcalls_shim_abi_version(void);
 
 /**
- * Creates a session seam and its bounded native-PCM bridge. All typed inputs
- * are copied before this call returns. `endpoints` must be non-null when
- * `endpoint_count` is non-zero. A null endpoint pointer with zero endpoints is
- * accepted only when `config->enable_p2p` is exactly one; all other null/count
- * combinations are rejected. Creation does not open a socket or start media.
- * The installed production adapter is intentionally unavailable until the
- * separately approved tgcalls artifact is linked.
+ * 创建会话及其有界 PCM 桥，并在返回前同步拷贝所有入参。
+ * `endpoint_count > 0` 时 `endpoints` 不可为空；仅当 `config->enable_p2p == 1` 时允许 `endpoints == NULL && endpoint_count == 0`。
  */
 CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_session_create(
     uint32_t abi_version,
@@ -158,32 +131,23 @@ CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_sessi
     const crossgram_tgcalls_session_callbacks* callbacks,
     crossgram_tgcalls_shim** out_session);
 
-/** Starts an already-created session. It does not claim media readiness on failure. */
 CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_session_start(
     crossgram_tgcalls_shim* session);
 
-/** Copies one bounded opaque inbound signaling payload into the native adapter. */
 CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_session_receive_signaling(
     crossgram_tgcalls_shim* session,
     const uint8_t* data,
     uint32_t length);
 
-/**
- * Pushes/pulls fixed-format PCM through the existing bounded bridge. Input is
- * copied before return; output is written to caller-owned storage. Every frame
- * is 20 ms, mono, 48 kHz native int16_t (960 samples / 1,920 bytes).
- */
+/** 推拉 20 ms 单声道 48 kHz `int16_t` PCM 帧（960 采样点 / 1920 字节）。 */
 CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_session_push_capture_20ms(
     crossgram_tgcalls_shim* session, const int16_t* samples);
 CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_session_pop_playout_20ms(
     crossgram_tgcalls_shim* session, int16_t* samples);
 
 /**
- * Terminal control calls are idempotent in this order: stop, join, destroy.
- * Join is the callback quiescence boundary: after it returns, the native adapter
- * has admitted no further callback and every admitted callback has returned.
- * Destroy takes the owning handle slot, clears it on success, and accepts an
- * already-null slot so it never dereferences a previously freed handle.
+ * 终态控制调用按 `stop -> join -> destroy` 顺序幂等执行。
+ * `join` 返回后保证不再进入新回调且已进入的回调均已返回；`destroy` 成功后将 `*session` 置空。
  */
 CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_session_stop(
     crossgram_tgcalls_shim* session);
@@ -192,7 +156,6 @@ CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_sessi
 CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_session_destroy(
     crossgram_tgcalls_shim** session);
 
-/** Creates a standalone bounded PCM bridge for the requested ABI version. */
 CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_pcm_bridge_create(
     uint32_t abi_version,
     crossgram_tgcalls_pcm_bridge** out_bridge);
@@ -214,7 +177,6 @@ CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_pcm_b
     crossgram_tgcalls_pcm_bridge* bridge);
 CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_pcm_bridge_join(
     crossgram_tgcalls_pcm_bridge* bridge);
-/** Clears the owning handle slot on success and accepts an already-null slot. */
 CROSSGRAM_TGCALLS_SHIM_API crossgram_tgcalls_shim_status crossgram_tgcalls_pcm_bridge_destroy(
     crossgram_tgcalls_pcm_bridge** bridge);
 CROSSGRAM_TGCALLS_SHIM_API uint64_t crossgram_tgcalls_pcm_bridge_dropped_playout_frames(

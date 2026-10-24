@@ -19,7 +19,7 @@ import { expandTelegramStrippedThumbnail, resolvePlatformPluginId } from '@mtpro
 export interface StaticPlatformOptions {
   now?: () => number
   instanceId?: string
-  /** Durable media directory. Set to undefined for an in-memory test adapter. */
+  /** 持久化媒体目录；传 `undefined` 时为纯内存测试适配器。 */
   mediaPath?: string
   transferChunkSize?: number
   eventIntervalMs?: number
@@ -63,18 +63,13 @@ const videoStickerAsset = new Uint8Array(readFileSync(new URL('./assets/video.we
 const gifStickerAsset = new Uint8Array(readFileSync(new URL('./assets/animated.gif', import.meta.url)))
 const apngStickerAsset = new Uint8Array(readFileSync(new URL('./assets/animated.apng', import.meta.url)))
 
-/** Cordis plugin entrypoint. Each plugin instance registers one isolated adapter. */
 export function apply(ctx: Context, config: Config = {}): void {
   const id = resolvePlatformPluginId(ctx, 'static')
   const mediaPath = config.mediaPath
     ?? (process.env.NODE_ENV === 'test' ? undefined : resolve(process.cwd(), 'data/static-media', id))
   const platform = new StaticPlatform({
     ...config,
-    // Keep media storage stable across HMR and process restarts. Message IDs
-    // still use a per-instance nonce to avoid sequence collisions after restart.
     mediaPath,
-    // Synthetic traffic is opt-in. Enabling it by default creates an unbounded
-    // durable update stream for every historical active platform session.
     eventIntervalMs: config.eventIntervalMs ?? 0,
     historySize: config.historySize ?? 10_000,
     providerIdPrefix: id,
@@ -84,7 +79,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.imSticker.register(new StaticStickerProvider(`${id}:plugin`, false, id), `${id}:plugin`)
 }
 
-/** Complete in-memory reference adapter used for development and conformance tests. */
+/** 用于本地开发与契约测试的内存参考平台适配器。 */
 export class StaticPlatform implements IMPlatform<StaticMediaLocator> {
   readonly platformKind = 'static'
   readonly capabilities: PlatformCapabilities = {
@@ -104,7 +99,6 @@ export class StaticPlatform implements IMPlatform<StaticMediaLocator> {
     messageActions: {
       delete: {
         own: { supported: true, maxAgeSeconds: 120 },
-        // StaticPlatform models services whose moderators may remove all history.
         others: { supported: true },
       },
       edit: { mode: 'native' },
@@ -556,7 +550,6 @@ export class StaticPlatform implements IMPlatform<StaticMediaLocator> {
     })
   }
 
-  /** Insert an incoming message and wait until every subscribed bridge handler has committed it. */
   async emitMessage(
     session: PlatformSession,
     conversation: IMConversation<StaticMediaLocator>,
@@ -569,7 +562,6 @@ export class StaticPlatform implements IMPlatform<StaticMediaLocator> {
     })
   }
 
-  /** Simulate another platform client advancing the current account's read boundary. */
   async emitRead(
     session: PlatformSession,
     conversationId: string,
@@ -579,7 +571,6 @@ export class StaticPlatform implements IMPlatform<StaticMediaLocator> {
     await this._dispatch(session, { type: 'read', conversationId, upToMessageId })
   }
 
-  /** Run one deterministic Group A new/edit/delete cycle. */
   async tick(session: PlatformSession): Promise<void> {
     const conversation = this._requireConversation('group-a')
     const active = [...(this._messages.get(conversation.id) ?? [])]

@@ -20,15 +20,13 @@ interface BundleRecord {
   platformSessionId: string
   chatId: number
   bundle: IMMessageBundle
-  /** Durable address encoded in `chatId`; absent for process-local transcripts. */
+  /** 编码进 `chatId` 的持久地址；仅进程内存活的转发没有该字段。 */
   address?: BundleAddress
   snapshots?: Promise<IMMessageSnapshot[]>
-  /** Adapter-owned avatar of the chat the bundle was archived from. */
   avatar?: Promise<IMMedia<any> | undefined>
   projection?: Promise<ProjectedBundle>
 }
 
-/** One synthetic peer photo, addressable by Telegram file locations. */
 interface AvatarEntry {
   media: IMMedia<any>
   peer: AvatarPeer
@@ -37,9 +35,8 @@ interface AvatarEntry {
 interface AvatarPeer { kind: 'user' | 'chat', id: number }
 
 /**
- * Photos of one platform session.  Peer locations are keyed by peer and photo,
- * because unrelated transcripts can share one avatar; photo locations carry no
- * peer, so the first registration of an image answers them.
+ * 单个平台会话下的头像表。peer location 按 peer+photo 索引（不同转发可共用同一张头像）；
+ * photo location 不带 peer，取首次注册的条目。
  */
 interface SessionAvatars {
   peers: Map<string, AvatarEntry>
@@ -53,10 +50,8 @@ interface ProjectedBundle {
 }
 
 /**
- * Where a bundle lives: the durable message row that carries it and the path
- * of bundle ordinals leading to it.  `path[0]` counts the bundle parts of the
- * stored message; every further step counts the bundle parts of the parent
- * transcript's archived messages, in the order the adapter returns them.
+ * 合并转发的位置：承载它的持久化消息行 ID，以及从外到内的 bundle 序号路径。
+ * `path[0]` 是落库消息中的第几个 bundle，后续每一级对应父级转发内归档消息的 bundle 序号。
  */
 export interface BundleAddress {
   storedMessageId: number
@@ -64,35 +59,15 @@ export interface BundleAddress {
 }
 
 /**
- * Transcript chat ids start above every id the bridge allocates for ordinary
- * peers and above the process-local fallback (`stableId` stays below 2^31), so
- * an encoded bundle can never be mistaken for any other peer.
- *
- * The base also carries the address scheme's version.  Transcript message ids
- * follow the transcript order now, and clients keep the messages they fetched
- * under the previous hash ids in their own storage, where they would show up
- * next to the new pages.  The previous scheme counted from `2^31` and its
- * largest id was `2^31` plus the largest message row at the time (a few
- * billion for production's ~1.4M rows); it never reaches this base, so every
- * id it handed out decodes to nothing and the client builds one fresh
- * transcript view instead of two interleaved ones.
+ * 合并转发虚拟群 ID 的起始值。高于普通 peer 与 `stableId`（< 2^31），避免与普通会话冲突；
+ * 同时高于旧版 2^31 基址，使客户端缓存的旧版哈希消息 ID 自动失效。
  */
 const BUNDLE_CHAT_ID_BASE = 2 ** 32
-/** Low part of a transcript chat id that carries the encoded bundle path. */
 const BUNDLE_PATH_CODES = 1024
-/**
- * Largest basic-group id every client accepts.  TDLib-based clients reject
- * basic chat ids above 999999999999, the tightest bound among the clients
- * Crossgram serves; this still leaves room for ~970 million stored messages.
- */
+/** TDLib 客户端接受的普通群（basic chat）最大 ID 上限。 */
 const MAX_BUNDLE_CHAT_ID = 999_999_999_999
 
-/**
- * Transcript chat id that encodes its bundle address, so a relay restart can
- * find the bundle again from nothing but the id a client already holds.
- * Returns `undefined` when the address does not fit; such bundles fall back to
- * the process-local id.
- */
+/** 将 `BundleAddress` 编码进虚拟群 `chatId`，使重启后仅凭客户端持有的 ID 即可还原；超出编码范围时返回 `undefined`。 */
 export function encodeBundleChatId(address: BundleAddress): number | undefined {
   const { storedMessageId, path } = address
   if (!Number.isSafeInteger(storedMessageId) || storedMessageId <= 0) return
@@ -102,7 +77,6 @@ export function encodeBundleChatId(address: BundleAddress): number | undefined {
   return Number.isSafeInteger(id) && id <= MAX_BUNDLE_CHAT_ID ? id : undefined
 }
 
-/** Inverse of `encodeBundleChatId`; `undefined` for every other chat id. */
 export function decodeBundleChatId(chatId: number): BundleAddress | undefined {
   if (!Number.isSafeInteger(chatId) || chatId > MAX_BUNDLE_CHAT_ID) return
   const relative = chatId - BUNDLE_CHAT_ID_BASE
@@ -112,12 +86,7 @@ export function decodeBundleChatId(chatId: number): BundleAddress | undefined {
   return path ? { storedMessageId, path } : undefined
 }
 
-/**
- * Packs a bundle path into a small integer: every ordinal is written as an
- * Elias-gamma code of `ordinal + 1` behind a leading sentinel bit, and the
- * result is shifted so the first bundle of a message, by far the common case,
- * encodes as 0.  Nested bundles several levels deep still fit in ten bits.
- */
+/** 用带前导哨兵位的 Elias-gamma 编码将 `ordinal + 1` 序列打包进 10 bit 整数，首条顶层转发编码为 0。 */
 function encodeBundlePath(path: readonly number[]): number | undefined {
   if (!path.length || path.some((ordinal) => !Number.isSafeInteger(ordinal) || ordinal < 0)) return
   let bits = '1'
@@ -144,61 +113,36 @@ function decodeBundlePath(code: number): number[] | undefined {
   return path.length && encodeBundlePath(path) === code ? path : undefined
 }
 
-/** Bundle parts of one message, in content order. */
 function bundleParts(parts: readonly { type: string }[]): IMMessageBundle[] {
   return parts.flatMap((part) => part.type === 'message-bundle'
     ? [(part as { type: 'message-bundle', bundle: IMMessageBundle }).bundle]
     : [])
 }
 
-/**
- * Nested bundles of a transcript: the bundle parts of every archived message,
- * in archive order.  Their positions are the ordinals of nested bundle paths.
- */
 function nestedBundles(snapshots: readonly IMMessageSnapshot[]): IMMessageBundle[] {
   return snapshots.flatMap((snapshot) => bundleParts(snapshot.content.parts))
 }
 
-/** Session capabilities a transcript needs to rebuild itself after a restart. */
 export type BundleSessionState = Pick<BridgeSessionState, 'platform' | 'session'> & {
   dialogs?: Partial<Pick<BridgeSessionState['dialogs'], 'readStoredMessage'>>
 }
 
-/** Addressed transcripts kept warm per session; any evicted one can be rebuilt. */
 const MAX_CACHED_RECORDS = 256
-/** Nested bundle addresses remembered per session while parents render. */
 const MAX_NESTED_ADDRESSES = 4096
 
 /**
- * Feature-owned view of the bundles clients may open.  A transcript of a
- * stored message is addressed by its row and bundle path, both encoded in the
- * transcript chat id, so this registry is only a cache: every link a client
- * holds can be rebuilt from MessageStore after a restart.  Bundles without a
- * durable address (unstored sources, paths too long to encode) keep a
- * process-local id and live only as long as the registry.
- *
- * Inside a transcript, message ids are allocated in the transcript's
- * chronological order (`transcriptMessageId`), because clients page history with
- * those ids as cursors and order same-timestamp messages by them.
+ * 合并转发虚拟会话的缓存与投影。
+ * 带持久地址的转发编码在 `chatId` 中，重启后可从 `MessageStore` 重建；转发内部消息 ID 按时间序递增分配以支持客户端游标分页。
  */
 export class MergedForwardProjection {
   private readonly _records = new Map<string, Map<number, BundleRecord>>()
-  /** Addresses of nested bundles, keyed by bundle id, learnt while their parent renders. */
   private readonly _nestedAddresses = new Map<string, Map<string, BundleAddress>>()
   private readonly _rebuilds = new Map<string, Promise<BundleRecord | undefined>>()
-  /** Synthetic peer photos this feature registered, scoped per session. */
   private readonly _avatars = new Map<string, SessionAvatars>()
-  /** Every photo id this feature handed out, checked before resolving a session. */
   private readonly _photoIds = new Set<string>()
 
   constructor(private readonly _dcId = 1) {}
 
-  /**
-   * One sender of a bundle rendered as a temporary Telegram user.  The avatar
-   * comes from the archived record: a transcript can only show what QQ kept
-   * for the forwarded message, and archives without sender identity stay on
-   * the empty photo so clients draw their own initial placeholder.
-   */
   makeBundleUser(state: BridgeSessionState, snapshot: IMMessageSnapshot): tl.RawUser {
     const id = bundleUserId(state, snapshot.senderId)
     const source = snapshot.sender
@@ -222,7 +166,6 @@ export class MergedForwardProjection {
     const existing = records.get(chatId)
     if (existing?.bundle.id === bundle.id) {
       existing.bundle = bundle
-      // Recently used transcripts stay at the end of the eviction order.
       records.delete(chatId)
       records.set(chatId, existing)
       return existing
@@ -237,11 +180,7 @@ export class MergedForwardProjection {
     return record
   }
 
-  /**
-   * Keeps the registry bounded.  Only addressed transcripts are dropped: the
-   * id a client holds rebuilds them from MessageStore, whereas a process-local
-   * transcript would become unreachable.
-   */
+  /** 只淘汰带持久地址的记录（可从 `MessageStore` 重建），保留进程内临时转发。 */
   private evict(records: Map<number, BundleRecord>): void {
     let addressed = 0
     for (const record of records.values()) if (record.address) addressed++
@@ -257,11 +196,7 @@ export class MergedForwardProjection {
     return this._records.get(platformSessionId)?.get(chatId)
   }
 
-  /**
-   * Transcript of one chat id: the cached record, or the bundle rebuilt from
-   * the stored message the id encodes.  This is what keeps links working
-   * across relay restarts.
-   */
+  /** 查找虚拟群对应的转发记录；未命中缓存时根据 `chatId` 编码的地址从落库消息重建。 */
   async lookup(state: BundleSessionState, chatId: number): Promise<BundleRecord | undefined> {
     const platformSessionId = state.session.platformSessionId
     const cached = this.resolve(platformSessionId, chatId)
@@ -280,11 +215,6 @@ export class MergedForwardProjection {
     return pending
   }
 
-  /**
-   * Walks a bundle address from its stored message down to the bundle it
-   * names.  Nested steps load the parent transcript through the adapter, the
-   * same way opening the parent would.
-   */
   private async rebuild(state: BundleSessionState, address: BundleAddress): Promise<BundleRecord | undefined> {
     const source = await state.dialogs!.readStoredMessage!(address.storedMessageId)
     if (!source) return
@@ -308,11 +238,6 @@ export class MergedForwardProjection {
     return match ? this.lookup(state, Number(match[1])) : undefined
   }
 
-  /**
-   * Durable address of a bundle part being projected.  Parts of a stored
-   * message are addressed by that row; bundles nested in a transcript inherit
-   * the address their parent registered while it rendered.
-   */
   private addressOf(input: MessageProjectionInput, bundle: IMMessageBundle, ordinal: number): BundleAddress | undefined {
     if (input.mode !== 'bundle') {
       return input.storedMessageId ? { storedMessageId: input.storedMessageId, path: [ordinal] } : undefined
@@ -320,7 +245,6 @@ export class MergedForwardProjection {
     return this._nestedAddresses.get(input.session.platformSessionId)?.get(bundle.id)
   }
 
-  /** Remembers where the bundles nested in a transcript live, before it renders them. */
   private registerNested(record: BundleRecord, snapshots: readonly IMMessageSnapshot[]): void {
     if (!record.address) return
     const nested = nestedBundles(snapshots)
@@ -362,8 +286,7 @@ export class MergedForwardProjection {
         if (preview) record.bundle = { ...record.bundle, preview }
       }
       const first = firstSnapshot(snapshots)
-      // The link anchors at the transcript's first message, so clients open the
-      // archive at its beginning instead of its newest record.
+      // 链接锚定在转发首条消息，使客户端从头打开聊天记录而非跳到末尾。
       const target = first ? transcriptMessageId(0, 0) : undefined
       if (target) targets.set(part.bundle.id, target)
       links.set(part.bundle.id, this.makeLink(
@@ -424,12 +347,8 @@ export class MergedForwardProjection {
   }
 
   /**
-   * Card of the merged forward.  It deliberately carries no photo: Telegram
-   * Android renders the photo of a `telegram_message` web page as a full-width
-   * banner above the title, so the archived chat avatar used to turn the card
-   * into a group portrait that occupied most of the bubble and that Telegram
-   * Desktop never showed at that size.  The transcript still carries that
-   * avatar on its own chat entity, where clients draw it as a peer photo.
+   * 合并转发的网页预览卡片。不附带 `photo`，否则 Telegram Android 会把 `telegram_message` 的图片渲染为通栏大图；
+   * 会话头像只挂在虚拟群 `chat` 实体上。
    */
   makePreview(
     record: BundleRecord,
@@ -443,8 +362,6 @@ export class MergedForwardProjection {
         id: Long.fromNumber(stableId(`merged-forward-preview:${record.bundle.id}`)),
         url, displayUrl: record.bundle.title, hash: 0,
         type: 'telegram_message', title: record.bundle.title,
-        // Without archived content the card shows only its title: never a
-        // placeholder sentence that pretends to be a preview.
         description: record.bundle.preview?.trim() || undefined,
       },
     }
@@ -461,9 +378,6 @@ export class MergedForwardProjection {
       fullChat: {
         _: 'chatFull', id: record.chatId, about: '',
         participants: { _: 'chatParticipantsForbidden', chatId: record.chatId },
-        // Clients read the profile photo of a basic chat from the full chat
-        // as well, so the transcript header must not fall back to an empty
-        // photo that the chat entity already knows better.
         chatPhoto: avatar
           ? this.makeBundlePhoto(record.platformSessionId, record.chatId, avatar)
           : { _: 'photoEmpty', id: Long.ZERO },
@@ -473,28 +387,16 @@ export class MergedForwardProjection {
     }
   }
 
-  /**
-   * Resolves the peer photo of the chat a bundle was archived from.  The
-   * platform supplies it through the optional bundle-avatar hook; archives
-   * without one keep the empty photo.
-   */
   loadAvatar(input: Pick<MessageProjectionInput, 'platform' | 'session'>, record: BundleRecord) {
     if (record.avatar) return record.avatar
     const pending: Promise<IMMedia<any> | undefined> = readBundleAvatar(input, record)
     record.avatar = pending
     pending.catch(() => {
-      // An unavailable adapter must not turn into a cached "no avatar": keep
-      // the transcript renderable and retry with the next request.
       if (record.avatar === pending) record.avatar = undefined
     })
     return pending.catch(() => undefined)
   }
 
-  /**
-   * Telegram photo that addresses the same bytes as a registered peer photo.
-   * Webpage thumbnails and full-chat profiles are fetched through
-   * `inputPhotoFileLocation`, so both views share this identity.
-   */
   private makeBundlePhoto(
     platformSessionId: string,
     chatId: number,
@@ -537,8 +439,6 @@ export class MergedForwardProjection {
     const entry: AvatarEntry = { media, peer }
     this._photoIds.add(photoId.toString())
     session.peers.set(peerKey(peer, photoId), entry)
-    // Several transcripts may render the same archived image, so the first
-    // registration keeps the photo location stable.
     const photoKey = photoId.toString()
     if (!session.photos.has(photoKey)) session.photos.set(photoKey, entry)
     return {
@@ -558,13 +458,8 @@ export class MergedForwardProjection {
     return session
   }
 
-  /**
-   * Cheap test for a file location this feature could own.  It runs before the
-   * RPC resolves a platform session, so ordinary media downloads never pay for
-   * the merged-forward lookup.
-   */
+  /** 在解析平台会话前快速判断文件位置是否可能属于合并转发头像，避免影响普通媒体下载路径。 */
   mightServeLocation(location: tl.TypeInputFileLocation): boolean {
-    // A durable transcript can serve its photo even before it was rebuilt.
     if (transcriptPhotoChatId(location) !== undefined) return true
     if (!this._photoIds.size) return false
     if (location._ === 'inputPeerPhotoFileLocation') {
@@ -577,11 +472,6 @@ export class MergedForwardProjection {
     return false
   }
 
-  /**
-   * Resolves one Telegram file location against the photos this feature
-   * handed out.  Requests that do not belong to a synthetic bundle peer stay
-   * unanswered so the ordinary bridge file routes keep serving them.
-   */
   resolveAvatarLocation(platformSessionId: string, location: tl.TypeInputFileLocation): AvatarEntry | undefined {
     const session = this._avatars.get(platformSessionId)
     if (!session) return
@@ -626,8 +516,6 @@ export class MergedForwardProjection {
 
   private async buildProjection(state: BridgeSessionState, record: BundleRecord): Promise<ProjectedBundle> {
     const snapshots = await this.loadSnapshots(state, record)
-    // Nested bundles render through the projection waterfall below; they can
-    // only link to durable transcripts once their address is known.
     this.registerNested(record, snapshots)
     const peer = { _: 'peerChat' as const, chatId: record.chatId }
     const ranks = transcriptRanks(snapshots)
@@ -661,10 +549,7 @@ export class MergedForwardProjection {
       messages.push(...rendered.messages)
       chats.push(...rendered.chats)
     }
-    // Transcripts read newest first.  Messages that share one timestamp — QQ
-    // only records whole seconds — fall back to the id, which is allocated in
-    // archive order, so the tiebreak shows the later message above the earlier
-    // one, exactly like the archive itself.
+    // 历史分页按最新在前返回；QQ 时间戳精度到秒，同秒消息用按归档序递增的 ID 决胜。
     messages.sort((left, right) => messageDate(right) - messageDate(left) || right.id - left.id)
     return {
       messages,
@@ -708,8 +593,7 @@ async function routeMergedForwardRpc(
     const state = await resolveState()
     let entry = projection.resolveAvatarLocation(state.session.platformSessionId, req.location)
     if (!entry) {
-      // A client may fetch the photo of a transcript it cached before a
-      // restart; rebuild that transcript so its avatar is registered again.
+      // 客户端可能在重启后拉取已缓存转发的头像，此时需先重建转发以重新注册头像。
       const chatId = transcriptPhotoChatId(req.location)
       const record = chatId === undefined ? undefined : await projection.lookup(state, chatId)
       if (record) {
@@ -801,11 +685,7 @@ async function routeMergedForwardRpc(
     }
     const bundle = await projection.materialize(state, record)
     const history = request as tl.messages.RawGetHistoryRequest
-    // A client that still carries a deep link generated before the relay
-    // anchored links at the first message has no way to learn the transcript
-    // order from the link, so it asks for the beginning explicitly.  Transcript
-    // message ids start at `TRANSCRIPT_MESSAGE_ID_BASE`, so the sentinel cannot
-    // collide with a real message of the bundle.
+    // 兼容旧版不带首条消息锚点的深链：客户端用 `offsetId = 1` 显式请求最旧一页。
     const page = history.offsetId === kFirstMessageOffsetId
       ? firstPage(selectWithinBounds(bundle.messages, history), history.limit)
       : selectHistory(bundle.messages, history)
@@ -833,13 +713,7 @@ async function routeMergedForwardRpc(
       ? await state.dialogs.getPeerDialogs({ ...req, peers: ordinaryPeers })
       : undefined
     const virtualByIndex = new Map(records.map((entry) => [entry.index, entry.record]))
-    // A transcript is a history-only view that must not turn into a chat-list
-    // entry, so its dialog is published with `topMessage = 0`: clients apply
-    // the entry, load history from the message they were asked to open, and
-    // skip persisting a dialog whose top message is empty.  Android otherwise
-    // takes the dialog prefetch at the start of every anchored history load,
-    // finds no dialog for the peer and stops without ever asking for history,
-    // which left the transcript on skeleton placeholders.
+    // `topMessage = 0` 让客户端通过锚点消息前的 dialog 预检，同时跳过将该虚拟会话写入聊天列表。
     let ordinaryCursor = 0
     const dialogs: tl.TypeDialog[] = []
     for (let index = 0; index < req.peers.length; index++) {
@@ -895,15 +769,6 @@ async function routeMergedForwardRpc(
   }
 }
 
-/**
- * Dialog entry a transcript chat may publish.
- *
- * It carries no top message on purpose: clients need the entry to reach the
- * anchored history request, and their own code skips persisting a dialog
- * whose top message is empty, so the transcript never becomes a chat-list
- * entry.  Notification settings are the neutral defaults for a peer the
- * viewer does not own.
- */
 function transcriptDialog(chatId: number): tl.RawDialog {
   return {
     _: 'dialog',
@@ -919,23 +784,12 @@ function transcriptDialog(chatId: number): tl.RawDialog {
   }
 }
 
-/**
- * Picks the message a merged-forward deep link anchors to.
- *
- * Native Telegram forwards link to the first message of the transcript, so
- * opening the link shows the bundle from its beginning.
- */
 function firstSnapshot(
   snapshots: readonly IMMessageSnapshot[],
 ): IMMessageSnapshot | undefined {
   return chronologicalSnapshots(snapshots)[0]
 }
 
-/**
- * Content preview of a bundle, one line per archived message, for platforms
- * that supply none.  Mirrors the layout native merged forwards show on their
- * card: the first few messages as `sender: text`.
- */
 export function snapshotPreview(snapshots: readonly IMMessageSnapshot[]): string | undefined {
   const lines = [...snapshots]
     .sort((left, right) => left.timestamp - right.timestamp)
@@ -958,7 +812,6 @@ export function snapshotPreview(snapshots: readonly IMMessageSnapshot[]): string
   return lines.join('\n') || undefined
 }
 
-/** Reads the optional avatar of the chat a bundle was archived from. */
 async function readBundleAvatar(
   input: Pick<MessageProjectionInput, 'platform' | 'session'>,
   record: BundleRecord,
@@ -970,41 +823,17 @@ function bundleChatId(bundle: IMMessageBundle): number {
   return stableId(`merged-forward-chat:${bundle.id}`)
 }
 
-/**
- * First id a transcript hands to a message.  Telegram clients use offset id 1
- * as the "beginning of the history" sentinel, so transcript ids start above
- * it and can never be mistaken for it.
- */
+/** 避开客户端表示“从历史开头读取”的 `offsetId = 1` 哨兵值。 */
 const TRANSCRIPT_MESSAGE_ID_BASE = 1000
 
-/** Ids reserved per archived message, one for each part it renders. */
+/** 每条归档消息预留的 ID 步长，用于容纳单条消息拆分出的多个 part。 */
 const TRANSCRIPT_MESSAGE_ID_STRIDE = 1000
 
-/**
- * Telegram message id of one rendered part of a transcript.
- *
- * Clients page history by message *id*: `offset_id`, `max_id` and `min_id`
- * are cursors, and a page has to be exactly the slice of the transcript those
- * cursors select.  Ids therefore grow with the transcript's chronological
- * order.  A hash cannot do that: every cursor would land on an arbitrary
- * subset of the transcript, and the client's own tiebreaker for messages that
- * share a timestamp — QQ timestamps only have second resolution — would order
- * them randomly instead of the way the archive stores them.
- *
- * `rank * stride` leaves every rendered part of one archived message its own
- * id.  A QQ message renders at most a handful of parts, far below the stride.
- */
+/** 按归档时间序分配消息 ID，满足客户端用 `offset_id`/`max_id`/`min_id` 游标分页及同秒消息排序。 */
 export function transcriptMessageId(rank: number, ordinal: number): number {
   return TRANSCRIPT_MESSAGE_ID_BASE + rank * TRANSCRIPT_MESSAGE_ID_STRIDE + ordinal
 }
 
-/**
- * Chronological order of a transcript's archived messages.
- *
- * QQ returns a merged forward in the order it stored the records, which is the
- * order the sender produced them; the timestamp is second-resolution, so it
- * only breaks ties between records that arrived out of order.
- */
 function chronologicalSnapshots(snapshots: readonly IMMessageSnapshot[]): IMMessageSnapshot[] {
   return snapshots
     .map((snapshot, index) => ({ snapshot, index }))
@@ -1013,7 +842,6 @@ function chronologicalSnapshots(snapshots: readonly IMMessageSnapshot[]): IMMess
     .map((entry) => entry.snapshot)
 }
 
-/** Chronological rank of every archived message of one transcript. */
 function transcriptRanks(snapshots: readonly IMMessageSnapshot[]): Map<string, number> {
   return new Map(chronologicalSnapshots(snapshots).map((snapshot, rank) => [snapshot.id, rank]))
 }
@@ -1022,33 +850,19 @@ function bundleUserId(state: BridgeSessionState, platformUserId: string): number
   return stableId(`merged-forward-user:${state.session.platformSessionId}:${platformUserId}`)
 }
 
-/**
- * Telegram `photo` size declared for bundle avatars when the adapter does not
- * report the real dimensions.  QQ avatars are square, so one value covers both
- * axes and clients only use it as a scaling hint.
- */
 const BUNDLE_PHOTO_SIZE = 640
 
-/**
- * File reference of the photos this feature serves through
- * `inputPhotoFileLocation`.  It keeps bundle photos addressable without
- * reading or persisting anything: the bytes are still fetched from the adapter
- * on every request.
- */
 const BUNDLE_PHOTO_FILE_REFERENCE = new TextEncoder().encode('crossgram-merged-forward-avatar:v1')
 
-/** Registry key of one synthetic peer photo. */
 function peerKey(peer: AvatarPeer, photoId: Long): string {
   return `${peer.kind}:${peer.id}:${photoId.toString()}`
 }
 
-/** Durable transcript whose peer photo a file location asks for, if any. */
 function transcriptPhotoChatId(location: tl.TypeInputFileLocation): number | undefined {
   if (location._ !== 'inputPeerPhotoFileLocation' || location.peer._ !== 'inputPeerChat') return
   return decodeBundleChatId(location.peer.chatId) ? location.peer.chatId : undefined
 }
 
-/** Registry peer of a Telegram file location, when it addresses a chat peer. */
 function inputPeerKey(location: tl.TypeInputPeer): string | undefined {
   if (location._ === 'inputPeerUser') return `user:${location.userId}`
   if (location._ === 'inputPeerChat') return `chat:${location.chatId}`
@@ -1058,7 +872,6 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index])
 }
 
-/** Storage type of one avatar payload, sniffed from the bytes themselves. */
 function avatarStorageFileType(bytes: Uint8Array): tl.storage.TypeFileType {
   if (bytes.length >= 8
     && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
@@ -1075,10 +888,8 @@ function avatarStorageFileType(bytes: Uint8Array): tl.storage.TypeFileType {
   return { _: 'storage.fileUnknown' }
 }
 
-/** Offset id a patched client sends to ask for the beginning of a transcript. */
 const kFirstMessageOffsetId = 1
 
-/** Oldest `limit` messages of a newest-first slice, keeping that order. */
 function firstPage(
   messages: readonly tl.TypeMessage[],
   limit: number,
@@ -1096,10 +907,6 @@ function selectHistory(
   return filtered.slice(start, start + Math.max(0, request.limit))
 }
 
-/**
- * Messages a history request admits: `maxId` and `minId` bound the transcript
- * by id, exactly as they bound an ordinary chat.
- */
 function selectWithinBounds(
   messages: readonly tl.TypeMessage[],
   request: tl.messages.RawGetHistoryRequest,
@@ -1111,16 +918,8 @@ function selectWithinBounds(
 }
 
 /**
- * Where a history page starts inside a newest-first transcript.
- *
- * Telegram treats `offsetId` as an exclusive cursor and `addOffset` as a shift
- * of the window: zero loads the messages directly below the cursor, a negative
- * offset moves the window toward newer messages — which is how clients load
- * the newest page (`offsetId = newest + 1`, `addOffset = -limit`), open a deep
- * link (`addOffset = -limit / 2`, so the anchor itself is in the page) or walk
- * forward from a gap in their local history.  A cursor below every message
- * starts past the oldest one, so a negative offset there returns the oldest
- * page; a window shifted above the newest message is clamped to it.
+ * 计算最新在前数组中的分页起点。
+ * `offsetId` 为排他游标（从第一条 `< offsetId` 的消息开始），`addOffset` 为负时向更新的消息偏移。
  */
 function pageStart(
   filtered: readonly tl.TypeMessage[],
@@ -1128,9 +927,6 @@ function pageStart(
 ): number {
   let start = 0
   if (request.offsetId > 0) {
-    // The cursor is exclusive: the page begins at the first message below it,
-    // which for an id between two messages is their boundary — never a page
-    // that silently restarts at the newest message.
     const below = filtered.findIndex((message) => message.id < request.offsetId)
     start = below < 0 ? filtered.length : below
   }

@@ -7,7 +7,7 @@ const PCM_DURATION_MS = 20
 const PCM_SAMPLES_PER_FRAME = 960
 const PCM_BYTES_PER_FRAME = 1_920
 
-/** One 20 ms 48 kHz mono signed-16-bit-little-endian PCM frame. */
+/** 单帧 20 ms、48 kHz、单声道 s16le PCM。 */
 export const QQ_VOICE_PCM_FORMAT = Object.freeze({
   encoding: PCM_ENCODING,
   sampleRate: PCM_SAMPLE_RATE,
@@ -17,7 +17,7 @@ export const QQ_VOICE_PCM_FORMAT = Object.freeze({
   bytesPerFrame: PCM_BYTES_PER_FRAME,
 })
 
-/** Media is deliberately lossy rather than allowed to delay real-time capture. */
+/** 实时音频优先低延迟，队列满时丢弃最旧帧而非阻塞采集。 */
 export const QQ_VOICE_PCM_QUEUE_CAPACITY = 4
 
 const MAX_SESSION_ID_LENGTH = 128
@@ -29,29 +29,18 @@ export interface QQVoicePcmFrame {
   data: Uint8Array
 }
 
-/**
- * Opaque, in-memory-only values for one media connection. Call and lease IDs
- * are only retained until connect() settles. The token is copied and the
- * caller-owned array is zeroed on entry.
- */
+/** 单次媒体连接的内存上下文；入口处会拷贝 `token` 并将调用方传入的缓冲区清零。 */
 export interface QQVoiceMediaSessionContext {
   callId: string
   leaseId: string
   token: Uint8Array
 }
 
-/**
- * Token ownership transfers to connect() for that single call. Implementations
- * must consume it before their promise settles, zero it, and not retain it.
- */
+/** `token` 所有权移交给当次 `connect()` 调用，实现方必须在 Promise 结束前消费并清零。 */
 export interface QQVoiceMediaConnectOptions extends QQVoiceMediaSessionContext {
   signal: AbortSignal
 }
 
-/**
- * Transport seam for a local or future QQ Bridge media gateway. Implementations
- * must honor the supplied abort signal and must not retain PCM after close().
- */
 export interface QQVoiceMediaTransport {
   connect(options: QQVoiceMediaConnectOptions): Promise<QQVoiceMediaConnection>
 }
@@ -59,13 +48,10 @@ export interface QQVoiceMediaTransport {
 export interface QQVoiceMediaConnection {
   send(frame: QQVoicePcmFrame, options: { signal: AbortSignal }): Promise<void>
   receive(options: { signal: AbortSignal }): AsyncIterable<QQVoicePcmFrame>
-  /** Gracefully closes the connection and resolves only after it is terminal. */
   close(): Promise<void>
-  /** Forcefully makes the connection terminal when graceful close cannot. */
   destroy(): Promise<void> | void
 }
 
-/** Lightweight adapter for a gateway-specific connection factory. */
 export class QQVoiceMediaClient implements QQVoiceMediaTransport {
   constructor(private readonly connector: QQVoiceMediaTransport['connect']) {}
 
@@ -81,7 +67,6 @@ export interface QQVoiceMediaOperationOptions {
 
 export interface QQVoiceMediaStartOptions extends QQVoiceMediaOperationOptions, QQVoiceMediaSessionContext {}
 
-/** Counts only dropped PCM frames. No audio, identifiers, or byte totals are retained. */
 export interface QQVoiceMediaStats {
   outgoingDroppedFrames: number
   incomingDroppedFrames: number
@@ -101,7 +86,6 @@ export class QQVoiceMediaClosedError extends Error {
   }
 }
 
-/** A transport operation failed. Its message intentionally contains no transport data. */
 export class QQVoiceMediaTransportError extends Error {
   constructor() {
     super('QQ voice media transport failed')
@@ -118,11 +102,7 @@ interface PendingStart {
   destroying: boolean
 }
 
-/**
- * A single bidirectional PCM session. Media producers never wait: each
- * direction retains at most four frames and drops its oldest queued frame on
- * overflow. Connection and teardown remain separate, ordered lifecycle work.
- */
+/** 双向 PCM 会话；上下行各自最多缓存 4 帧，溢出时丢弃最旧帧以避免阻塞生产端。 */
 export class QQVoiceMediaSession {
   private readonly controller = new AbortController()
   private readonly outgoing = new DroppingQueue<QQVoicePcmFrame>(QQ_VOICE_PCM_QUEUE_CAPACITY)
@@ -149,17 +129,16 @@ export class QQVoiceMediaSession {
     return { ...this.counts }
   }
 
-  /** Resolves only after the transport has conclusively become terminal. */
   get finished(): Promise<void> {
     return this.closedResult.promise
   }
 
-  /** Validates and accepts the frame synchronously; it never waits for transport I/O. */
+  /** 同步校验并入队，不等待底层传输 I/O。 */
   send(frame: QQVoicePcmFrame, options: Pick<QQVoiceMediaOperationOptions, 'signal'> = {}): void {
     assertPcmFrame(frame)
     if (options.signal?.aborted) throw options.signal.reason ?? new QQVoiceMediaClosedError()
     if (this.controller.signal.aborted) throw this.controller.signal.reason ?? new QQVoiceMediaClosedError()
-    // The copy lets callers safely reuse their capture buffer while queued.
+    // 拷贝一份，便于调用方复用采集缓冲区。
     if (this.outgoing.push({ format: QQ_VOICE_PCM_FORMAT, data: new Uint8Array(frame.data) })) {
       this.counts.outgoingDroppedFrames++
     }
@@ -190,7 +169,7 @@ export class QQVoiceMediaSession {
       for await (const frame of this.connection.receive({ signal: this.controller.signal })) {
         if (this.controller.signal.aborted) return
         assertPcmFrame(frame)
-        // Copy before queuing: transport implementations may reuse receive buffers.
+        // 入队前拷贝，防止底层传输层复用接收缓冲区。
         if (this.incoming.push({ format: QQ_VOICE_PCM_FORMAT, data: new Uint8Array(frame.data) })) {
           this.counts.incomingDroppedFrames++
         }
@@ -220,8 +199,6 @@ export class QQVoiceMediaSession {
 
   private async terminateConnection(): Promise<void> {
     const gracefulClose = invoke(this.connection.close.bind(this.connection))
-    // A late successful graceful close is still conclusive, even if the force
-    // close path has already timed out.
     void gracefulClose.then(() => this.closedResult.resolve(), () => undefined)
     const closeResult = await settleAtMost(gracefulClose, DEFAULT_CLOSE_TIMEOUT_MS)
     if (closeResult.status === 'fulfilled') {
@@ -241,7 +218,6 @@ export class QQVoiceMediaSession {
   }
 }
 
-/** Cordis seam (`ctx.qqntVoiceMedia`) for one active QQ Bridge PCM session. */
 export class QQVoiceMedia extends Service {
   private active?: QQVoiceMediaSession
   private starting?: PendingStart
@@ -454,7 +430,7 @@ class DroppingQueue<T> {
 
   constructor(private readonly capacity: number) {}
 
-  /** Returns true exactly when the oldest queued item was dropped. */
+  /** 淘汰了最旧元素时返回 `true`。 */
   push(value: T): boolean {
     if (this.error) throw this.error
     const reader = this.readers.shift()

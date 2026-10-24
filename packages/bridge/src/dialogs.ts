@@ -21,7 +21,12 @@ import { isLocalOnlyConversation, isRequestInboxConversation } from './request-i
 import { RecentPromiseCache } from './recent-promise-cache.js'
 import { BoundedMap } from './bounded-map.js'
 import { makeUser } from './synthetic.js'
-import { toUser, type MessageStore, type ProjectedMessage } from './message-store.js'
+import {
+  toUser, type MessageStore, type ProjectedMessage, type SearchedMessage, type SearchPartIndexEntry,
+} from './message-store.js'
+import {
+  filterSearchKinds, messageSearchKinds, messageSearchText, normalizeSearchTerms, partMatchesSearchKinds,
+} from './message-search.js'
 import { PlatformDataService } from './platform-manager.js'
 import type { PlatformEventDeliveryOptions, PlatformEventPublishResult } from './platform-manager.js'
 import type { IMMediaRow, IMUserRow, TlMessagePartRow } from './models.js'
@@ -33,6 +38,7 @@ import { probeImageDimensions } from './image-dimensions.js'
 import { withAutoLinkEntities } from './message-entities.js'
 import { getCardThumbnailFile, makeCardThumbnailPhoto, storageFileType } from './card-thumbnail.js'
 import type { DraftStore, StoredDraft } from './draft-store.js'
+import type { ScheduledMessage, ScheduledMessageStore } from './scheduled-messages.js'
 import { MUTE_FOREVER, type NotificationSettingsStore, type NotificationTarget } from './notification-settings.js'
 import type { BlockedPeerChange, BlockedPeerStore } from './blocked-peers.js'
 import { SystemPeerCallbackError, type SystemPeerResolution, type SystemPeerService } from './system-peer.js'
@@ -41,14 +47,16 @@ import {
   type DialogFolderStore, type StoredDialogFilter,
 } from './dialog-folders.js'
 import type { MessageProjectionPipeline } from './message-projection.js'
+import type { SendEchoes } from './send-echoes.js'
 import type { SpeechPipeline } from './speech.js'
+import { convertRichMessage, markdownRichMessage, type RichMediaReference, type ResolvedRichMedia } from './rich-message.js'
 
 type GetDialogsRequest = tl.messages.RawGetDialogsRequest
 type GetPeerDialogsRequest = tl.messages.RawGetPeerDialogsRequest
 type GetHistoryRequest = tl.messages.RawGetHistoryRequest
 type GetMessagesRequest = tl.messages.RawGetMessagesRequest
 type GetChannelMessagesRequest = Omit<tl.channels.RawGetMessagesRequest, 'id'> & {
-  /** Official Telegram Android's #93d7b347 request uses Vector<int>. */
+  /** 官方 Telegram Android 的 `#93d7b347` 请求使用 `Vector<int>`。 */
   id: Array<tl.TypeInputMessage | number>
 }
 type SendMessageRequest = tl.messages.RawSendMessageRequest
@@ -86,19 +94,10 @@ type MentionReadPublisher = (
   excludeConnection?: ServerConnection,
 ) => Promise<{ pts: number, ptsCount: number }>
 
-// Crossgram clients consume updateMessageID(id=0) as an explicit acknowledgement
-// that the local message for this random ID was intentionally cancelled. Telegram
-// message IDs are strictly positive, so zero is a wire-compatible sentinel that
-// does not require a private TL constructor.
+// 客户端将 `updateMessageID(id=0)` 视为取消对应 `randomId` 占位消息的确认信号（合法消息 ID 均大于 0）。
 export const CANCELLED_MESSAGE_ID = 0
 
-/**
- * Entry ceiling for the per-device message id indexes. One message can occupy
- * up to three `_messageToTl` keys (primary, source alias, QQ sequence) plus one
- * `_tlToMessage` and one `_messageOutgoingByTl` entry, so this bounds the three
- * maps at roughly 60-70 MiB together instead of the gigabytes an unbounded
- * device accumulated over a week.
- */
+/** 单设备消息 ID 索引上限（每条消息最多占 3 个 `_messageToTl` 键及各 1 个反向索引项，总内存约 60–70 MiB）。 */
 const MAX_CACHED_MESSAGE_INDEX_ENTRIES = 200_000
 
 
@@ -107,7 +106,7 @@ interface MessageRef {
   platformMessageId: string
   ordinal: number
   nativeSequence?: string
-  /** True for service notices: reply targets that QQ resolves through the message they accompany. */
+  /** 标记系统提示（QQ 回复灰条时需重解析到同序号的正文消息）。 */
   service?: boolean
 }
 
@@ -115,7 +114,7 @@ interface MaterializedMessage {
   source: IMMessage
   tlId: number
   ordinal: number
-  /** Durable `mtproto_im_message` row id when the source is stored. */
+  /** 持久化 `mtproto_im_message` 行 ID。 */
   storedMessageId?: number
   groupedId?: string
   media?: IMMediaRow
@@ -123,11 +122,43 @@ interface MaterializedMessage {
   unreadMention?: boolean
 }
 
-interface SearchCursorState {
-  upstreamCursor?: string
-  exhausted: boolean
-  pending: MaterializedMessage[]
+interface LocalSearchOptions {
+  /** 限定的平台会话 ID；缺省时跨全部会话。 */
+  conversationIds?: string[]
+  q: string
+  filter: tl.TypeMessagesFilter
+  fromId?: tl.TypeInputPeer
+  minDate: number
+  maxDate: number
+  offsetId: number
+  /** 全局搜索时 `offsetId` 所属的会话。 */
+  anchorPeerId?: string
+  /** 全局搜索的 `offsetRate`（上一页最后一条的时间戳）。 */
+  offsetRate?: number
+  addOffset: number
+  limit: number
+  maxId: number
+  minId: number
+  /** 计算精确总数（需扫完整个范围），否则返回下界估计。 */
+  exactCount: boolean
 }
+
+interface LocalSearchResult {
+  page: MaterializedMessage[]
+  count: number
+  exact: boolean
+  hasMore: boolean
+  sliced: boolean
+}
+
+/** 单次搜索最多向数据库取几批，防止极稀疏的过滤条件扫完整个账号。 */
+const SEARCH_SCAN_ROUNDS = 10
+const SEARCH_BATCH_MIN = 20
+const SEARCH_BATCH_MAX = 100
+const CALENDAR_PERIOD_LIMIT = 100
+const POSITIONS_LIMIT = 1_000
+/** 日历按 UTC+8 的自然日分组：QQ 用户几乎都在该时区，客户端按本地日期摆放时不会把同一天拆成两格。 */
+const CALENDAR_UTC_OFFSET_SECONDS = 8 * 60 * 60
 
 interface ResolvedMediaUpload {
   media: IMMediaInput
@@ -145,7 +176,7 @@ interface QQGroupMsgMaskPolicy {
   folderId: 0 | 1
 }
 
-/** Preserve system-peer metadata so direct bridge bots retain bot/usernames after hydration. */
+/** 保留 `metadata` 使内置系统 bot 在加载后仍具备 `bot` 标记与用户名。 */
 function directConversationUser(conversation: IMConversation): IMUser {
   return {
     id: conversation.id,
@@ -168,11 +199,7 @@ const QQ_GROUP_MSG_MASK = {
   RECEIVE: 4,
 } as const
 
-/**
- * QQ is authoritative for group masks: NOTIFY stays in the main list, ASSISTANT
- * moves to Archive, and RECEIVE stays in the main list without notification.
- * UNSPECIFIED and SHIELD deliberately leave local Telegram state untouched.
- */
+/** QQ 群消息提醒策略映射：`NOTIFY` 留主列表，`ASSISTANT` 进归档，`RECEIVE` 留主列表且静音；其余保持本地状态。 */
 const QQ_GROUP_MSG_MASK_POLICIES: Readonly<Record<number, QQGroupMsgMaskPolicy>> = {
   [QQ_GROUP_MSG_MASK.NOTIFY]: { muteUntil: 0, folderId: 0 },
   [QQ_GROUP_MSG_MASK.ASSISTANT]: { muteUntil: MUTE_FOREVER, folderId: 1 },
@@ -207,35 +234,24 @@ export interface BlockedPeerRpcChange extends BlockedPeerChange {
   userId: number
 }
 
-/** `crossgram.getFeatures` request for one conversation. */
 export interface GetFeaturesRequest {
   peer: tl.TypeInputPeer
 }
 
-/** `crossgram.sendPoke` request. */
 export interface SendPokeRequest {
   peer: tl.TypeInputPeer
   userId: tl.TypeInputUser
   count: number
 }
 
-/** Feature payload of `crossgram.getFeatures`, serialized as a `dataJSON` string. */
 export interface CrossgramFeatures {
-  /**
-   * Native poke support for the requested peer. Absent on official Telegram
-   * servers, on platforms without pokes, and for peers that cannot be poked,
-   * which is exactly what keeps the client entry hidden there.
-   */
+  /** 当前会话若支持原生戳一戳则返回该字段，缺省时客户端隐藏入口。 */
   poke?: {
-    /** Largest burst one `crossgram.sendPoke` call may send. */
     maxCount: number
   }
 }
 
-/**
- * Per-authorized-session bridge for dialog/history RPCs. Telegram's numeric
- * peer/message IDs are allocated here and reverse-mapped to opaque platform IDs.
- */
+/** 单个授权会话的对话与历史消息 RPC 处理器，负责 Telegram 数字 ID 与平台字符串 ID 的双向映射。 */
 export class DialogRpc {
   private static readonly PEER_HYDRATION_TTL_MS = 5_000
   private static readonly REACTION_REFRESH_FAILURE_COOLDOWN_MS = 30_000
@@ -269,9 +285,7 @@ export class DialogRpc {
   private readonly _storedUsers = new Map<string, IMUser<any>>()
   private readonly _platformUsers = new Map<string, IMUser<any>>()
   private readonly _pendingPlatformUsers = new Map<string, Promise<IMUser<any> | null>>()
-  /** Platform user IDs from the latest authoritative contacts snapshot. */
   private readonly _contactUserIds = new Set<string>()
-  /** Whether the address book has been loaded for this RPC instance. */
   private _contactsHydrated = false
   private _contactsHydration?: Promise<void>
   private readonly _topicToConversation = new Map<number, string>()
@@ -279,9 +293,7 @@ export class DialogRpc {
   private readonly _avatarMedia = new Map<string, IMMedia<any>>()
   private readonly _memberPages = new Map<string, MemberPageState>()
   private readonly _pendingMemberPages = new Map<string, Promise<void>>()
-  private readonly _searchCursors = new Map<string, SearchCursorState>()
   private readonly _reactionRefreshFailures = new Map<string, number>()
-  // ponytail: session-wide queue; use per-peer queues only if folder edit throughput matters.
   private _folderEditQueue = Promise.resolve()
   private readonly _actions: PlatformMessageActions
   private _peersHydratedAt = 0
@@ -313,23 +325,17 @@ export class DialogRpc {
       excludeAuthKeyId?: string,
     ) => Promise<void>,
     private readonly _notificationSettings?: NotificationSettingsStore,
-    /** Canonical persisted Telegram ID for this authorized platform user. */
     private readonly _authenticatedSelfId?: number,
     private readonly _blockedPeers?: BlockedPeerStore,
     private readonly _dialogFolders?: DialogFolderStore,
     private readonly _systemPeers?: SystemPeerService,
     private readonly _messageProjection?: MessageProjectionPipeline,
+    private readonly _sendEchoes?: SendEchoes,
+    private readonly _scheduled?: ScheduledMessageStore,
+    private readonly _onScheduledChange?: () => void,
   ) {
     this._actions = new PlatformMessageActions(_platform, _session)
-    // These three maps index the messages a device has touched. They are a
-    // synchronous cache in front of the durable `mtproto_tl_message_part`
-    // table, and every read path already falls back to `MessageStore` on a
-    // miss, so a store-backed instance can drop its oldest entries: without a
-    // bound they grow with every message the device ever sees and never shrink,
-    // which is how the 7-day production run reached ~1.4 GiB of anonymous
-    // memory. A storeless instance keeps them complete — it has no durable
-    // table to fall back to, and `_messageId` must not hand out an id it has
-    // already used earlier in the same process.
+    // 有 `MessageStore` 时淘汰旧条目并由数据库兜底；无存储模式不可淘汰，避免重用已分配的 ID。
     const messageIndexLimit = store ? MAX_CACHED_MESSAGE_INDEX_ENTRIES : Number.POSITIVE_INFINITY
     this._messageToTl = new BoundedMap(messageIndexLimit)
     this._tlToMessage = new BoundedMap(messageIndexLimit)
@@ -346,10 +352,7 @@ export class DialogRpc {
   async getDialogs(req: GetDialogsRequest): Promise<tl.messages.TypeDialogs> {
     const startedAt = performance.now()
     await this._hydrateUsers()
-    // Telegram evaluates the `contacts` flag of dialog filters from the user
-    // objects returned alongside dialogs.  Do not rely on the client calling
-    // contacts.getContacts first: Android commonly requests dialogs while
-    // constructing folders, before it has refreshed the address book.
+    // 客户端按随对话返回的 `user.contact` 评估分组过滤规则，且 Android 构建分组时未必先调 `contacts.getContacts`。
     await this._ensureContactsHydrated()
     const hydrateMs = performance.now() - startedAt
     const requestedOffsetPeer = req.offsetPeer._ === 'inputPeerEmpty'
@@ -363,22 +366,22 @@ export class DialogRpc {
     const archivedPeerIds = await this._dialogFolders?.archivedPeerIds(
       this._session.platformSessionId,
     ) ?? new Set<string>()
+    // 置顶会话不混入分页流（首屏前置返回或由 getPinnedDialogs 单独拉取）；按置顶数多拉一些，
+    // 剔除后仍凑满一页，否则 Android 把短页当作到底、Desktop 遇到全是置顶的空页会停止翻页
+    const pinnedPeerIds = new Set(await this._dialogFolders?.pinnedPeerIds(
+      this._session.platformSessionId,
+    ) ?? [])
     const loadAt = performance.now()
     const query = {
-      limit: clampLimit(req.limit) + 1,
+      limit: clampLimit(req.limit) + pinnedPeerIds.size + 1,
       afterId: requestedOffsetPeer,
     }
-    // Android omits folder_id for its global dialog feed and expects archived
-    // rows to remain in that page (with dialog.folder_id=1). Removing them makes
-    // a short page look like end-of-list, so the client never requests page 2.
-    // Explicit folder 0/1 requests are folder-scoped and still need filtering.
+    // Android 拉取全局对话列表时不传 `folder_id`，并期望归档会话带 `dialog.folder_id=1` 一并返回；
+    // 若过滤掉会导致单页不满，被客户端误判为已到底而不再翻页。显式传 0/1 时才按文件夹过滤。
     const unscoped = folderId === undefined
       ? await this._loadDialogPage(query)
       : undefined
-    // QQ masks can move an assistant group outside the first native page, so
-    // QQ always scans its effective folder before returning a scoped request.
-    // Other platforms retain the native main-list pagination fast path unless
-    // a page-level override or a durable archive row requires filtering.
+    // QQ 群消息屏蔽可将群移入归档，需始终按实际文件夹扫描；其他平台在无归档覆盖时直接走原生分页。
     const initialMain = !unscoped && this._platform.platformKind !== 'qq' && folderId === 0 && !archivedPeerIds.size
       ? await this._loadDialogPage(query)
       : undefined
@@ -388,10 +391,16 @@ export class DialogRpc {
       ? initialMain
       : await this._loadDialogFolderPage(query, folderId as 0 | 1, archivedPeerIds))
     const loadMs = performance.now() - loadAt
-    // Preserve the platform's authoritative order. Re-sorting each page makes
-    // Telegram's last offset peer point into the middle of the upstream page,
-    // causing the next request to overlap or repeat the first page.
-    const all = loaded.dialogs.slice()
+    // 保持上游顺序以免末尾 offsetPeer 错位
+    const folderPinned = pinnedPeerIds.size
+      ? await this._pinnedDialogs(folderId, archivedPeerIds, loaded.dialogs)
+      : []
+    const firstPage = req.offsetPeer._ === 'inputPeerEmpty' && !req.offsetId && !req.offsetDate
+    const leadingPinned = firstPage && !req.excludePinned ? folderPinned : []
+    const all = [
+      ...leadingPinned,
+      ...loaded.dialogs.filter((dialog) => !pinnedPeerIds.has(dialog.conversation.id)),
+    ]
     const usersAt = performance.now()
     await this._persistUsers(all
       .filter((dialog) => dialog.conversation.kind === 'direct')
@@ -407,11 +416,7 @@ export class DialogRpc {
       this._peerId(dialog.conversation.id)
     }
 
-    // PlatformDataService has already persisted any previews exposed by
-    // getDialogs. Never fan a stored dialog-list request out into upstream
-    // history calls, including for rows whose platform preview is temporarily
-    // absent during cold start. The no-store path still allocates Telegram IDs
-    // oldest-first from history.
+    // 有存储时 `PlatformDataService` 已持久化会话预览，不可再向上游并发拉取历史消息；无存储模式仍需从历史按序分配 ID。
     if (!this._store) await Promise.all(all.map((dialog) => this._loadHistory(dialog.conversation.id)))
     const projectionsAt = performance.now()
     const dialogProjections = new Map<string, MaterializedMessage[]>()
@@ -424,12 +429,7 @@ export class DialogRpc {
       const projected = await this._store.readProjectedByPlatformIds(
         this._session.platformSessionId, targets,
       )
-      // A dialog preview can point at a persisted message whose sender is not
-      // the sender from the current upstream preview (for example after a
-      // recovery or duplicate dialog row was reconciled). Load every sender
-      // referenced by the actual projected source before materialization;
-      // otherwise projectTlMessage() can call _userId() for an unmapped user
-      // even though its durable row already exists.
+      // 数据库中的消息发送者可能与上游最新预览不同，需在投影前同步其持久化的用户映射。
       await this._syncStoredUsers(projected.flatMap(({ source }) => messageReferencedUserIds(source)))
       for (const stored of projected) {
         const materialized = stored.parts.map((part): MaterializedMessage => ({
@@ -459,6 +459,9 @@ export class DialogRpc {
         this._effectiveFolderId(dialog.conversation, archivedPeerIds) || undefined,
         dialogProjections.get(dialog.conversation.id),
       )))
+    for (const item of materialized) {
+      if (pinnedPeerIds.has(item.source.conversation.id)) item.dialog.pinned = true
+    }
     const materializeMs = performance.now() - materializeAt
     let start = 0
     if (req.offsetPeer._ !== 'inputPeerEmpty') {
@@ -473,9 +476,17 @@ export class DialogRpc {
       if (index >= 0) start = index + 1
     }
 
-    const limit = clampLimit(req.limit)
+    // 前置的置顶会话计入 limit，页长仍能表示是否还有下一页；其后至少保留一条普通会话，
+    // 因为客户端以末条会话为 offset 翻页，若末条是置顶会话会跳过上游排在它前面的会话
+    const requestedLimit = clampLimit(req.limit)
+    const limit = leadingPinned.length
+      ? leadingPinned.length + Math.max(1, requestedLimit - leadingPinned.length)
+      : requestedLimit
     const page = materialized.slice(start, start + limit)
-    const total = loaded.total ?? (loaded.nextCursor ? all.length + 1 : all.length)
+    // 上游 total 含本文件夹的置顶会话，仅非 exclude_pinned 的首屏才返回它们
+    const total = loaded.total !== undefined
+      ? loaded.total - folderPinned.length + leadingPinned.length
+      : loaded.nextCursor ? all.length + 1 : all.length
     const sliced = start > 0 || page.length < total
     const result = {
       _: sliced ? 'messages.dialogsSlice' : 'messages.dialogs',
@@ -495,11 +506,6 @@ export class DialogRpc {
     return result as unknown as tl.messages.TypeDialogs
   }
 
-  /**
-   * Source of one durable message row of this session.  Virtual features that
-   * address their peers by stored message use it to rebuild those peers after
-   * a restart instead of keeping a process-local registry.
-   */
   async readStoredMessage(storedMessageId: number): Promise<IMMessage | undefined> {
     return this._store?.readMessageByRowId(this._session.platformSessionId, storedMessageId)
   }
@@ -549,6 +555,18 @@ export class DialogRpc {
       seen.add(peerId)
     }
 
+    const pinnedPeerIds = new Set(await this._dialogFolders?.pinnedPeerIds(
+      this._session.platformSessionId,
+    ) ?? [])
+    const materialized = await this._materializePeerDialogs(selected, archivedPeerIds, pinnedPeerIds)
+    return this._peerDialogsResult(materialized, archive)
+  }
+
+  private async _materializePeerDialogs(
+    selected: readonly IMDialog[],
+    archivedPeerIds: ReadonlySet<string>,
+    pinnedPeerIds: ReadonlySet<string>,
+  ) {
     if (!this._store) await Promise.all(selected.map((dialog) => this._loadHistory(dialog.conversation.id)))
     await this._syncStoredUsers(selected.flatMap((dialog) => [
       ...(dialog.conversation.kind === 'direct' ? [dialog.conversation.id] : []),
@@ -562,6 +580,16 @@ export class DialogRpc {
         dialog, drafts.get(dialog.conversation.id),
         this._effectiveFolderId(dialog.conversation, archivedPeerIds) || undefined,
       )))
+    for (const item of materialized) {
+      if (pinnedPeerIds.has(item.source.conversation.id)) item.dialog.pinned = true
+    }
+    return materialized
+  }
+
+  private async _peerDialogsResult(
+    materialized: Awaited<ReturnType<DialogRpc['_materializePeerDialogs']>>,
+    archive?: Awaited<ReturnType<DialogRpc['_archiveFolderDialog']>>,
+  ): Promise<tl.messages.RawPeerDialogs> {
     const state = await this._store?.getUpdateState(this._session.platformSessionId)
     return {
       _: 'messages.peerDialogs',
@@ -669,20 +697,38 @@ export class DialogRpc {
 
   async saveDraft(req: tl.messages.RawSaveDraftRequest): Promise<tl.TlObject> {
     if (!this._drafts) throw new RpcError(500, 'DRAFT_STORE_UNAVAILABLE')
-    if (req.richMessage) throw new RpcError(400, 'DRAFT_RICH_MESSAGE_UNSUPPORTED')
     await this._hydratePeers()
     const scope = await this._resolveDraftScope(req.peer, req.replyTo)
     this._assertWritableConversation(scope.conversationId)
     const date = Math.floor(Date.now() / 1000)
     if (hasDraftContent(req)) {
+      let message = req.message
+      let entities = req.entities
+      let richMessage: tl.RawRichMessage | undefined
+      if (req.richMessage) {
+        // 图文草稿保留结构供编辑器重新打开；读取时若暂存媒体已失效会自动剔除。
+        const conversion = await convertRichMessage(
+          req.richMessage,
+          (reference) => this._resolveDraftMedia(reference),
+        )
+        richMessage = {
+          _: 'richMessage',
+          blocks: conversion?.blocks ?? [],
+          photos: conversion?.photos ?? [],
+          documents: conversion?.documents ?? [],
+        }
+        message = conversion?.text ?? ''
+        entities = undefined
+      }
       const draft: tl.RawDraftMessage = {
         _: 'draftMessage',
         noWebpage: req.noWebpage,
         invertMedia: req.invertMedia,
         replyTo: req.replyTo,
-        message: req.message,
-        entities: req.entities,
-        media: req.media,
+        message,
+        entities,
+        media: richMessage ? undefined : req.media,
+        richMessage,
         date,
         effect: req.effect,
         suggestedPost: req.suggestedPost,
@@ -690,7 +736,7 @@ export class DialogRpc {
       await this._drafts.save(
         this._session.platformSessionId, scope.conversationId, scope.topMsgId, draft,
       )
-      await this._publishDraft(scope.conversationId, scope.topMsgId, draft)
+      await this._publishDraft(scope.conversationId, scope.topMsgId, this._servableDraft(draft))
     } else {
       await this._drafts.remove(
         this._session.platformSessionId, scope.conversationId, scope.topMsgId,
@@ -706,9 +752,13 @@ export class DialogRpc {
     await this._hydratePeers()
     const drafts = await this._drafts?.list(this._session.platformSessionId) ?? []
     const state = await this._store?.getUpdateState(this._session.platformSessionId)
+    const servable = drafts.map((stored) => ({
+      ...stored,
+      draft: this._servableDraft(stored.draft as tl.RawDraftMessage),
+    }))
     return {
       _: 'updates',
-      updates: drafts.map((stored) => this._makeDraftUpdate(stored)),
+      updates: servable.map((stored) => this._makeDraftUpdate(stored)),
       users: [], chats: [],
       date: state?.date ?? Math.floor(Date.now() / 1000),
       seq: state?.seq ?? 0,
@@ -778,20 +828,398 @@ export class DialogRpc {
     return this._conversation(this._resolvePeer(peer))
   }
 
+  /**
+   * `messages.search`：只在本地投影过的消息中搜索，不再请求上游平台。
+   * 支持关键词（多词 AND）、`fromId`、`minDate`/`maxDate`、`offsetId`/`addOffset`/`maxId`/`minId`、
+   * 各类共享媒体过滤、`MyMentions`，以及空 peer + `PhoneCalls` 的通话记录。
+   */
   async search(req: tl.messages.RawSearchRequest): Promise<tl.messages.TypeMessages> {
+    await this._hydratePeers()
+    if (req.peer._ === 'inputPeerEmpty') {
+      const result = await this._localSearch({
+        q: req.q, filter: req.filter, fromId: req.fromId,
+        minDate: req.minDate, maxDate: req.maxDate,
+        offsetId: req.offsetId, addOffset: req.addOffset, limit: req.limit,
+        maxId: req.maxId, minId: req.minId, exactCount: false,
+      })
+      return this._searchResponse(result, [])
+    }
+    const peerId = req.topMsgId
+      ? await this._resolveMentionConversation(req.peer, req.topMsgId)
+      : this._resolvePeer(req.peer)
+    const conversation = this._conversation(peerId)
+    if (!this._store) return this._searchLoadedHistory(req, peerId, conversation)
+    const result = await this._localSearch({
+      conversationIds: [peerId],
+      q: req.q, filter: req.filter, fromId: req.fromId,
+      minDate: req.minDate, maxDate: req.maxDate,
+      offsetId: req.offsetId, addOffset: req.addOffset, limit: req.limit,
+      maxId: req.maxId, minId: req.minId,
+      exactCount: req.offsetId === 0 && req.addOffset <= 0 && req.maxId === 0,
+    })
+    return this._searchResponse(result, [conversation])
+  }
+
+  /** `messages.searchGlobal`：跨会话搜索，`offsetRate` 是上一页最后一条的时间戳。 */
+  async searchGlobal(req: tl.messages.RawSearchGlobalRequest): Promise<tl.messages.TypeMessages> {
+    await this._hydratePeers()
+    if (!this._store) return { _: 'messages.messages', messages: [], topics: [], chats: [], users: [this._makeSelfUser()] }
+    const kindFilter = req.groupsOnly || req.usersOnly || req.broadcastsOnly
+    const conversationIds = kindFilter
+      ? (await this._store.listConversations(this._session.platformSessionId))
+          .filter((conversation) => {
+            const kind = this._conversationSearchKind(conversation)
+            return (req.groupsOnly && kind === 'group')
+              || (req.usersOnly && kind === 'user')
+              || (req.broadcastsOnly && kind === 'broadcast')
+          })
+          .map((conversation) => conversation.id)
+      : undefined
+    let anchorPeerId: string | undefined
+    if (req.offsetId > 0 && req.offsetPeer._ !== 'inputPeerEmpty') {
+      try {
+        anchorPeerId = this._resolvePeer(req.offsetPeer)
+      } catch {
+        anchorPeerId = undefined
+      }
+    }
+    const result = await this._localSearch({
+      conversationIds,
+      q: req.q, filter: req.filter,
+      minDate: req.minDate ?? 0,
+      // offsetRate 由上一页最后一条消息的时间戳给出；没有可用锚点时退化为时间上界。
+      maxDate: req.maxDate ?? 0,
+      offsetId: req.offsetId, anchorPeerId, offsetRate: req.offsetRate,
+      addOffset: 0, limit: req.limit, maxId: 0, minId: 0, exactCount: false,
+    })
+    return this._searchResponse(result, [], true)
+  }
+
+  /** `messages.searchSentMedia`：自己发过的媒体（发送面板「最近发送」）。 */
+  async searchSentMedia(req: tl.messages.RawSearchSentMediaRequest): Promise<tl.messages.TypeMessages> {
+    await this._hydratePeers()
+    if (!this._store) return { _: 'messages.messages', messages: [], topics: [], chats: [], users: [this._makeSelfUser()] }
+    const result = await this._localSearch({
+      q: req.q, filter: req.filter, fromId: { _: 'inputPeerSelf' },
+      minDate: 0, maxDate: 0, offsetId: 0, addOffset: 0, limit: req.limit,
+      maxId: 0, minId: 0, exactCount: false,
+    })
+    return this._searchResponse({ ...result, sliced: false }, [])
+  }
+
+  async getSearchCounters(
+    req: tl.messages.RawGetSearchCountersRequest,
+  ): Promise<tl.messages.RawSearchCounter[]> {
+    await this._hydratePeers()
+    if (!this._store || req.peer._ === 'inputPeerEmpty') {
+      return req.filters.map((filter) => ({ _: 'messages.searchCounter', filter, count: 0 }))
+    }
+    const peerId = req.topMsgId
+      ? await this._resolveMentionConversation(req.peer, req.topMsgId)
+      : this._resolvePeer(req.peer)
+    const counters: tl.messages.RawSearchCounter[] = []
+    for (const filter of req.filters) {
+      const index = await this._searchIndex(peerId, filter)
+      counters.push({ _: 'messages.searchCounter', filter, count: index?.length ?? 0 })
+    }
+    return counters
+  }
+
+  /**
+   * `messages.getSearchResultsCalendar`：按天汇总共享媒体，供客户端日历视图使用。
+   * 从 `offsetId`（或 `offsetDate`）往更早方向返回最多 100 天，每天附带当天最新的一条消息。
+   */
+  async getSearchResultsCalendar(
+    req: tl.messages.RawGetSearchResultsCalendarRequest,
+  ): Promise<tl.messages.RawSearchResultsCalendar> {
     await this._hydratePeers()
     const peerId = this._resolvePeer(req.peer)
     const conversation = this._conversation(peerId)
-    if (req.filter._ === 'inputMessagesFilterPinned') return this._emptyMessages(conversation)
-    if (this._platform.searchMessages && !isLocalOnlyConversation(conversation)) {
-      return this._searchPlatform(req, peerId, conversation)
+    const index = (await this._searchIndex(peerId, req.filter)) ?? []
+    const startIndex = calendarStartIndex(index, req.offsetId, req.offsetDate)
+    const periods: tl.RawSearchResultsCalendarPeriod[] = []
+    const representatives: SearchPartIndexEntry[] = []
+    let current: { day: number, period: tl.RawSearchResultsCalendarPeriod } | undefined
+    for (const entry of index.slice(startIndex)) {
+      const day = calendarDayStart(entry.timestamp)
+      if (current?.day !== day) {
+        if (periods.length >= CALENDAR_PERIOD_LIMIT) break
+        current = {
+          day,
+          period: {
+            _: 'searchResultsCalendarPeriod', date: day,
+            minMsgId: entry.tlMessageId, maxMsgId: entry.tlMessageId, count: 0,
+          },
+        }
+        periods.push(current.period)
+        representatives.push(entry)
+      }
+      current.period.count++
+      current.period.minMsgId = Math.min(current.period.minMsgId, entry.tlMessageId)
+      current.period.maxMsgId = Math.max(current.period.maxMsgId, entry.tlMessageId)
     }
+    const oldest = index.at(-1)
+    const page = await this._materializeIndexEntries(representatives, req.filter)
+    const users = await this._messageSenders(page.map((item) => item.source))
+    const projected = await this._projectMessages(page)
+    return {
+      _: 'messages.searchResultsCalendar',
+      count: index.length,
+      minDate: oldest?.timestamp ?? 0,
+      minMsgId: oldest?.tlMessageId ?? 0,
+      ...(startIndex > 0 ? { offsetIdOffset: startIndex } : {}),
+      periods,
+      messages: projected.messages,
+      chats: uniqueChats([
+        ...(conversation.kind === 'direct' ? [] : [this._makeChat(conversation)]),
+        ...projected.chats,
+      ]),
+      users: uniqueUsers([...users, this._makeSelfUser()]),
+    }
+  }
+
+  /** `messages.getSearchResultsPositions`：共享媒体滚动条用的「消息 ID → 序号」映射。 */
+  async getSearchResultsPositions(
+    req: tl.messages.RawGetSearchResultsPositionsRequest,
+  ): Promise<tl.messages.RawSearchResultsPositions> {
+    await this._hydratePeers()
+    const peerId = this._resolvePeer(req.peer)
+    const index = (await this._searchIndex(peerId, req.filter)) ?? []
+    const start = req.offsetId > 0
+      ? index.findIndex((entry) => entry.tlMessageId < req.offsetId)
+      : 0
+    const positions = start < 0
+      ? []
+      : index.slice(start, start + Math.max(0, Math.min(req.limit, POSITIONS_LIMIT))).map((entry, offset) => ({
+          _: 'searchResultPosition' as const,
+          msgId: entry.tlMessageId,
+          date: entry.timestamp,
+          offset: start + offset,
+        }))
+    return { _: 'messages.searchResultsPositions', count: index.length, positions }
+  }
+
+  /** 共享媒体类过滤器的完整分片索引；`undefined` 表示该过滤器本地无结果。 */
+  private async _searchIndex(
+    peerId: string,
+    filter: tl.TypeMessagesFilter,
+  ): Promise<SearchPartIndexEntry[] | undefined> {
+    if (!this._store) return
+    const kinds = filterSearchKinds(filter)
+    if (kinds === null) return
+    const entries = await this._store.searchPartIndex(this._session.platformSessionId, {
+      platformConversationIds: [peerId], terms: [], kinds: kinds || undefined,
+    })
+    if (filter._ !== 'inputMessagesFilterPhoneCalls' || !filter.missed) return entries
+    const missed = new Set((await this._store.readProjectedByMessageIds(
+      this._session.platformSessionId, entries.map((entry) => entry.messageId),
+    )).filter(({ source }) => isMissedCall(source)).map(({ parts }) => parts[0]?.messageId))
+    return entries.filter((entry) => missed.has(entry.messageId))
+  }
+
+  private async _materializeIndexEntries(
+    entries: readonly SearchPartIndexEntry[],
+    filter: tl.TypeMessagesFilter,
+  ): Promise<MaterializedMessage[]> {
+    if (!this._store || !entries.length) return []
+    const projected = await this._store.readProjectedByMessageIds(
+      this._session.platformSessionId, entries.map((entry) => entry.messageId),
+    )
+    const wanted = new Set(entries.map((entry) => entry.tlMessageId))
+    const items = await this._materializeProjected(projected, (part) => wanted.has(part.tlMessageId))
+    return items.filter((item) => wanted.has(item.tlId) && (filter._ !== 'inputMessagesFilterEmpty' || item.ordinal === 0))
+  }
+
+  private async _localSearch(options: LocalSearchOptions): Promise<LocalSearchResult> {
+    const empty: LocalSearchResult = { page: [], count: 0, sliced: false, exact: true, hasMore: false }
+    if (!this._store) return empty
+    const kinds = filterSearchKinds(options.filter)
+    if (kinds === null) return empty
+    const missedCallsOnly = options.filter._ === 'inputMessagesFilterPhoneCalls' && options.filter.missed === true
+    let senderUserId: number | undefined
+    if (options.fromId) {
+      senderUserId = this._searchSenderUserId(options.fromId)
+      if (senderUserId === undefined) return empty
+    }
+    const query = {
+      platformConversationIds: options.conversationIds,
+      terms: normalizeSearchTerms(options.q),
+      senderUserId,
+      minTimestamp: options.minDate > 0 ? options.minDate : undefined,
+      maxTimestamp: options.maxDate > 0 ? options.maxDate : undefined,
+      kinds: kinds || undefined,
+    }
+    const singleConversation = options.conversationIds?.length === 1 ? options.conversationIds[0] : undefined
+    // Telegram 消息 ID 只在单个会话内有序，`offsetId`/`maxId`/`minId` 只用于会话内搜索。
+    const upperTlId = singleConversation
+      ? Math.min(...[options.offsetId, options.maxId].filter((id) => id > 0), Number.POSITIVE_INFINITY)
+      : Number.POSITIVE_INFINITY
+    const lowerTlId = singleConversation && options.minId > 0 ? options.minId : 0
+    let before: { timestamp: number, messageId: number } | undefined
+    const anchorConversation = singleConversation ?? options.anchorPeerId
+    if (options.offsetId > 0 && anchorConversation) {
+      const anchor = await this._store.findProjectedByTlId(
+        this._session.platformSessionId, options.offsetId, anchorConversation,
+      )
+      const anchorMessageId = anchor?.parts[0]?.messageId
+      if (anchor && anchorMessageId !== undefined) {
+        // 会话内搜索把锚点消息本身也纳入扫描，由分片 ID 过滤剔除，避免相册剩余分片被跳过。
+        before = {
+          timestamp: anchor.source.timestamp,
+          messageId: singleConversation ? anchorMessageId + 1 : anchorMessageId,
+        }
+      }
+    }
+    if (!before && !singleConversation && options.offsetRate && options.offsetRate > 0) {
+      before = { timestamp: options.offsetRate + 1, messageId: 0 }
+    }
+    const limit = clampLimit(options.limit)
+    const start = Math.max(0, options.addOffset)
+    const needed = start + limit
+    const collected: MaterializedMessage[] = []
+    let cursor = before
+    let hasMore = true
+    for (let round = 0; round < SEARCH_SCAN_ROUNDS && hasMore && (collected.length < needed || needed === 0); round++) {
+      const batch = Math.min(SEARCH_BATCH_MAX, Math.max(SEARCH_BATCH_MIN, needed - collected.length + 1))
+      const result = await this._store.searchMessages(this._session.platformSessionId, {
+        ...query, before: cursor, limit: batch,
+      })
+      hasMore = result.hasMore
+      const last = result.messages.at(-1)
+      if (last) cursor = { timestamp: last.source.timestamp, messageId: last.messageId }
+      const items = await this._materializeProjected(result.messages, (part, message) => {
+        if (part.tlMessageId >= upperTlId || part.tlMessageId <= lowerTlId) return false
+        if (missedCallsOnly && !isMissedCall(message.source)) return false
+        if (!kinds) return part.ordinal === 0
+        const media = part.mediaId === null ? undefined : message.media.find((entry) => entry.id === part.mediaId)
+        return partMatchesSearchKinds((message as SearchedMessage).searchKinds, { ordinal: part.ordinal, media }, kinds)
+      })
+      collected.push(...await this._visibleMessages(items))
+      if (needed === 0) break
+    }
+    const page = collected.slice(start, start + limit)
+    const more = collected.length > start + limit || hasMore
+    let count: number
+    let exact = false
+    if (options.exactCount || limit === 0) {
+      count = kinds
+        ? (await this._store.searchPartIndex(this._session.platformSessionId, query)).length
+        : await this._store.countSearchMessages(this._session.platformSessionId, query)
+      exact = true
+    } else {
+      count = start + page.length + (more ? 1 : 0)
+    }
+    return {
+      page,
+      count,
+      exact,
+      hasMore: more,
+      sliced: more || start > 0 || options.offsetId > 0 || options.maxId > 0 || limit === 0 || count > page.length,
+    }
+  }
+
+  /** `fromId` 对应的 `mtproto_im_user` 行号（与 Telegram 用户 ID 相同）。 */
+  private _searchSenderUserId(peer: tl.TypeInputPeer): number | undefined {
+    if (peer._ === 'inputPeerSelf') return this._selfId
+    if (peer._ === 'inputPeerUser' || peer._ === 'inputPeerUserFromMessage') {
+      return this._tlToUser.has(peer.userId) ? peer.userId : undefined
+    }
+    return undefined
+  }
+
+  private _conversationSearchKind(conversation: IMConversation): 'user' | 'group' | 'broadcast' {
+    if (conversation.kind === 'direct') return 'user'
+    return this._isTelegramChannel(conversation) && conversation.kind === 'channel' ? 'broadcast' : 'group'
+  }
+
+  private async _materializeProjected(
+    projected: readonly ProjectedMessage[],
+    accept: (part: TlMessagePartRow, message: ProjectedMessage) => boolean,
+  ): Promise<MaterializedMessage[]> {
+    const output: MaterializedMessage[] = []
+    for (const message of projected) {
+      const parts = message.parts.slice().sort((left, right) => right.tlMessageId - left.tlMessageId)
+      for (const part of parts) {
+        if (!accept(part, message)) continue
+        const item: MaterializedMessage = {
+          source: message.source,
+          tlId: part.tlMessageId,
+          ordinal: part.ordinal,
+          storedMessageId: part.messageId,
+          groupedId: part.groupedId ?? undefined,
+          media: message.media.find((entry) => entry.id === part.mediaId),
+          mediaRows: message.media,
+        }
+        this._rememberMessage(item)
+        output.push(item)
+      }
+    }
+    if (!output.length) return output
+    // 投影消息实体与表情回应前，先将数据库中的用户映射同步到当前实例。
+    await this._syncStoredUsers([
+      ...new Set(output.map(({ source }) => source.conversationId)),
+      ...output.flatMap(({ source }) => messageReferencedUserIds(source)),
+    ])
+    await this._rememberReplyTargets(output.map((item) => item.source))
+    return output
+  }
+
+  private async _searchResponse(
+    result: LocalSearchResult,
+    baseConversations: readonly IMConversation[],
+    global = false,
+  ): Promise<tl.messages.TypeMessages> {
+    const { page } = result
+    const conversations = new Map(baseConversations.map((conversation) => [conversation.id, conversation]))
+    for (const item of page) {
+      if (!conversations.has(item.source.conversationId)) {
+        conversations.set(item.source.conversationId, this._conversation(item.source.conversationId))
+      }
+    }
+    const peerUsers = await Promise.all([...conversations.values()]
+      .filter((conversation) => conversation.kind === 'direct')
+      .map((conversation) => this._getPeerUser(conversation.id, conversation.title)))
+    const senders = await this._messageSenders(page.map((item) => item.source))
+    const projected = await this._projectMessages(page)
+    const chats = uniqueChats([
+      ...[...conversations.values()].flatMap((conversation) => {
+        if (conversation.kind === 'direct') return []
+        const parent = conversation.parentId ? this._conversation(conversation.parentId) : undefined
+        return parent ? [this._makeChat(parent), this._makeChat(conversation)] : [this._makeChat(conversation)]
+      }),
+      ...projected.chats,
+    ])
+    const users = uniqueUsers([...peerUsers, ...senders, this._makeSelfUser()])
+    if (!result.sliced) {
+      return { _: 'messages.messages', messages: projected.messages, topics: [], chats, users }
+    }
+    const last = page.at(-1)
+    return {
+      _: 'messages.messagesSlice',
+      ...(result.exact ? {} : { inexact: true }),
+      count: result.count,
+      ...(global && result.hasMore && last ? { nextRate: last.source.timestamp } : {}),
+      messages: projected.messages,
+      topics: [],
+      chats,
+      users,
+    } as tl.messages.RawMessagesSlice
+  }
+
+  /** 无持久化存储（纯内存模式）时退化为在已加载的历史窗口内过滤。 */
+  private async _searchLoadedHistory(
+    req: tl.messages.RawSearchRequest,
+    peerId: string,
+    conversation: IMConversation,
+  ): Promise<tl.messages.TypeMessages> {
+    const kinds = filterSearchKinds(req.filter)
+    if (kinds === null) return this._emptyMessages(conversation)
     const requestedLimit = clampLimit(req.limit)
     const all = await this._loadHistory(peerId, {
       offsetId: req.offsetId, offsetDate: req.maxDate, addOffset: req.addOffset,
       limit: Math.max(1, requestedLimit), maxId: req.maxId, minId: req.minId,
     })
-    const query = req.q.toLocaleLowerCase()
+    const terms = normalizeSearchTerms(req.q)
     const visible = await this._visibleMessages(all)
     const filtered = visible.filter((item) => {
       if (req.offsetId > 0 && item.tlId >= req.offsetId) return false
@@ -799,53 +1227,29 @@ export class DialogRpc {
       if (req.maxDate > 0 && item.source.timestamp >= req.maxDate) return false
       if (req.maxId > 0 && item.tlId >= req.maxId) return false
       if (req.minId > 0 && item.tlId <= req.minId) return false
-      if (query && !messageText(item.source).toLocaleLowerCase().includes(query)) return false
-      return matchesMessageFilter(item, req.filter)
+      if (req.fromId && this._searchSenderUserId(req.fromId) !== (
+        item.source.outgoing ? this._selfId : this._userToTl.get(item.source.senderId)
+      )) return false
+      const text = messageSearchText(item.source)
+      if (!terms.every((term) => text.includes(term))) return false
+      if (!kinds) return item.ordinal === 0
+      return partMatchesSearchKinds(
+        messageSearchKinds(item.source, {
+          selfUserId: this._session.userId, conversationKind: conversation.kind,
+        }),
+        { ordinal: item.ordinal, media: item.media },
+        kinds,
+      )
     })
     const start = Math.max(0, req.addOffset)
     const page = filtered.slice(start, start + requestedLimit)
-    const users = await this._messageSenders(page.map((item) => item.source))
-    const count = filtered.length
-    const sliced = requestedLimit === 0 ? count > 0 : page.length < count || start > 0
-    const projected = await this._projectMessages(page)
-    return {
-      _: sliced ? 'messages.messagesSlice' : 'messages.messages',
-      ...(sliced ? { count } : {}),
-      messages: projected.messages, topics: [],
-      chats: uniqueChats([
-        ...(conversation.kind === 'direct' ? [] : [this._makeChat(conversation)]),
-        ...projected.chats,
-      ]),
-      users: uniqueUsers([...users, this._makeSelfUser()]),
-    } as unknown as tl.messages.TypeMessages
-  }
-
-  async getSearchCounters(
-    req: tl.messages.RawGetSearchCountersRequest,
-  ): Promise<tl.messages.RawSearchCounter[]> {
-    if (req.peer._ === 'inputPeerSelf') {
-      return req.filters.map((filter) => ({ _: 'messages.searchCounter', filter, count: 0 }))
-    }
-    const counters: tl.messages.RawSearchCounter[] = []
-    for (const filter of req.filters) {
-      if (!supportsSharedMediaFilter(filter)) {
-        counters.push({ _: 'messages.searchCounter', filter, count: 0 })
-        continue
-      }
-      const result = await this.search({
-        _: 'messages.search', peer: req.peer, savedPeerId: req.savedPeerId,
-        topMsgId: req.topMsgId, q: '', filter,
-        minDate: 0, maxDate: 0, offsetId: 0, addOffset: 0, limit: 0,
-        maxId: 0, minId: 0, hash: Long.ZERO,
-      })
-      const count = result._ === 'messages.messagesSlice' || result._ === 'messages.channelMessages'
-        ? result.count
-        : result._ === 'messages.messages'
-          ? result.messages.length
-          : 0
-      counters.push({ _: 'messages.searchCounter', inexact: count > 0 || undefined, filter, count })
-    }
-    return counters
+    return this._searchResponse({
+      page,
+      count: filtered.length,
+      exact: true,
+      hasMore: start + page.length < filtered.length,
+      sliced: requestedLimit === 0 ? filtered.length > 0 : page.length < filtered.length || start > 0,
+    }, [conversation])
   }
 
   async getUnreadMentions(
@@ -919,168 +1323,6 @@ export class DialogRpc {
     }
   }
 
-  private async _searchPlatform(
-    req: tl.messages.RawSearchRequest,
-    peerId: string,
-    conversation: IMConversation,
-  ): Promise<tl.messages.TypeMessages> {
-    const fromUserId = req.fromId?._ === 'inputPeerSelf'
-      ? this._session.userId
-      : req.fromId?._ === 'inputPeerUser'
-        ? this._tlToUser.get(req.fromId.userId)
-        : undefined
-    const fingerprint = JSON.stringify([
-      peerId, req.q, req.filter._, fromUserId ?? '', req.minDate, req.maxDate,
-    ])
-    const cursorState = req.offsetId > 0
-      ? this._searchCursors.get(`${fingerprint}:${req.offsetId}`)
-      : undefined
-    let maxTimestamp = req.maxDate > 0 ? req.maxDate : undefined
-    if (req.offsetId > 0 && !cursorState) {
-      const stored = this._store
-        ? await this._store.findProjectedByTlId(this._session.platformSessionId, req.offsetId, peerId)
-        : undefined
-      const anchorTimestamp = stored?.source.timestamp
-      if (anchorTimestamp !== undefined) {
-        maxTimestamp = Math.min(maxTimestamp ?? anchorTimestamp, anchorTimestamp)
-      }
-    }
-    const requestedLimit = clampLimit(req.limit)
-    const start = Math.max(0, req.addOffset)
-    const target = Math.max(1, requestedLimit + start)
-    // Native QQ search already applies the text query for an unfiltered
-    // request.  Requesting a fixed 200-item page in that case makes common
-    // CJK terms fan out into hundreds of durable projections before Telegram
-    // only needs the first result.  Keep the broad page for bridge-side
-    // filters, where sparse native pages are still required for correctness.
-    const upstreamPageLimit = req.filter._ === 'inputMessagesFilterEmpty' &&
-      !req.fromId && req.minDate === 0 && req.maxDate === 0
-      ? Math.min(200, target)
-      : 200
-    const candidates = cursorState?.pending.slice() ?? []
-    let upstreamCursor = cursorState?.upstreamCursor
-    let exhausted = cursorState?.exhausted ?? false
-    const normalizedQuery = req.q.toLocaleLowerCase()
-    for (
-      let requestCount = 0;
-      candidates.length < target && !exhausted && requestCount < 100;
-      requestCount++
-    ) {
-      const query = {
-        query: req.q,
-        cursor: upstreamCursor,
-        // Broad pages prevent sparse bridge-side filters (especially links
-        // and video subtypes) from stopping at unrelated native results.
-        limit: upstreamPageLimit,
-        fromUserId,
-        minTimestamp: req.minDate > 0 ? req.minDate : undefined,
-        maxTimestamp,
-        mediaKind: searchMediaKind(req.filter),
-      } as const
-      const upstream = this._data
-        ? await this._data.searchMessages(peerId, query)
-        : await this._platform.searchMessages!(this._session, { id: peerId }, query)
-      const materialized = await this._materializeSearchMessages(peerId, upstream.messages)
-      const visible = await this._visibleMessages(materialized)
-      candidates.push(...visible.filter((item) => {
-        if (req.offsetId > 0 && !cursorState && item.tlId >= req.offsetId) return false
-        if (req.minDate > 0 && item.source.timestamp <= req.minDate) return false
-        if (req.maxDate > 0 && item.source.timestamp >= req.maxDate) return false
-        if (req.maxId > 0 && item.tlId >= req.maxId) return false
-        if (req.minId > 0 && item.tlId <= req.minId) return false
-        if (normalizedQuery && !messageText(item.source).toLocaleLowerCase().includes(normalizedQuery)) return false
-        return matchesMessageFilter(item, req.filter)
-      }))
-      upstreamCursor = upstream.nextCursor
-      if (!upstreamCursor) exhausted = true
-    }
-    const page = candidates.slice(start, start + requestedLimit)
-    const pending = candidates.slice(start + page.length)
-    const hasMore = pending.length > 0 || Boolean(upstreamCursor)
-    if (page.length && hasMore) {
-      this._rememberSearchCursor(`${fingerprint}:${page.at(-1)!.tlId}`, {
-        upstreamCursor, exhausted, pending,
-      })
-    }
-    const users = await this._messageSenders(page.map((item) => item.source))
-    const count = exhausted
-      ? candidates.length
-      : Math.max(1, start + page.length + (hasMore ? 1 : 0))
-    const sliced = Boolean(
-      hasMore || cursorState || req.offsetId > 0 || start > 0 || requestedLimit === 0 && count > 0,
-    )
-    const projected = await this._projectMessages(page)
-    return {
-      _: sliced ? 'messages.messagesSlice' : 'messages.messages',
-      ...(sliced ? { count } : {}),
-      messages: projected.messages, topics: [],
-      chats: uniqueChats([
-        ...(conversation.kind === 'direct' ? [] : [this._makeChat(conversation)]),
-        ...projected.chats,
-      ]),
-      users: uniqueUsers([...users, this._makeSelfUser()]),
-    } as unknown as tl.messages.TypeMessages
-  }
-
-  private _rememberSearchCursor(key: string, state: SearchCursorState): void {
-    this._searchCursors.set(key, state)
-    while (this._searchCursors.size > 1024) {
-      const oldest = this._searchCursors.keys().next().value as string | undefined
-      if (!oldest) break
-      this._searchCursors.delete(oldest)
-    }
-  }
-
-  private async _materializeSearchMessages(
-    peerId: string,
-    messages: readonly IMMessage[],
-  ): Promise<MaterializedMessage[]> {
-    if (this._store) {
-      const output: MaterializedMessage[] = []
-      for (const source of messages) {
-        const projected = await this._store.findProjectedByPlatformId(
-          this._session.platformSessionId, peerId, source.id,
-        )
-        if (!projected) continue
-        for (const part of projected.parts) {
-          const item: MaterializedMessage = {
-            source: projected.source,
-            tlId: part.tlMessageId,
-            ordinal: part.ordinal,
-            storedMessageId: part.messageId,
-            groupedId: part.groupedId ?? undefined,
-            media: projected.media.find((entry) => entry.id === part.mediaId),
-            mediaRows: projected.media,
-          }
-          this._rememberMessage(item)
-          output.push(item)
-        }
-      }
-      // PlatformDataService persists search hits before this method reads their
-      // projections. A fresh DialogRpc still needs those durable user rows in
-      // its process-local ID maps before message entities and reactions can be
-      // projected. History reads already perform the same hydration step.
-      await this._syncStoredUsers([
-        peerId,
-        ...output.flatMap(({ source }) => messageReferencedUserIds(source)),
-      ])
-      await this._rememberReplyTargets(output.map((item) => item.source))
-      return output
-    }
-    for (const source of messages.slice().sort((left, right) => left.timestamp - right.timestamp)) {
-      this._messageId(peerId, source.id)
-    }
-    return messages.map((source) => {
-      const item: MaterializedMessage = {
-        source,
-        tlId: telegramMessageId(source) ?? this._messageId(peerId, source.id),
-        ordinal: 0,
-      }
-      this._rememberMessage(item)
-      return item
-    })
-  }
-
   async readHistory(
     req: tl.messages.RawReadHistoryRequest,
     excludeConnection?: ServerConnection,
@@ -1096,7 +1338,243 @@ export class DialogRpc {
     req: tl.messages.RawGetScheduledHistoryRequest,
   ): Promise<tl.messages.TypeMessages> {
     await this._hydratePeers()
-    return this._emptyMessages(this._conversation(this._resolvePeer(req.peer)))
+    const conversation = this._conversation(this._resolvePeer(req.peer))
+    const rows = await this._scheduledMessages(conversation.id)
+    return this._scheduledMessagesReply(conversation, rows)
+  }
+
+  async getScheduledMessages(
+    req: tl.messages.RawGetScheduledMessagesRequest,
+  ): Promise<tl.messages.TypeMessages> {
+    await this._hydratePeers()
+    const conversation = this._conversation(this._resolvePeer(req.peer))
+    if (!this._scheduled) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    const rows = await this._scheduled.byTlIds(
+      this._session.platformSessionId, conversation.id, req.id,
+    )
+    return this._scheduledMessagesReply(conversation, rows)
+  }
+
+  /**
+   * 立即发送定时消息。
+   *
+   * 每一行先经 `claimNow()` 认领再走普通发送路径，产生的消息会像正常发送一样落库和推送，
+   * 之后标记为 sent 并从客户端可见列表中移除。调度器正在发送的行会被跳过，交给调度器推送删除。
+   */
+  async sendScheduledMessages(
+    req: tl.messages.RawSendScheduledMessagesRequest,
+  ): Promise<tl.TypeUpdates> {
+    await this._hydratePeers()
+    const conversation = this._conversation(this._resolvePeer(req.peer))
+    if (!this._scheduled) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    const rows = await this._scheduled.byTlIds(
+      this._session.platformSessionId, conversation.id, req.id,
+    )
+    if (!rows.length) throw new RpcError(400, 'MESSAGE_ID_INVALID')
+    const updates: tl.TypeUpdate[] = []
+    const removedIds: number[] = []
+    const sentIds: number[] = []
+    const owner = `send-now-${this._session.platformSessionId}`
+    try {
+      for (const row of rows) {
+        const now = Math.floor(Date.now() / 1_000)
+        if (!await this._scheduled.claimNow(row.id, owner, now)) continue
+        let sent: tl.TypeUpdates
+        try {
+          sent = await this._sendMessage(this._scheduledSendRequest(row))
+        } catch (error) {
+          await this._scheduled.release(
+            row.id, row.status === 'failed' ? 'failed' : 'pending',
+            error instanceof Error ? error.message : String(error),
+          )
+          throw error
+        }
+        const sentUpdates = sent._ === 'updates' ? sent.updates : []
+        // randomId 在定时创建时已经确认过，这里再带 `updateMessageID` 会被客户端套到早已删除的占位上。
+        updates.push(...sentUpdates.filter((update) => update._ !== 'updateMessageID'))
+        const newId = sentUpdates
+          .map((update) => update._ === 'updateNewMessage' || update._ === 'updateNewChannelMessage'
+            ? update.message.id
+            : undefined)
+          .find((id): id is number => id !== undefined)
+        if (newId !== undefined) sentIds.push(newId)
+        await this._scheduled.markSent(row.id, newId)
+        removedIds.push(row.tlMessageId)
+      }
+    } finally {
+      this._onScheduledChange?.()
+    }
+    updates.push({
+      _: 'updateDeleteScheduledMessages',
+      peer: this._conversationPeer(conversation),
+      messages: removedIds,
+      // sent_messages 必须与 messages 一一对应，有缺失时整体省略。
+      sentMessages: sentIds.length && sentIds.length === removedIds.length ? sentIds : undefined,
+    })
+    return {
+      _: 'updates', updates,
+      users: [this._makeSelfUser()],
+      chats: conversation.kind === 'direct' ? [] : [this._makeChat(conversation)],
+      date: Math.floor(Date.now() / 1_000), seq: 0,
+    }
+  }
+
+  async deleteScheduledMessages(
+    req: tl.messages.RawDeleteScheduledMessagesRequest,
+  ): Promise<tl.TypeUpdates> {
+    await this._hydratePeers()
+    const conversation = this._conversation(this._resolvePeer(req.peer))
+    if (!this._scheduled) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    const removed: number[] = []
+    for (const tlMessageId of req.id) {
+      if (await this._scheduled.cancel(
+        this._session.platformSessionId, conversation.id, tlMessageId,
+      )) removed.push(tlMessageId)
+    }
+    if (removed.length) this._onScheduledChange?.()
+    return {
+      _: 'updates', updates: [{
+        _: 'updateDeleteScheduledMessages',
+        peer: this._conversationPeer(conversation),
+        messages: removed,
+      }],
+      users: [this._makeSelfUser()],
+      chats: conversation.kind === 'direct' ? [] : [this._makeChat(conversation)],
+      date: Math.floor(Date.now() / 1_000), seq: 0,
+    }
+  }
+
+  /**
+   * 到时间后投递一条已存储的行（由调度器调用）。
+   *
+   * peer 按存储的会话 ID 重建，而不是用创建时客户端传入的 input peer，
+   * 这样重启后也不会留下过期的 peer。
+   */
+  async deliverScheduled(message: ScheduledMessage): Promise<{
+    sentTlMessageId?: number
+    peer: tl.TypePeer
+  }> {
+    const conversationId = message.platformConversationId
+    if (!this._conversations.has(conversationId)) {
+      const stored = await this._store?.getConversation(
+        this._session.platformSessionId, conversationId,
+      )
+      if (stored) this._conversations.set(conversationId, stored)
+      else this._conversations.set(conversationId, {
+        id: conversationId, kind: message.conversationKind, title: conversationId,
+      })
+    }
+    const conversation = this._conversation(conversationId)
+    if (conversation.kind === 'direct') await this._getPeerUser(conversationId)
+    const result = await this._sendMessage(this._scheduledSendRequest(message))
+    const resultUpdates = result._ === 'updates' ? result.updates : []
+    const sentTlMessageId = resultUpdates
+      .map((update) => update._ === 'updateNewMessage' || update._ === 'updateNewChannelMessage'
+        ? update.message.id
+        : undefined)
+      .find((id): id is number => id !== undefined)
+    return { sentTlMessageId, peer: this._conversationPeer(conversation) }
+  }
+
+  private _scheduledSendRequest(message: ScheduledMessage): SendMessageRequest {
+    const conversation = this._conversation(message.platformConversationId)
+    const peer: tl.TypeInputPeer = conversation.kind === 'direct'
+      ? { _: 'inputPeerUser', userId: this._userId(conversation.id), accessHash: Long.ZERO }
+      : { _: 'inputPeerChannel', channelId: this._peerId(conversation.id), accessHash: Long.ONE }
+    return {
+      _: 'messages.sendMessage',
+      peer,
+      message: message.text,
+      randomId: Long.fromString(message.randomId),
+      entities: (message.entities ?? undefined) as unknown as tl.TypeMessageEntity[] | undefined,
+      replyTo: message.replyToMsgId
+        ? { _: 'inputReplyToMessage', replyToMsgId: message.replyToMsgId }
+        : undefined,
+    }
+  }
+
+  private async _scheduleTextMessage(req: SendMessageRequest): Promise<tl.TypeUpdates> {
+    if (!this._scheduled || !this._store) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    await this._hydratePeers()
+    const conversationId = this._resolveMessageTarget(req.peer, req.replyTo)
+    this._assertWritableConversation(conversationId)
+    const conversation = this._conversation(conversationId)
+    if (conversation.kind === 'channel' && conversation.parentId) {
+      throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    }
+    const dueAt = req.scheduleDate!
+    if (!Number.isSafeInteger(dueAt) || dueAt <= 0) throw new RpcError(400, 'SCHEDULE_DATE_INVALID')
+    const idScope = `scheduled:${this._session.platformSessionId}:${conversationId}`
+    const [tlMessageId] = await this._store.allocateIds(idScope, 1)
+    const replyToMsgId = req.replyTo?._ === 'inputReplyToMessage'
+      ? req.replyTo.replyToMsgId
+      : undefined
+    const row = await this._scheduled.create({
+      platformSessionId: this._session.platformSessionId,
+      platformConversationId: conversationId,
+      conversationKind: conversation.kind,
+      tlMessageId,
+      text: req.message,
+      entities: (req.entities as unknown as JsonValue[] | undefined) ?? null,
+      replyToMsgId,
+      dueAt,
+      randomId: req.randomId.toString(),
+    })
+    this._onScheduledChange?.()
+    return {
+      _: 'updates',
+      updates: [
+        // 客户端只靠 `updateMessageID` 把本地「发送中」的定时占位消息升级为服务端消息；
+        // 缺了它占位会一直转圈，`getScheduledHistory` 再插入一份带对勾的副本，发送后也删不掉占位。
+        { _: 'updateMessageID', id: tlMessageId, randomId: req.randomId },
+        {
+          _: 'updateNewScheduledMessage',
+          message: this._scheduledMessageTl(row, conversation),
+        },
+      ],
+      users: [this._makeSelfUser()],
+      chats: conversation.kind === 'direct' ? [] : [this._makeChat(conversation)],
+      date: Math.floor(Date.now() / 1_000), seq: 0,
+    }
+  }
+
+  private async _scheduledMessages(conversationId: string): Promise<ScheduledMessage[]> {
+    if (!this._scheduled) return []
+    return this._scheduled.list(this._session.platformSessionId, conversationId)
+  }
+
+  private _scheduledMessagesReply(
+    conversation: import('./platform.js').IMConversation,
+    rows: ScheduledMessage[],
+  ): tl.messages.RawMessages {
+    return {
+      _: 'messages.messages',
+      messages: rows
+        .sort((left, right) => left.dueAt - right.dueAt)
+        .map((row) => this._scheduledMessageTl(row, conversation)),
+      topics: [],
+      chats: conversation.kind === 'direct' ? [] : [this._makeChat(conversation)],
+      users: [this._makeSelfUser()],
+    }
+  }
+
+  private _scheduledMessageTl(
+    row: ScheduledMessage,
+    conversation: import('./platform.js').IMConversation,
+  ): tl.RawMessage {
+    return {
+      _: 'message',
+      id: row.tlMessageId,
+      peerId: this._conversationPeer(conversation),
+      fromId: { _: 'peerUser', userId: this._selfId },
+      date: row.dueAt,
+      message: row.text,
+      entities: (row.entities ?? undefined) as unknown as tl.TypeMessageEntity[] | undefined,
+      out: true,
+      replyTo: row.replyToMsgId
+        ? { _: 'messageReplyHeader', replyToMsgId: row.replyToMsgId }
+        : undefined,
+    }
   }
 
   async getMessages(req: GetMessagesRequest): Promise<tl.messages.TypeMessages> {
@@ -1209,28 +1687,114 @@ export class DialogRpc {
 
   async getPinnedDialogs(folderId = 0): Promise<tl.messages.RawPeerDialogs> {
     if (folderId !== 0 && folderId !== 1) throw new RpcError(400, 'FOLDER_ID_INVALID')
+    await this._hydratePeers()
     const archive = folderId === 0 ? await this._archiveFolderDialog() : undefined
+    const archivedPeerIds = await this._dialogFolders?.archivedPeerIds(
+      this._session.platformSessionId,
+    ) ?? new Set<string>()
+    const pinned = await this._pinnedDialogs(folderId, archivedPeerIds)
+    const materialized = await this._materializePeerDialogs(
+      pinned, archivedPeerIds, new Set(pinned.map((dialog) => dialog.conversation.id)),
+    )
+    return this._peerDialogsResult(materialized, archive && {
+      ...archive, dialog: { ...archive.dialog, pinned: true },
+    })
+  }
+
+  /** 置顶或取消置顶一个会话，返回推送给其他设备的 update；状态未变时返回 undefined */
+  async toggleDialogPin(
+    req: tl.messages.RawToggleDialogPinRequest,
+  ): Promise<tl.RawUpdateDialogPinned | undefined> {
+    const pending = this._folderEditQueue.then(() => this._toggleDialogPin(req))
+    this._folderEditQueue = pending.then(() => undefined, () => undefined)
+    return pending
+  }
+
+  private async _toggleDialogPin(
+    req: tl.messages.RawToggleDialogPinRequest,
+  ): Promise<tl.RawUpdateDialogPinned | undefined> {
+    if (!this._dialogFolders) throw new RpcError(500, 'FOLDER_STORE_UNAVAILABLE')
+    // 归档文件夹始终置顶于主列表
+    if (req.peer._ === 'inputDialogPeerFolder') return undefined
+    if (req.peer._ !== 'inputDialogPeer') throw new RpcError(400, 'PEER_ID_INVALID')
+    await this._hydratePeers()
+    const peerId = this._resolvePeer(req.peer.peer)
+    const pinned = req.pinned === true
+    const changed = await this._dialogFolders.setPeerPinned(this._session.platformSessionId, peerId, pinned)
+    if (!changed) return undefined
+    const archivedPeerIds = await this._dialogFolders.archivedPeerIds(this._session.platformSessionId)
+    const folderId = this._effectiveFolderId(this._conversation(peerId), archivedPeerIds)
     return {
-      _: 'messages.peerDialogs',
-      dialogs: archive ? [{ ...archive.dialog, pinned: true }] : [],
-      messages: archive?.messages ?? [], chats: archive?.chats ?? [], users: archive?.users ?? [],
-      state: {
-        _: 'updates.state', pts: this._pts, qts: 0,
-        date: Math.floor(Date.now() / 1000), seq: 0, unreadCount: 0,
-      },
+      _: 'updateDialogPinned', pinned, folderId: folderId || undefined,
+      peer: { _: 'dialogPeer', peer: this._conversationPeer(this._conversation(peerId)) },
     }
   }
 
-  /**
-   * The bridge does not expose pinned ordinary peers, but Telegram clients send this
-   * housekeeping RPC during dialog synchronization. A successful no-op is
-   * preferable to METHOD_NOT_IMPLEMENTED, which Android keeps retrying.
-   */
+  /** 替换指定文件夹的置顶顺序，返回推送给其他设备的 update */
   async reorderPinnedDialogs(
     req: tl.messages.RawReorderPinnedDialogsRequest,
-  ): Promise<tl.TlObject> {
+  ): Promise<tl.RawUpdatePinnedDialogs> {
+    const pending = this._folderEditQueue.then(() => this._reorderPinnedDialogs(req))
+    this._folderEditQueue = pending.then(() => undefined, () => undefined)
+    return pending
+  }
+
+  private async _reorderPinnedDialogs(
+    req: tl.messages.RawReorderPinnedDialogsRequest,
+  ): Promise<tl.RawUpdatePinnedDialogs> {
     if (req.folderId !== 0 && req.folderId !== 1) throw new RpcError(400, 'FOLDER_ID_INVALID')
-    return { _: 'boolTrue' } as unknown as tl.TlObject
+    const folderId = req.folderId as 0 | 1
+    // 客户端同步对话时会发送此请求；无存储时没有可排序的置顶，返回错误会让 Android 无限重试
+    if (!this._dialogFolders) return { _: 'updatePinnedDialogs', folderId: folderId || undefined, order: [] }
+    await this._hydratePeers()
+    const order = req.order.flatMap((entry) => {
+      // 归档文件夹隐式置顶，不占用存储的位置
+      if (entry._ === 'inputDialogPeerFolder') return []
+      if (entry._ !== 'inputDialogPeer') throw new RpcError(400, 'PEER_ID_INVALID')
+      return [this._resolvePeer(entry.peer)]
+    })
+    const archivedPeerIds = await this._dialogFolders.archivedPeerIds(this._session.platformSessionId)
+    const previous = (await this._dialogFolders.pinnedPeerIds(this._session.platformSessionId))
+      .filter((peerId) => this._effectiveFolderId(this._conversation(peerId), archivedPeerIds) === folderId)
+    const next = await this._dialogFolders.reorderPinnedPeers(
+      this._session.platformSessionId, order, previous, req.force === true,
+    )
+    return {
+      _: 'updatePinnedDialogs', folderId: folderId || undefined,
+      order: [
+        ...(folderId === 0 && req.order.some((entry) => entry._ === 'inputDialogPeerFolder')
+          ? [{ _: 'dialogPeerFolder' as const, folderId: 1 }]
+          : []),
+        ...next.map((peerId) => ({
+          _: 'dialogPeer' as const, peer: this._conversationPeer(this._conversation(peerId)),
+        })),
+      ],
+    }
+  }
+
+  /** 按置顶顺序读取指定文件夹的置顶会话（未在当前页中的会话从 MessageStore 补齐） */
+  private async _pinnedDialogs(
+    folderId: 0 | 1 | undefined,
+    archivedPeerIds: ReadonlySet<string>,
+    loaded: readonly IMDialog[] = [],
+  ): Promise<IMDialog[]> {
+    const pinnedPeerIds = await this._dialogFolders?.pinnedPeerIds(this._session.platformSessionId) ?? []
+    if (!pinnedPeerIds.length) return []
+    const byId = new Map(loaded.map((dialog) => [dialog.conversation.id, dialog]))
+    const missing = pinnedPeerIds.filter((peerId) => !byId.has(peerId))
+    if (missing.length && this._store) {
+      for (const dialog of await this._store.readDialogs(this._session.platformSessionId, missing)) {
+        byId.set(dialog.conversation.id, dialog)
+      }
+    }
+    return pinnedPeerIds.flatMap((peerId) => {
+      const dialog = byId.get(peerId)
+      if (!dialog) return []
+      if (folderId !== undefined && this._effectiveFolderId(dialog.conversation, archivedPeerIds) !== folderId) return []
+      this._conversations.set(peerId, dialog.conversation)
+      this._peerId(peerId)
+      return [dialog]
+    })
   }
 
   async getContacts(): Promise<tl.contacts.RawContacts> {
@@ -1254,13 +1818,10 @@ export class DialogRpc {
       this._contactUserIds.clear()
       for (const user of resolvedUsers) {
         this._contactUserIds.add(user.id)
-        // QQ dialogs are keyed by UID, but legacy/resolved conversations can
-        // still be keyed by numeric UIN. Keep both forms contact-aware.
+        // 兼容以 UID 或数字 UIN 作为会话键的 QQ 联系人识别。
         const numericId = user.metadata?.qq
         if (typeof numericId === 'string' && numericId) this._contactUserIds.add(numericId)
       }
-      // A previous projection may have cached the same user as a non-contact,
-      // or a removed friend as a contact. Rebuild it from this snapshot.
       this._peerUsers.clear()
       users = resolvedUsers.map((user) => {
         this._conversations.set(user.id, { id: user.id, kind: 'direct', title: user.firstName })
@@ -1297,8 +1858,6 @@ export class DialogRpc {
     try {
       await pending
     } catch (error) {
-      // Contact metadata is advisory for dialog projection.  A transient QQ
-      // buddy-list failure must not make the entire dialogs RPC unavailable.
       this._onTrace?.('contacts hydration failed: %s', String(error))
     } finally {
       if (this._contactsHydration === pending) this._contactsHydration = undefined
@@ -1457,8 +2016,6 @@ export class DialogRpc {
       try {
         profile = await this._getPlatformUser(peerId) ?? undefined
       } catch {
-        // Extended profile data is optional. A transient profile lookup must
-        // not make an otherwise resolvable users.getFullUser request fail.
       }
     }
     const about = profile?.about
@@ -1473,15 +2030,7 @@ export class DialogRpc {
         ...(about !== undefined ? { about } : {}),
         settings: { _: 'peerSettings' },
         notifySettings: await this._peerNotifySettings(peerId ?? this._session.userId),
-        // Bots share the `bot_info_version` flag slot with `bot` in the `user`
-        // object, and clients only treat a bot's info as loaded once
-        // `userFull.bot_info` arrives: Telegram Desktop's
-        // `HistoryInner::refreshAboutView` re-requests the whole full user on
-        // every `FullInfo` update while `BotInfo::inited` is false, which loops
-        // at round-trip speed for as long as the bot chat stays open. Each of
-        // those replies also re-applies `userFull.notify_settings`, so a mute
-        // the client has not flushed yet is reverted before
-        // `account.updateNotifySettings` is sent.
+        // 缺少 `userFull.bot_info` 会使 Telegram Desktop 将 `BotInfo::inited` 保持为 false，在聊天打开期间死循环请求 `users.getFullUser` 并回滚未提交的静音设置。
         ...(user._ === 'user' && user.bot === true ? { botInfo: makeBotInfo(about) } : {}),
         commonChatsCount: 0,
       },
@@ -1694,10 +2243,7 @@ export class DialogRpc {
         users: page.members.map((member) => this._makeMemberUser(member)),
       }
     }
-    // Telegram applies offset/limit after filtering. Since the platform API is
-    // cursor-paged and has no filtered-list primitive, scan the bounded member
-    // snapshot before slicing so Android can find mention/search candidates
-    // beyond QQNT's first native page.
+    // 平台接口不支持服务端过滤，需先扫描有界成员快照再按 `offset`/`limit` 切片。
     let members = await this._allMembers(conversation.id)
     if (req.filter._ === 'channelParticipantsAdmins') {
       members = members.filter((member) => member.role === 'owner' || member.role === 'administrator')
@@ -1825,9 +2371,7 @@ export class DialogRpc {
       const button = projected.source.content.inlineKeyboard?.rows
         .flatMap((row) => row.buttons)
         .find((candidate) => candidate.type === 'callback' && candidate.data === data)
-      // Terminal provider messages deliberately remove buttons. Clients may
-      // retry the original callback, so providers validate their terminal
-      // state while pending rows must still have rendered callback data.
+      // 已完结的系统会话消息会移除按钮，允许客户端重试交给 provider 校验终态；仍有键盘的消息则必须匹配按钮。
       if (!button && projected.source.content.inlineKeyboard) throw new RpcError(400, 'DATA_INVALID')
       try {
         const answer = await this._systemPeers!.callback(this._session, systemPeer, {
@@ -1870,8 +2414,7 @@ export class DialogRpc {
       }
     }
     if (!this._platform.clickInlineButton) throw new RpcError(400, 'BOT_RESPONSE_TIMEOUT')
-    // Channel message ids are only unique per channel: the same TL id names
-    // unrelated messages in other groups, so resolve it inside this peer.
+    // 频道消息 ID 仅在频道内唯一，需限定在当前会话中解析。
     const remembered = this._tlToMessage.get(req.msgId)
     const peerProjection = remembered && this._belongsToDisplayPeer(remembered.peerId, conversationId)
       ? undefined
@@ -1897,6 +2440,16 @@ export class DialogRpc {
       messageId: target.platformMessageId,
       nativeSequence: target.nativeSequence,
     }, button)
+    if (answer.refresh && message) {
+      // The platform resolved the button server-side (a group invite accepted):
+      // republish the message without its keyboard so clients drop the button.
+      await this._onLocalEvent?.(this._session, {
+        type: 'message-edit',
+        eventId: `inline-keyboard-refresh:${encodeURIComponent(conversationId)}:${encodeURIComponent(message.id)}`,
+        conversation: this._conversation(message.conversationId),
+        message: { ...message, content: { ...message.content, inlineKeyboard: undefined } },
+      })
+    }
     return {
       _: 'messages.botCallbackAnswer',
       alert: answer.alert || undefined,
@@ -1908,6 +2461,7 @@ export class DialogRpc {
   }
 
   async sendMedia(req: SendMediaRequest, excludeConnection?: ServerConnection): Promise<tl.TypeUpdates> {
+    if (req.scheduleDate !== undefined) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
     return this._sendMediaOnce(req.randomId.toString(), async () => {
       const startedAt = performance.now()
       const resolved = await this._resolveSendMedia(req.media)
@@ -1943,6 +2497,7 @@ export class DialogRpc {
   }
 
   async sendMultiMedia(req: SendMultiMediaRequest, excludeConnection?: ServerConnection): Promise<tl.TypeUpdates> {
+    if (req.scheduleDate !== undefined) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
     const randomId = req.multiMedia.map((item) => item.randomId.toString()).join(':')
     return this._sendMediaOnce(randomId, async () => {
       if (!req.multiMedia.length) throw new RpcError(400, 'MEDIA_EMPTY')
@@ -1971,15 +2526,10 @@ export class DialogRpc {
     channel?: tl.TypeInputChannel,
   ): Promise<tl.messages.RawAffectedMessages> {
     if (!this._store) throw new RpcError(500, 'MESSAGE_STORE_UNAVAILABLE')
-    // Telegram Android periodically sends empty channel deletions as a cleanup
-    // probe. Treating them like real deletes refreshes every dialog and then
-    // tries to reserve zero PTS, causing a retry storm that competes with user
-    // sends. An empty vector is a successful no-op and must not touch upstream.
+    // Telegram Android 会定期发送空 `id` 列表的删除探测；直接返回空结果，避免全量刷新对话或预留 0 个 pts。
     if (!req.id.length) {
       return this._emptyDeleteResult(channel)
     }
-    // Message ownership and action policy must be evaluated against a fresh
-    // upstream preview rather than the short-lived read-side peer cache.
     await this._hydratePeers(true)
     const expectedConversation = channel ? this._resolveChannel(channel).id : undefined
     const grouped = new Map<string, Array<{
@@ -2007,20 +2557,13 @@ export class DialogRpc {
       const conversation = this._conversation(conversationId)
       const policy = this._platform.capabilities.messageActions?.delete
       const now = Math.floor(Date.now() / 1000)
-      // A service notice is a relay-side rendering of an upstream sidecar: QQ
-      // keeps it on the msgSeq of the message it accompanies and resolves a
-      // recall that names the sidecar to that content message, so forwarding one
-      // upstream would delete an unrelated message. Notices are therefore removed
-      // from this relay only, and they are always removable because they are not
-      // the platform's messages.
+      // QQ 灰条与所依附的正文消息共用 `msgSeq`，向上游转发撤回会误删正文消息，因此仅在本地移除。
       const notices = targets.filter(({ source }) => isServiceMessage(source))
       const messages = targets.filter(({ source }) => !isServiceMessage(source))
       const canDeleteAny = messages.length ? await this._canDeleteAnyMessage(conversationId) : false
       const allowed = messages.every(({ source }) => {
         const own = source.outgoing || source.senderId === this._session.userId
-        // QQ administrators can recall older messages from other members. The
-        // adapter still controls whether deletion is supported at all, while
-        // the regular-member age limit remains in force.
+        // 群管理员撤回他人消息不受普通成员撤回时限约束。
         const rule = own || !canDeleteAny ? (own ? policy?.own : policy?.others) : {
           supported: policy?.others?.supported ?? false,
         }
@@ -2044,9 +2587,7 @@ export class DialogRpc {
       }
       if (notices.length) {
         const messageIds = [...new Set(notices.map((target) => target.source.id))]
-        // Publishing through the durable update pipeline removes the notices for
-        // every session and journals the deletion, which a relay-local removal
-        // could not do on its own.
+        // 经 update 管道删除并记入日志，确保同一账号的所有会话同步移除该提示。
         const published = this._onLocalEvent
           ? await this._onLocalEvent(this._session, {
               type: 'message-delete',
@@ -2066,9 +2607,6 @@ export class DialogRpc {
       }
     }
     const ptsCount = affected.size
-    // Deleting stale or already-deleted Telegram ids is idempotent. No rows
-    // changed, so keep the current PTS instead of attempting to reserve zero
-    // entries (which is invalid and previously triggered a client retry storm).
     if (!ptsCount) return this._emptyDeleteResult(channel)
     const pts = await this._reservePts(
       ptsCount,
@@ -2092,9 +2630,10 @@ export class DialogRpc {
   ): Promise<tl.TypeUpdates> {
     if (!this._store) throw new RpcError(500, 'MESSAGE_STORE_UNAVAILABLE')
     if (req.scheduleDate !== undefined) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
-    if (req.media || req.richMessage || req.message === undefined) throw new RpcError(400, 'MESSAGE_EDIT_UNSUPPORTED')
-    if (!req.message.length) throw new RpcError(400, 'MESSAGE_EMPTY')
-    if (Array.from(req.message).length > this._platform.capabilities.send.maxTextLength) {
+    if (req.media) throw new RpcError(400, 'MESSAGE_EDIT_UNSUPPORTED')
+    if (req.message === undefined && !req.richMessage) throw new RpcError(400, 'MESSAGE_EDIT_UNSUPPORTED')
+    if (!req.richMessage && !req.message!.length) throw new RpcError(400, 'MESSAGE_EMPTY')
+    if (!req.richMessage && Array.from(req.message!).length > this._platform.capabilities.send.maxTextLength) {
       throw new RpcError(400, 'MESSAGE_TOO_LONG')
     }
     await this._hydratePeers()
@@ -2113,10 +2652,31 @@ export class DialogRpc {
       throw new RpcError(400, 'MESSAGE_EDIT_TIME_EXPIRED')
     }
     const ordinal = projected.parts.find((part) => part.tlMessageId === req.id)?.ordinal ?? 0
-    await this._hydrateMentionUsernames(req.message, req.entities)
     const replyToNativeSequence = qqReplySequenceFromMetadata(projected.source.metadata)
-    const content: IMMessageInput = {
-      parts: [this._inputTextPart(req.message, req.entities)],
+    const editUploads: UploadedFile[] = []
+    let content: IMMessageInput
+    if (req.richMessage) {
+      // 撤回重发一次只能替换一条上游物理消息，禁止编辑已被拆分为多条的消息。
+      if ((projected.source.sourceIds?.length ?? 1) > 1) {
+        throw new RpcError(400, 'MESSAGE_EDIT_UNSUPPORTED')
+      }
+      const rich = await this._richMessageContent(
+        req.richMessage, editUploads, req.message, req.entities,
+      )
+      if (!rich) throw new RpcError(400, 'MESSAGE_EMPTY')
+      this._assertSendableContent(rich)
+      this._assertSendableMedia(
+        rich.parts.flatMap((part) => part.type === 'media' ? [part.media] : []),
+        [],
+        rich.parts.some((part) => part.type === 'text' && part.text.length > 0),
+      )
+      content = rich
+    } else {
+      await this._hydrateMentionUsernames(req.message!, req.entities)
+      content = { parts: [this._inputTextPart(req.message!, req.entities)] }
+    }
+    content = {
+      ...content,
       ...(projected.source.replyToId !== undefined
         ? { replyToId: projected.source.replyToId }
         : {}),
@@ -2133,6 +2693,7 @@ export class DialogRpc {
     } catch (error) {
       this._throwMessageAction(error, 'MESSAGE_EDIT_FORBIDDEN')
     }
+    await Promise.all(editUploads.map((upload) => this._uploads?.complete(upload)))
     const conversation = this._conversation(conversationId)
     const source: IMMessage<any> = {
       ...(edited!.replacedMessageId
@@ -2164,8 +2725,6 @@ export class DialogRpc {
         { type: 'message', conversation, message: source },
         delivery,
       )
-      // The requester receives the same durable PTS-bearing updates as the
-      // observer sockets, but in the edit RPC response instead of as a push.
       const payloads = [deleted, replacement]
         .map((published) => published as tl.RawUpdates | undefined)
         .filter((payload): payload is tl.RawUpdates => payload?._ === 'updates')
@@ -2279,16 +2838,18 @@ export class DialogRpc {
     const conversation = this._conversation(toId)
     const publishedPayloads: tl.RawUpdates[] = []
     const projections = []
-    for (const output of forwarded!) {
-      const source: IMMessage<any> = { ...output, conversationId: toId, outgoing: true }
-      const published = await this._publishLocalMessage(toId, source, excludeConnection)
-      if (published) {
-        publishedPayloads.push(published)
-        continue
+    await this._withSendEchoes(forwarded!, async () => {
+      for (const output of forwarded!) {
+        const source: IMMessage<any> = { ...output, conversationId: toId, outgoing: true }
+        const published = await this._publishLocalMessage(toId, source, excludeConnection)
+        if (published) {
+          publishedPayloads.push(published)
+          continue
+        }
+        const persisted = await this._store.ingest(this._session, conversation, source)
+        projections.push(...persisted.projection)
       }
-      const persisted = await this._store.ingest(this._session, conversation, source)
-      projections.push(...persisted.projection)
-    }
+    })
     if (projections.length) {
       let pts = await this._reservePts(
         projections.length,
@@ -2313,9 +2874,7 @@ export class DialogRpc {
     const projectedCount = payload.updates.filter((update) =>
       update._ === 'updateNewMessage' || update._ === 'updateNewChannelMessage').length
     const confirmed = this._withMessageIds(payload, req.randomId.slice(0, projectedCount))
-    // Native platforms may coalesce several forwarded inputs into fewer outputs.
-    // Confirm every unpaired random ID as cancelled so patched Telegram clients
-    // remove their local placeholders instead of converting them to send errors.
+    // 平台可能将多条转发合并为更少的消息；未配对的 `randomId` 标记为已取消，让客户端移除本地占位消息。
     for (const randomId of req.randomId.slice(projectedCount)) {
       confirmed.updates.push({ _: 'updateMessageID', id: CANCELLED_MESSAGE_ID, randomId })
     }
@@ -2335,7 +2894,8 @@ export class DialogRpc {
       conversationId: resolution.peer.id,
       outgoing: true,
     }
-    const published = await this._publishLocalMessage(resolution.peer.id, source, excludeConnection)
+    const published = await this._withSendEchoes([source], () =>
+      this._publishLocalMessage(resolution.peer.id, source, excludeConnection))
     await this._systemPeers!.receive(this._session, resolution, source, input)
     if (published) return this._confirmForwardRandomIds(published, randomIds)
 
@@ -2448,9 +3008,7 @@ export class DialogRpc {
       }
     }
     if (req.location._ === 'inputPeerPhotoFileLocation') {
-      // Persisted avatar locators can outlive QQ CDN credentials or predate
-      // newer locator fields (for example avatarUin). Refresh the peer first,
-      // then fall back to the cached projection when upstream is unavailable.
+      // 持久化的头像 locator 可能已过期，优先向上游刷新 peer，失败再回退到本地缓存。
       const media = await this._resolveAvatarMedia(req.location.peer, req.location.photoId)
         ?? this._avatarMedia.get(req.location.photoId.toString())
       if (!media || !this._platform.downloadMedia) throw new RpcError(400, 'LOCATION_INVALID')
@@ -2580,13 +3138,6 @@ export class DialogRpc {
     return directDownloadJSON(resolved)
   }
 
-  /**
-   * Advertise what this account's platform supports for one peer.
-   *
-   * Clients ask before rendering a platform-specific action. An official
-   * Telegram server rejects the unknown method, so the caller keeps the action
-   * hidden instead of sending one that cannot work.
-   */
   async getFeatures(req: GetFeaturesRequest): Promise<tl.RawDataJSON> {
     const features: CrossgramFeatures = {}
     const poke = this._platform.capabilities.poke
@@ -2600,12 +3151,6 @@ export class DialogRpc {
     return featuresJSON(features)
   }
 
-  /**
-   * Send a native poke (nudge) notice through the platform.
-   *
-   * The poke is a platform action, so the notice it produces is published to
-   * every session instead of being an optimistic local message.
-   */
   async sendPoke(req: SendPokeRequest): Promise<tl.TlObject> {
     const poke = this._platform.capabilities.poke
     if (!poke || poke.maxCount <= 0 || !this._platform.sendPoke) {
@@ -2735,8 +3280,6 @@ export class DialogRpc {
           try {
             media = (await this._backfillConversation(conversationId))?.avatar
           } catch {
-            // A missing or temporarily unavailable upstream avatar remains a
-            // normal LOCATION_INVALID response and may be retried later.
           }
         }
       }
@@ -2912,7 +3455,11 @@ export class DialogRpc {
     }
     const conversation = this._conversation(peerId)
     const result = await this._store!.setReactions(this._session, conversation, target, updated)
-    await this._reactions!.markUsed(peerId, newlySelected)
+    // `add_to_recent` 只在用户从回应面板里主动挑选时置位；没置位（双击快速回应、气泡内联条）
+    // 只刷新最近列表里已有的记录，不新增条目。
+    const recentChanged = await this._reactions!.markUsed(peerId, newlySelected, {
+      append: Boolean(req.addToRecent),
+    })
     const update: tl.RawUpdateMessageReactions = {
       _: 'updateMessageReactions',
       peer: this._conversationPeer(conversation),
@@ -2924,7 +3471,7 @@ export class DialogRpc {
         (id) => this._userId(id),
       ),
     }
-    const recentUpdate: tl.TypeUpdate[] = newlySelected.length
+    const recentUpdate: tl.TypeUpdate[] = recentChanged
       ? [{ _: 'updateRecentReactions' }]
       : []
     return {
@@ -3080,10 +3627,7 @@ export class DialogRpc {
         const pageActors = new Map<string, IMReactionActor[]>()
         for (const item of page.actors) {
           const actors = pageActors.get(item.reactionKey) ?? []
-          // Keep every actor returned by the explicit list request. The
-          // Telegram message payload still exposes a three-user preview, but
-          // truncating this cache would make the full reaction list regress to
-          // three users whenever a later refresh falls back to stored data.
+          // 完整保留拉到的回应用户列表，避免后续刷新回退到持久化数据时被截断为 3 人预览。
           actors.push(item.actor)
           pageActors.set(item.reactionKey, actors)
         }
@@ -3189,11 +3733,12 @@ export class DialogRpc {
     req: SendMessageRequest,
     excludeConnection?: ServerConnection,
   ): Promise<tl.TypeUpdates> {
+    if (req.richMessage) return this._sendRichMessage(req, excludeConnection)
     if (!req.message.length) throw new RpcError(400, 'MESSAGE_EMPTY')
     if (Array.from(req.message).length > this._platform.capabilities.send.maxTextLength) {
       throw new RpcError(400, 'MESSAGE_TOO_LONG')
     }
-    if (req.scheduleDate !== undefined) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    if (req.scheduleDate !== undefined) return this._scheduleTextMessage(req)
 
     await this._hydratePeers()
     const peerId = this._resolveMessageTarget(req.peer, req.replyTo)
@@ -3226,9 +3771,9 @@ export class DialogRpc {
       outgoing: true,
       replyToId: sent.replyToId ?? replyToId,
     }
-    const published = await this._publishLocalMessage(
+    const published = await this._withSendEchoes([source], () => this._publishLocalMessage(
       peerId, source, excludeConnection, [req.randomId], replyTopMessageId(req.replyTo),
-    )
+    ))
     if (systemPeer) await this._systemPeers!.receive(this._session, systemPeer, source, input)
     if (published) {
       const update = published.updates.find((item) =>
@@ -3237,11 +3782,7 @@ export class DialogRpc {
         | tl.RawUpdateNewChannelMessage
         | undefined
       if (!update) throw new RpcError(500, 'MESSAGE_UPDATE_NOT_FOUND')
-      // Always carry random_id on the wire instead of relying on the implicit
-      // updateShortSentMessage request context. Desktop forks can apply the
-      // returned Updates without forwarding that out-of-band random ID, which
-      // leaves their optimistic local item pending and inserts this message as
-      // a second item. updateMessageID makes reconciliation self-contained.
+      // 始终附带 `updateMessageID`，避免桌面端分支忽略请求上下文而将回包当作第二条新消息插入。
       return this._withMessageIds(published, [req.randomId], replyTopMessageId(req.replyTo))
     }
     let persisted: Awaited<ReturnType<MessageStore['ingest']>> | undefined
@@ -3276,6 +3817,122 @@ export class DialogRpc {
     }
   }
 
+  private async _sendRichMessage(
+    req: SendMessageRequest,
+    excludeConnection?: ServerConnection,
+  ): Promise<tl.TypeUpdates> {
+    if (req.scheduleDate !== undefined) throw new RpcError(400, 'SCHEDULED_MESSAGES_UNAVAILABLE')
+    const uploads: UploadedFile[] = []
+    const content = await this._richMessageContent(req.richMessage!, uploads, req.message, req.entities)
+    if (!content) throw new RpcError(400, 'MESSAGE_EMPTY')
+    return this._sendRichContent(req.peer, content, uploads, [req.randomId], req.replyTo, excludeConnection)
+  }
+
+  private async _richMessageContent(
+    input: tl.TypeInputRichMessage,
+    uploads: UploadedFile[],
+    text?: string,
+    entities?: tl.TypeMessageEntity[],
+  ): Promise<IMMessageInput | undefined> {
+    await this._hydratePeers()
+    await this._hydrateMentionUsernames(text ?? '', entities)
+    const conversion = await convertRichMessage(input, async (reference) => this._resolveRichMedia(reference, (
+      resolved,
+    ) => {
+      uploads.push(resolved.upload)
+    }))
+    if (!conversion) return undefined
+    return {
+      parts: [
+        ...(text?.length ? [this._inputTextPart(text, entities)] : []),
+        ...conversion.parts.map((part) => part.type === 'text'
+          ? this._inputTextPart(part.text, part.entities)
+          : { type: 'media' as const, media: part.media }),
+      ],
+    }
+  }
+
+  private async _resolveRichMedia(
+    reference: RichMediaReference,
+    onResolved?: (resolved: ResolvedMediaUpload) => void,
+  ): Promise<ResolvedRichMedia | undefined> {
+    if (!reference.input) throw new RpcError(400, 'MEDIA_INVALID')
+    const media: tl.TypeInputMedia = reference.kind === 'photo'
+      ? { _: 'inputMediaPhoto', id: reference.input as tl.TypeInputPhoto }
+      : { _: 'inputMediaDocument', id: reference.input as tl.TypeInputDocument }
+    const resolved = await this._resolveSendMedia(media)
+    if ('sticker' in resolved) throw new RpcError(400, 'MEDIA_INVALID')
+    onResolved?.(resolved)
+    return { media: resolved.media }
+  }
+
+  /** 解析草稿媒体引用；仅保留当前仍在暂存中的上传，避免客户端重开草稿时出现无法加载的图片。 */
+  private async _resolveDraftMedia(reference: RichMediaReference): Promise<ResolvedRichMedia | undefined> {
+    if (!reference.input || !this._uploads) return undefined
+    let resolved: ResolvedMediaUpload | ResolvedStickerInput
+    try {
+      resolved = await this._resolveSendMedia(reference.kind === 'photo'
+        ? { _: 'inputMediaPhoto', id: reference.input as tl.TypeInputPhoto }
+        : { _: 'inputMediaDocument', id: reference.input as tl.TypeInputDocument })
+    } catch {
+      return undefined
+    }
+    if ('sticker' in resolved) return undefined
+    const staged = this._uploads.getStaged(this._session.platformSessionId, String(resolved.upload.fileId))
+    if (!staged) return undefined
+    const media = makeStagedMessageMedia(staged, this._dcId)
+    return {
+      media: staged.media,
+      ...(media._ === 'messageMediaPhoto' && media.photo._ === 'photo' ? { rawPhoto: media.photo } : {}),
+      ...(media._ === 'messageMediaDocument' && media.document._ === 'document'
+        ? { rawDocument: media.document } : {}),
+    }
+  }
+
+  /** 剔除草稿中已过期的暂存媒体。 */
+  private _servableDraft(draft: tl.RawDraftMessage): tl.RawDraftMessage {
+    if (!draft.richMessage) return draft
+    const rich = draft.richMessage
+    if (!rich.photos.length && !rich.documents.length) return draft
+    const servable = new Set<string>()
+    for (const media of [...rich.photos, ...rich.documents]) {
+      if (this._uploads?.getStaged(this._session.platformSessionId, media.id.toString())) {
+        servable.add(media.id.toString())
+      }
+    }
+    if (servable.size === rich.photos.length + rich.documents.length) return draft
+    return {
+      ...draft,
+      richMessage: {
+        ...rich,
+        photos: rich.photos.filter((photo) => servable.has(photo.id.toString())),
+        documents: rich.documents.filter((document) => servable.has(document.id.toString())),
+        blocks: rich.blocks.filter((block) => {
+          const id = mediaBlockId(block)
+          return id === undefined || servable.has(id)
+        }),
+      },
+    }
+  }
+
+  /**
+   * 平台返回发送结果后，把「这些平台消息是当前 auth key 发的」记下来，再投递本地副本。
+   * 平台随后回显同一条消息时，`UpdateManager` 按平台消息 id 把发送端排除掉：客户端
+   * 只从 RPC 回包里拿这一条，`updateMessageID` 能原地升级，不会多出服务端副本。
+   */
+  private async _withSendEchoes<T>(
+    sent: readonly IMMessage<any>[],
+    publish: () => Promise<T>,
+  ): Promise<T> {
+    const ids = sent.flatMap((message) => [message.id, ...(message.sourceIds ?? [])])
+    this._sendEchoes?.bind(this._session.platformSessionId, ids, this._authKeyId)
+    try {
+      return await publish()
+    } finally {
+      this._sendEchoes?.release(this._session.platformSessionId, ids)
+    }
+  }
+
   private async _sendToPlatform(send: () => Promise<IMMessage>): Promise<IMMessage> {
     try {
       return await send()
@@ -3305,7 +3962,17 @@ export class DialogRpc {
     }
     const file = media.file
     if (file._ !== 'inputFile' && file._ !== 'inputFileBig') throw new RpcError(400, 'FILE_ID_INVALID')
-    const kind = media._ === 'inputMediaUploadedPhoto' ? 'image' : 'file'
+    // A GIF or APNG that the client sends as an animation reaches the relay as
+    // an uploaded document, never as a photo, and Telegram models it as an
+    // image: the relay itself projects an animated image document back as
+    // `kind: 'image'` with the image mime. Sending it to the platform as a file
+    // produces a plain attachment whose name the user never chose. Only a
+    // document that the client marked as animated counts, so an explicit
+    // "send as file" and a video never take the image path.
+    const animatedImage = media._ === 'inputMediaUploadedDocument'
+      && isAnimatedImageMime(media.mimeType)
+      && media.attributes.some((item) => item._ === 'documentAttributeAnimated')
+    const kind = media._ === 'inputMediaUploadedPhoto' || animatedImage ? 'image' : 'file'
     const attribute = media._ === 'inputMediaUploadedDocument'
       ? media.attributes.find((item) => item._ === 'documentAttributeFilename')
       : undefined
@@ -3418,6 +4085,36 @@ export class DialogRpc {
     }
   }
 
+  private _assertSendableContent(content: IMMessageInput): void {
+    const text = content.parts.flatMap((part) => part.type === 'text' ? [part.text] : []).join('\n')
+    if (Array.from(text).length > this._platform.capabilities.send.maxTextLength) {
+      throw new RpcError(400, 'MESSAGE_TOO_LONG')
+    }
+  }
+
+  private _assertSendableMedia(
+    media: readonly IMMediaInput[],
+    stickers: readonly import('./sticker-provider.js').IMStickerSendPlan[],
+    hasText: boolean,
+  ): void {
+    if (media.length > this._platform.capabilities.send.maxMedia) throw new RpcError(400, 'MEDIA_TOO_MANY')
+    if (media.some((item) => item.kind === 'image') && !this._platform.capabilities.send.images) {
+      throw new RpcError(400, 'PHOTO_SEND_UNAVAILABLE')
+    }
+    if (media.some((item) => item.kind === 'file') && !this._platform.capabilities.send.files) {
+      throw new RpcError(400, 'FILE_SEND_UNAVAILABLE')
+    }
+    if (hasText && media.length && !this._platform.capabilities.send.mixed) {
+      throw new RpcError(400, 'MIXED_SEND_UNAVAILABLE')
+    }
+    if (stickers.some((item) => item.type === 'native') && !this._platform.capabilities.stickers?.native) {
+      throw new RpcError(400, 'STICKER_SEND_UNAVAILABLE')
+    }
+    if (stickers.some((item) => item.type === 'upload') && !this._platform.capabilities.stickers?.upload) {
+      throw new RpcError(400, 'STICKER_SEND_UNAVAILABLE')
+    }
+  }
+
   private async _sendRichContent(
     inputPeer: tl.TypeInputPeer,
     content: IMMessageInput,
@@ -3431,9 +4128,7 @@ export class DialogRpc {
     const stickers = content.parts.flatMap((part) => part.type === 'sticker' ? [part.sticker] : [])
     const text = content.parts.flatMap((part) => part.type === 'text' ? [part.text] : []).join('\n')
     if (stickers.length > 1) throw new RpcError(400, 'STICKERS_TOO_MUCH')
-    if (Array.from(text).length > this._platform.capabilities.send.maxTextLength) {
-      throw new RpcError(400, 'MESSAGE_TOO_LONG')
-    }
+    this._assertSendableContent(content)
 
     await this._hydratePeers()
     const hydrateMs = performance.now() - startedAt
@@ -3444,24 +4139,7 @@ export class DialogRpc {
     const replyMs = performance.now() - replyAt
     const replyToId = replyTarget?.id
     const systemPeer = await this._systemPeers?.resolve(this._session, peerId)
-    if (!systemPeer) {
-      if (media.length > this._platform.capabilities.send.maxMedia) throw new RpcError(400, 'MEDIA_TOO_MANY')
-      if (media.some((item) => item.kind === 'image') && !this._platform.capabilities.send.images) {
-        throw new RpcError(400, 'PHOTO_SEND_UNAVAILABLE')
-      }
-      if (media.some((item) => item.kind === 'file') && !this._platform.capabilities.send.files) {
-        throw new RpcError(400, 'FILE_SEND_UNAVAILABLE')
-      }
-      if (text && media.length && !this._platform.capabilities.send.mixed) {
-        throw new RpcError(400, 'MIXED_SEND_UNAVAILABLE')
-      }
-      if (stickers.some((item) => item.type === 'native') && !this._platform.capabilities.stickers?.native) {
-        throw new RpcError(400, 'STICKER_SEND_UNAVAILABLE')
-      }
-      if (stickers.some((item) => item.type === 'upload') && !this._platform.capabilities.stickers?.upload) {
-        throw new RpcError(400, 'STICKER_SEND_UNAVAILABLE')
-      }
-    }
+    if (!systemPeer) this._assertSendableMedia(media, stickers, Boolean(text))
     const resolvedContent: IMMessageInput = {
       ...content,
       replyToId,
@@ -3481,9 +4159,9 @@ export class DialogRpc {
     if (!this._store) throw new RpcError(500, 'MESSAGE_STORE_UNAVAILABLE')
     const replyToTopId = replyTopMessageId(replyTo)
     const publishAt = performance.now()
-    const published = await this._publishLocalMessage(
+    const published = await this._withSendEchoes([source], () => this._publishLocalMessage(
       peerId, source, excludeConnection, randomIds, replyToTopId,
-    )
+    ))
     const publishMs = performance.now() - publishAt
     const cleanupAt = performance.now()
     if (systemPeer) {
@@ -3565,17 +4243,11 @@ export class DialogRpc {
     replyToTopId?: number,
   ): Promise<tl.RawUpdates | undefined> {
     if (!this._store || !this._onLocalEvent) return
-    // The target was hydrated and validated before the platform send. Event
-    // ingestion persists it again atomically with the message, so reading the
-    // same conversation back from the database here only adds a serialized
-    // round trip to the send RPC's critical path.
     const conversation = this._conversation(conversationId)
     const published = await this._onLocalEvent(
       this._session,
       { type: 'message', conversation, message },
-      // Every live auth key may observe this update before the RPC result. Carry
-      // random_id on those pushes so the sending client can reconcile its local
-      // item instead of inserting the echoed server message separately.
+      // 实时连接可能在 RPC 返回前先收到推送，推送中也需携带 `random_id` 供发送端对账本地占位消息。
       {
         ...this._localDelivery(excludeConnection, true),
         forceDelivery: true,
@@ -3608,10 +4280,7 @@ export class DialogRpc {
     return {
       ...payload,
       updates,
-      // This payload is returned by the send RPC, not a second sequenced push.
-      // If an unavoidable platform echo reached the client first, reusing its
-      // positive seq makes Telegram Desktop discard the whole RPC result before
-      // it can apply updateMessageID and replace the optimistic local message.
+      // RPC 响应必须置 `seq=0`；若平台回显先到达客户端，复用正数 `seq` 会导致 Telegram Desktop 丢弃整个响应而无法完成 `updateMessageID` 对账。
       seq: 0,
     }
   }
@@ -3679,7 +4348,6 @@ export class DialogRpc {
     return this._pts
   }
 
-  /** Return the durable PTS baseline clients must use for this Telegram channel. */
   private async _channelPts(conversation: import('./platform.js').IMConversation): Promise<number> {
     const target = this._isSubchannel(conversation)
       ? this._conversation(conversation.parentId!)
@@ -3691,26 +4359,12 @@ export class DialogRpc {
     )).pts
   }
 
-  /**
-   * Resolve a dialog preview message to its durable projection, persisting the
-   * message first when the store has never seen it.
-   *
-   * A dialog page is often the first place a client learns about a preview
-   * message. Before this ran, the only remaining source of an id for an
-   * unprojected preview was the process-local counter in `_messageId`, and that
-   * address is not the id the message receives when it is finally ingested: the
-   * client cached one identity while every later request resolved the other, and
-   * the abandoned entry stayed in `_tlToMessage`/`_messageOutgoingByTl` for the
-   * life of the device state. Ingesting here keeps the published preview address
-   * equal to the one `messages.getMessages` and later dialog pages resolve.
-   */
+  /** 将会话预览消息落库并解析为持久化投影，确保 `topMessage` 与后续 `messages.getMessages` 解析出相同的 ID。 */
   private async _projectDialogPreview(
     platformPeerId: string,
     conversation: IMConversation,
     message: IMMessage,
   ): Promise<MaterializedMessage[]> {
-    // Without a store there is no durable id to publish, so the caller keeps
-    // falling back to the process-local address.
     if (!this._store) return []
     const read = async (): Promise<MaterializedMessage[]> => {
       const stored = await this._store!.findProjectedByPlatformId(
@@ -3731,8 +4385,6 @@ export class DialogRpc {
       try {
         await this._store.ingest(this._session, conversation, message)
       } catch (error) {
-        // Keep the dialog list available; the caller falls back to the
-        // process-local address exactly as it did before this helper existed.
         this._onTrace?.(
           'dialog preview ingestion failed conversation=%s message=%s error=%s',
           platformPeerId, message.id, error instanceof Error ? error.message : String(error),
@@ -3780,17 +4432,8 @@ export class DialogRpc {
       projected = await this._projectDialogPreview(platformPeerId, source.conversation, source.lastMessage)
     }
     const top = projected?.[0]
-    // A store-backed dialog page must never anchor a peer to a process-local
-    // id. The client caches `topMessage` as the peer's preview address, and
-    // nothing resolves a counter value there — `messages.getMessages` answers
-    // messageEmpty for it, the next dialog page assigns the message its durable
-    // timestamp-bucketed id instead, and a restart loses it. Publish an empty
-    // preview and let the client load history, exactly as the merged-forward
-    // transcript dialogs do. A storeless process has no durable id space at
-    // all, so its process-local bootstrap id remains the only address it can
-    // offer and still resolves within that process.
-    // Evaluated only when no durable projection supplied `top`, so the common
-    // preloaded-preview path keeps its original cost.
+    // 有存储时绝不可向客户端返回进程内临时分配的 `topMessage`，否则客户端缓存的预览 ID 与后续入库分配的持久化 ID 不一致；
+    // 若尚无持久化投影则返回 0，让客户端自行拉取历史消息。
     const topMessage = top?.tlId ?? (source.lastMessage
       ? this._sourceMessageId(source.lastMessage)
         ?? this._storelessMessageId(platformPeerId, source.lastMessage)
@@ -3881,6 +4524,11 @@ export class DialogRpc {
           await this._data!.syncHistory(peerId, {
             limit: fetchLimit,
             before: anchor ? { id: anchor.source.id, timestamp: anchor.source.timestamp } : undefined,
+            // 客户端第一次打开会话（没有锚点）要的是最新一页。不带 `latest` 时 platform-qqnt 会把
+            // 「首条未读」当成隐式锚点，把未读区灌进库里；库里还没有更新的消息时客户端首屏就会停在
+            // 未读区（中间隔着几千条），而不是最新消息。未读区的预热由客户端跳到未读位置那次
+            // `isAroundUnread()` 请求负责。
+            ...(anchor ? {} : { latest: true }),
           })
         }
       }
@@ -4171,7 +4819,6 @@ export class DialogRpc {
     return { ...page, dialogs: dialogs.filter((dialog) => !this._isSubchannel(dialog.conversation)) }
   }
 
-  /** QQ mask folder placement is transient; durable rows remain fallback state. */
   private _effectiveFolderId(
     conversation: import('./platform.js').IMConversation,
     archivedPeerIds: ReadonlySet<string>,
@@ -4226,8 +4873,7 @@ export class DialogRpc {
     }
   }
 
-  // Desktop discovers Archive through dialogFolder, then requests folder_id=1.
-  // Returning only its children leaves a fresh client unaware of the folder.
+  // 桌面端依赖 `dialogFolder` 发现归档夹并进一步请求 `folder_id=1`。
   private async _archiveFolderDialog(loaded?: readonly IMDialog[], includeEmpty = false) {
     await this._hydrateUsers()
     const archivedPeerIds = await this._dialogFolders?.archivedPeerIds(
@@ -4409,8 +5055,7 @@ export class DialogRpc {
       source,
       chats: [] as tl.TypeChat[],
     }
-    // A join service message names members the conversation may never have
-    // seen. Persist them first so the Telegram projection can reference them.
+    // 入群系统消息涉及的成员可能从未发过言，需先落库分配 Telegram 用户 ID。
     await this._resolveServiceMembers(source)
     const fallback = () => {
       const projectedSource = draft.source as IMMessage
@@ -4425,7 +5070,7 @@ export class DialogRpc {
             return reaction._ === 'reactionCustomEmoji' ? reaction.documentId.toNumber() : undefined
           } : undefined,
         },
-      )
+      ) ?? makeTlMarkdownArticle(projectedSource)
       return {
         message: projectTlMessage({
           platformSessionId: this._session.platformSessionId,
@@ -4508,10 +5153,7 @@ export class DialogRpc {
   ): Promise<void> {
     if (!this._store) return
     const targets = new Map<string, { conversationId: string, key: string, message: IMMessage }>()
-    // QQ reports a reply to a gray-tip sidecar with the sidecar's own id while
-    // the sidecar shares its QQ sequence with the content message it accompanies.
-    // The reply still belongs to that content message, so a target that resolves
-    // to a service notice is re-resolved instead of being trusted.
+    // QQ 回复灰条时 `replyToId` 指向灰条自身，但灰条与正文消息共用 `msgSeq`；命中系统提示时需重解析到对应正文消息。
     const sidecars: Array<{ key: string, message: IMMessage }> = []
     for (const message of messages) {
       if (message.replyToId) {
@@ -4562,12 +5204,7 @@ export class DialogRpc {
     }))
   }
 
-  /**
-   * Remember a resolved projection, optionally pinning the reply key that
-   * referenced it. A gray-tip target resolves to the content message that owns
-   * the same QQ sequence, so the reply key must point at that message even
-   * though the reply named the sidecar.
-   */
+  /** 缓存已解析的消息投影，并将回复键绑定到目标正文消息（含灰条重解析后的目标）。 */
   private _rememberProjection(projected: ProjectedMessage, key?: string): void {
     for (const part of projected.parts) this._rememberMessage({
       source: projected.source,
@@ -4775,9 +5412,7 @@ export class DialogRpc {
           output.push({ _: 'messageEntityBlockquote', offset: base + entity.offset, length: entity.length })
         } else if (entity.type === 'custom-emoji'
           && entity.definition.presentation.type === 'custom' && this._reactions) {
-          // Resolve through the shared identity and keep the legacy
-          // per-conversation id resolvable for clients that cached this
-          // message while the update path still published it.
+          // 统一按全局 key 解析，同时保留旧版按会话分配的 ID 兼容已缓存该消息的客户端。
           const documentId = this._reactions.registerInlineCustomEmoji(
             source.conversationId, entity.definition,
           )
@@ -4856,8 +5491,7 @@ export class DialogRpc {
   }
 
   private _rememberUsername(peerId: string, username: string | undefined): void {
-    // Partial projections such as direct-dialog titles omit usernames. Keep
-    // the last authoritative value instead of erasing the reverse lookup.
+    // 仅含标题的部分投影（如私聊会话项）不带用户名，忽略空值以免清空已有的反向索引。
     if (!username) return
     const previous = this._usernameByPeer.get(peerId)
     if (previous) {
@@ -4941,10 +5575,7 @@ export class DialogRpc {
             this._registerUser(row)
             return toUser(row)
           })
-        // Message ingestion can create a sender row whose only name is the
-        // opaque platform ID. Treat that as a placeholder so a later profile
-        // lookup can still replace it, while complete persisted identities
-        // remain available without a network request.
+        // 消息入库时可能先写入以平台 ID 为名称的占位用户，需继续向平台拉取完整资料替换。
         const stored = local && !isPlaceholderUser(local) ? local : undefined
         const upstream = stored ? undefined : await this._getPlatformUser(peerId)
         const user = stored ?? upstream ?? local ?? { id: peerId, firstName: fallbackName ?? peerId }
@@ -5009,7 +5640,6 @@ export class DialogRpc {
     ]
   }
 
-  /** Members a service notice names, excluding ids already covered elsewhere. */
   private _serviceMemberUsers(
     message: IMMessage<any>,
     exclude: Iterable<string> = [],
@@ -5023,12 +5653,6 @@ export class DialogRpc {
     return [...members.values()]
   }
 
-  /**
-   * Persist every member a service notice names.
-   *
-   * Join notices reference members who may never have sent a message, so the
-   * projection cannot allocate their Telegram ids until a profile row exists.
-   */
   private async _resolveServiceMembers(message: IMMessage<any>): Promise<void> {
     const members = this._serviceMemberUsers(message)
     if (!members.length) return
@@ -5129,9 +5753,7 @@ export class DialogRpc {
     requestedEnd: number,
   ): Promise<void> {
     const cursor = state.nextCursor
-    // QQNT currently emits native member chunks of about 30 even when
-    // Telegram asks for 100-200. Request at least 100 and retain any spill so
-    // a short upstream page cannot make Android treat page one as terminal.
+    // QQNT 每次原生只返回约 30 名成员；每次至少请求 100 条并缓存多出部分，防止单页过短被 Android 误判为最后一页。
     const requestLimit = Math.min(500, Math.max(100, requestedEnd - state.members.length))
     const page = await this._platform.getConversationMembers(
       this._session, { id: conversationId }, { cursor, limit: requestLimit },
@@ -5351,8 +5973,13 @@ export class DialogRpc {
 
   private async _mainDrafts(): Promise<Map<string, StoredDraft>> {
     const drafts = await this._drafts?.list(this._session.platformSessionId) ?? []
-    return new Map(drafts.filter((draft) => draft.topMsgId === 0)
-      .map((draft) => [draft.conversationId, draft]))
+    const servable = drafts
+      .filter((draft) => draft.topMsgId === 0)
+      .map((draft) => ({
+        ...draft,
+        draft: this._servableDraft(draft.draft as tl.RawDraftMessage),
+      }))
+    return new Map(servable.map((draft) => [draft.conversationId, draft]))
   }
 
   private _makeDraftUpdate(stored: {
@@ -5532,11 +6159,7 @@ export class DialogRpc {
   private _peerId(peerId: string): number {
     const existing = this._peerToTl.get(peerId)
     if (existing !== undefined) return existing
-    // Scope synthetic peer IDs to the platform session: two accounts of the
-    // same platform sitting in the same native conversation (e.g. two QQ
-    // logins in one group) must project to two separate Telegram chats.
-    // Without the session prefix both hash to one channel whose message IDs
-    // then interleave along two non-monotonic allocation tracks.
+    // 按 `platformSessionId` 隔离合成 peer ID，避免同平台多账号处于同一群聊时共用同一个频道 ID 导致消息序号交错。
     const id = this._allocate(peerTlSeed(this._session.platformSessionId, peerId), this._tlToPeer)
     this._peerToTl.set(peerId, id)
     this._tlToPeer.set(id, peerId)
@@ -5565,10 +6188,7 @@ export class DialogRpc {
     await this._notificationSettings?.update(
       this._session.platformSessionId, target, req.settings,
     )
-    // Reverse-sync Telegram mute state into the QQ group message mask. Only QQ
-    // groups carry a `qqGroupMsgMask` metadata field; other conversations keep
-    // Telegram-local notification settings. Mask 2 (ASSISTANT) and 3 (SHIELD)
-    // have no Telegram-side equivalent and are never written back here.
+    // 将静音状态反向同步为 QQ 群消息提醒策略（仅写回 `NOTIFY`/`RECEIVE`，不写回 `ASSISTANT`/`SHIELD`）。
     if (target.type === 'peer') {
       await this._syncQqGroupMsgMask(target.peerId, req.settings.muteUntil)
     }
@@ -5580,8 +6200,6 @@ export class DialogRpc {
     if (conversation?.kind !== 'group') return
     if (typeof conversation.metadata?.qqGroupMsgMask !== 'number') return
     if (!this._platform.setConversationNotificationMask) return
-    // Telegram mute → QQ mask: forever/future timestamps map to mask 4 (receive
-    // without notification); 0/undefined (unmute) maps to mask 1 (notify).
     const isMuted = muteUntil !== undefined && muteUntil !== 0
     const mask = isMuted ? QQ_GROUP_MSG_MASK.RECEIVE : QQ_GROUP_MSG_MASK.NOTIFY
     try {
@@ -5671,12 +6289,7 @@ export class DialogRpc {
     return requested.type === 'broadcasts' ? broadcast : conversation.kind !== 'direct' && !broadcast
   }
 
-  /**
-   * Notification settings are muteable for every peer a client knows, not only
-   * for peers with a materialized conversation: Telegram clients mute group
-   * members, message senders and bot contacts that never became dialogs.
-   * Resolve those from the persisted user rows instead of rejecting them.
-   */
+  /** 允许对尚未生成对话的群成员、消息发送者或联系人设置静音，从持久化用户表兜底解析。 */
   private async _resolveNotificationPeer(peer: tl.TypeInputPeer): Promise<string> {
     if (peer._ === 'inputPeerSelf') return this._session.userId
     if (peer._ !== 'inputPeerUser') return this._resolvePeer(peer)
@@ -5692,7 +6305,6 @@ export class DialogRpc {
     return row.platformUserId
   }
 
-  /** Category defaults a peer or topic inherits when it has no full override. */
   private _defaultNotifyTarget(peerId: string): NotificationTarget {
     const conversation = this._conversation(peerId)
     if (conversation.kind === 'direct') return { type: 'users' }
@@ -5713,16 +6325,12 @@ export class DialogRpc {
     const persisted = await this._notificationSettings?.get(
       this._session.platformSessionId, target,
     ) ?? { _: 'peerNotifySettings' as const }
-    // Only peer settings mirror QQ. Topic and category targets remain Telegram-local.
     const policy = target.type === 'peer'
       ? qqGroupMsgMaskPolicy(this._conversations.get(target.peerId))
       : undefined
     const merged = policy ? { ...persisted, muteUntil: policy.muteUntil } : persisted
     if (target.type !== 'peer' || !this._notificationSettings) return merged
-    // Telegram answers with the *effective* settings of a peer. Clients treat
-    // fields that are missing from the answer as unknown: they then re-request
-    // the settings, drop locally cached mute state or defer notifications, so
-    // fill the inherited category defaults before returning the override.
+    // 客户端会将缺省字段视为未知并反复重拉设置，需合并所属分类的默认通知配置后返回。
     const defaults = await this._notificationSettings.get(
       this._session.platformSessionId, this._defaultNotifyTarget(target.peerId),
     )
@@ -5751,23 +6359,11 @@ export class DialogRpc {
     return id
   }
 
-  /**
-   * Process-local bootstrap id for a preview message, only for a process that
-   * has no durable id space. A store-backed process returns `undefined`: the
-   * message receives a timestamp-bucketed id when it is ingested, so a counter
-   * value would anchor the client to an address no later request resolves.
-   */
+  /** 仅在无存储模式下为预览消息分配进程内临时 ID；有存储时返回 `undefined` 以免污染客户端缓存。 */
   private _storelessMessageId(peerId: string, message: IMMessage): number | undefined {
     return this._store ? undefined : this._messageId(peerId, message.id)
   }
 
-  /**
-   * Telegram-native id of a preview message, remembered so a later
-   * `messages.readHistory`/`getMessages` can map the id back.
-   *
-   * Returns `undefined` when the message only carries a platform id, which the
-   * caller answers with an empty preview instead of a process-local value.
-   */
   private _sourceMessageId(message: IMMessage): number | undefined {
     const native = telegramMessageId(message)
     if (native === undefined) return undefined
@@ -5912,12 +6508,10 @@ export class DialogRpc {
     if (!this._store) return
     const scoped = await this._findPeerProjection(displayConversationId, tlMessageId)
     if (scoped) return scoped
-    // Preserve compatibility with partially hydrated parent-channel views;
-    // the caller still validates that this result belongs to the display peer.
+    // 兼容仅部分加载的父频道视图，调用方会二次校验结果是否属于当前展示会话。
     return this._store.findProjectedByTlId(this._session.platformSessionId, tlMessageId)
   }
 
-  /** Finds a TL message id inside one display peer or its topics, never elsewhere. */
   private async _findPeerProjection(
     displayConversationId: string,
     tlMessageId: number,
@@ -5965,11 +6559,7 @@ export function makeAdminRights(
   }
 }
 
-/**
- * Modern Telegram clients require default_banned_rights to decide whether a
- * regular channel member may send. Omitting it is interpreted as no granted
- * bannable actions rather than as an unrestricted default member.
- */
+/** 现代 Telegram 客户端要求携带 `default_banned_rights`，缺省会被视为禁止普通成员执行任何可封禁操作（含发言）。 */
 export function makeDefaultBannedRights(readOnly = false): tl.RawChatBannedRights {
   return {
     _: 'chatBannedRights',
@@ -6044,8 +6634,7 @@ function plainUsernameMentions(text: string): Array<{ offset: number, length: nu
     const length = match[0].length
     const before = text[offset - 1]
     const after = text[offset + length]
-    // Avoid email addresses and partial matches inside a longer Telegram
-    // username. Non-ASCII prose may directly precede an @mention.
+    // 排除邮箱地址与长用户名内部的截断匹配（非 ASCII 字符可直接紧挨 `@`）。
     if (before && /[A-Za-z0-9_@]/.test(before)) continue
     if (after && /[A-Za-z0-9_]/.test(after)) continue
     mentions.push({ offset, length })
@@ -6060,71 +6649,37 @@ function rangesOverlap(
   return left.offset < right.offset + right.length && right.offset < left.offset + left.length
 }
 
-function matchesMessageFilter(item: MaterializedMessage, filter: tl.TypeMessagesFilter): boolean {
-  if (filter._ === 'inputMessagesFilterEmpty') return true
-  const media = item.media
-  const animatedImage = isAnimatedImageMime(media?.mimeType)
-  const video = media?.kind === 'file' && media.mimeType?.startsWith('video/') === true
-  const voice = media?.kind === 'file' && media.voice === true
-  const music = media?.kind === 'file' && !voice && media.mimeType?.startsWith('audio/') === true
-  if (filter._ === 'inputMessagesFilterPhotos') return media?.kind === 'image' && !animatedImage
-  if (filter._ === 'inputMessagesFilterVideo') return video
-  if (filter._ === 'inputMessagesFilterPhotoVideo') {
-    return media?.kind === 'image' && !animatedImage || video
-  }
-  if (filter._ === 'inputMessagesFilterDocument') {
-    return media?.kind === 'file' && !video && !voice && !music && !animatedImage
-  }
-  if (filter._ === 'inputMessagesFilterUrl') return item.ordinal === 0 && messageHasLink(item.source)
-  if (filter._ === 'inputMessagesFilterGif') return Boolean(media && animatedImage)
-  if (filter._ === 'inputMessagesFilterVoice') return voice
-  if (filter._ === 'inputMessagesFilterMusic') return music
-  if (filter._ === 'inputMessagesFilterRoundVoice') return voice
-  return false
+
+
+
+
+function calendarDayStart(timestamp: number): number {
+  const local = timestamp + CALENDAR_UTC_OFFSET_SECONDS
+  return local - (((local % 86_400) + 86_400) % 86_400) - CALENDAR_UTC_OFFSET_SECONDS
 }
 
-function searchMediaKind(filter: tl.TypeMessagesFilter): 'image' | 'file' | undefined {
-  if (filter._ === 'inputMessagesFilterPhotos' || filter._ === 'inputMessagesFilterGif') return 'image'
-  if (
-    filter._ === 'inputMessagesFilterVideo'
-    || filter._ === 'inputMessagesFilterDocument'
-    || filter._ === 'inputMessagesFilterVoice'
-    || filter._ === 'inputMessagesFilterMusic'
-    || filter._ === 'inputMessagesFilterRoundVoice'
-    || filter._ === 'inputMessagesFilterRoundVideo'
-  ) return 'file'
-  return undefined
+/** 日历从 `offsetId` 之前（或 `offsetDate` 之前）的第一条开始。 */
+function calendarStartIndex(
+  index: readonly SearchPartIndexEntry[],
+  offsetId: number,
+  offsetDate: number,
+): number {
+  if (offsetId <= 0 && offsetDate <= 0) return 0
+  const found = index.findIndex((entry) =>
+    (offsetId <= 0 || entry.tlMessageId < offsetId) && (offsetDate <= 0 || entry.timestamp < offsetDate))
+  return found < 0 ? index.length : found
 }
 
-function supportsSharedMediaFilter(filter: tl.TypeMessagesFilter): boolean {
-  return filter._ === 'inputMessagesFilterPhotos'
-    || filter._ === 'inputMessagesFilterVideo'
-    || filter._ === 'inputMessagesFilterPhotoVideo'
-    || filter._ === 'inputMessagesFilterDocument'
-    || filter._ === 'inputMessagesFilterUrl'
-    || filter._ === 'inputMessagesFilterGif'
-    || filter._ === 'inputMessagesFilterVoice'
-    || filter._ === 'inputMessagesFilterMusic'
-    || filter._ === 'inputMessagesFilterRoundVoice'
+function isMissedCall(message: IMMessage): boolean {
+  const action = message.content.serviceAction
+  return action?.type === 'phone-call' && !action.duration && message.outgoing !== true
 }
 
-function messageHasLink(message: IMMessage): boolean {
-  return message.content.parts.some((part) => {
-    if (part.type === 'card') return Boolean(cardUrl(part.card))
-    if (part.type !== 'text') return false
-    if (part.entities?.some((entity) =>
-      entity.type === 'text-link' || entity.type === 'conversation-link')) return true
-    return Boolean(withAutoLinkEntities(part.text)?.some((entity) =>
-      entity._ === 'messageEntityUrl' || entity._ === 'messageEntityTextUrl'))
-  })
-}
-
-/** Seed for a synthetic Telegram peer/user ID, scoped to one platform session. */
 export function peerTlSeed(platformSessionId: string, platformPeerId: string): string {
   return `peer:${platformSessionId}:${platformPeerId}`
 }
 
-/** Stable positive signed-int ID used for synthetic Telegram entities. */
+/** 生成 `[1, 0x7fffffff - 1]` 范围内的稳定正有符号 32 位整型 ID（FNV-1a）。 */
 export function stableId(value: string): number {
   let hash = 0x811c9dc5
   for (let i = 0; i < value.length; i++) {
@@ -6134,7 +6689,6 @@ export function stableId(value: string): number {
   return (hash >>> 0) % 0x7ffffffe + 1
 }
 
-/** Builds a self-contained Telegram preview without asking Telegram to scrape QQ URLs. */
 export function makeTlCardPreview(
   card: import('./platform.js').IMMessageCard,
   dcId = 1,
@@ -6144,8 +6698,6 @@ export function makeTlCardPreview(
   try {
     displayUrl = new URL(url).hostname || displayUrl
   } catch {
-    // The fallback above is always valid; keep a useful display label if a
-    // future adapter supplies a non-standard URL.
   }
   return {
     _: 'messageMediaWebPage', manual: true, safe: true,
@@ -6181,7 +6733,6 @@ export function projectTlMessage(options: {
   topicId?: number
   mentioned?: boolean
   unreadMention?: boolean
-  /** Maps a platform user id to its Telegram id for service notices. */
   userId?: (platformUserId: string) => number | undefined
 }): tl.TypeMessage {
   const {
@@ -6237,13 +6788,7 @@ export function projectTlMessage(options: {
   } as tl.RawMessage
 }
 
-/**
- * Telegram action a platform service notice maps to.
- *
- * A join notice becomes Telegram's own join service message so clients link the
- * joined member; anything the notice cannot name keeps platform's wording as a
- * custom action instead of losing the notice.
- */
+/** 将入群系统通知映射为原生入群 Action 以支持点击成员跳转；若无法解析全部成员 ID 则回退为自定义文本提示。 */
 function makeTlServiceAction(
   service: IMMessageServiceAction,
   messageId: string,
@@ -6299,13 +6844,6 @@ function uniqueProjectedMessages(messages: ProjectedMessage[]): ProjectedMessage
   return [...new Map(messages.map((message) => [message.source.id, message])).values()]
 }
 
-/**
- * The `userFull.bot_info` payload for a bot peer.
- *
- * Telegram always reports a description slot for bots (empty when the bot has
- * none) and omits `user_id` unless the bot is managed by another user; the
- * bridge only ever has a description to report.
- */
 function makeBotInfo(description: string | undefined): tl.RawBotInfo {
   return {
     _: 'botInfo',
@@ -6361,6 +6899,14 @@ function withReplyToTopId(update: tl.TypeUpdate, replyToTopId: number | undefine
   }
 }
 
+function mediaBlockId(block: tl.TypePageBlock): string | undefined {
+  if (block._ === 'pageBlockPhoto') return block.photoId.toString()
+  if (block._ === 'pageBlockVideo') return block.videoId.toString()
+  if (block._ === 'pageBlockAudio') return block.audioId.toString()
+  if (block._ === 'pageBlockDocument') return block.documentId.toString()
+  return undefined
+}
+
 function hasDraftContent(request: tl.messages.RawSaveDraftRequest): boolean {
   if (request.message.length || request.media || request.suggestedPost || request.richMessage) return true
   if (request.effect && !request.effect.isZero()) return true
@@ -6397,10 +6943,7 @@ function selectHistoryWindow(
   const maxId = request.maxId ?? 0
   const minId = request.minId ?? 0
   const filtered = all.filter((item) => {
-    // A negative add_offset asks for a window which starts before (newer
-    // than) offset_id. Keep both sides of the anchor until the window has
-    // been selected below; filtering here used to make every unread-window
-    // request empty.
+    // `add_offset < 0` 表示从 `offset_id` 往更新方向取窗口，需保留锚点两侧消息供下方切片。
     if (addOffset >= 0 && offsetId > 0 && item.tlId >= offsetId) return false
     if (offsetDate > 0 && item.source.timestamp >= offsetDate) return false
     if (maxId > 0 && item.tlId >= maxId) return false
@@ -6462,6 +7005,25 @@ export interface TlArticleProjectionOptions {
   userId?: (platformUserId: string) => number
   customEmojiId?: (definition: IMReactionDefinition) => number | undefined
   conversationLink?: (conversation: IMConversation) => string | undefined
+}
+
+/**
+ * A platform message whose body is markdown as a Telegram rich message.
+ *
+ * Telegram draws a table only as a page block, so a body that contains one has
+ * no styled-text form. Sending the whole body as a rich message also lets one
+ * renderer draw quotes, lists, headings and inline markup together, which is
+ * what a platform whose body arrived as markdown already had.
+ *
+ * This is the only projection for such a body: clients are expected to know
+ * rich messages (layer 227 and later, TDLib 1.8.64 and later), and the relay
+ * does not probe versions. `markdownRichMessage` swallowing a conversion
+ * failure is the one fallback left — the message then goes out as its styled
+ * text rather than not at all.
+ */
+export function makeTlMarkdownArticle(source: IMProjectableMessage): tl.RawRichMessage | undefined {
+  const markdown = source.content.richMarkdown
+  return markdown ? markdownRichMessage(markdown) : undefined
 }
 
 export function makeTlArticleMedia(
@@ -6554,10 +7116,7 @@ function makeTlRichText(
 
 function makeTlPhoto(media: IMMediaRow, timestamp: number, dcId = 1): tl.RawPhoto {
   const id = Long.fromNumber(media.id)
-  // Real Telegram media always carries a non-zero access hash. The bridge
-  // resolves downloads from its durable media row, so this synthetic hash is
-  // only for clients (notably Desktop) that disable the download action when
-  // access_hash is zero.
+  // 桌面端在 `access_hash` 为 0 时会禁用下载操作，需填充非零值。
   const accessHash = Long.fromNumber(media.id)
   const fileReference = new TextEncoder().encode(`bridge-media:${media.id}`)
   const dimensions = media.width && media.height
@@ -6565,12 +7124,7 @@ function makeTlPhoto(media: IMMediaRow, timestamp: number, dcId = 1): tl.RawPhot
     : media.preview
       ? { width: media.preview.width, height: media.preview.height }
       : { width: 1, height: 1 }
-  // QQ exposes a 720-spec URL even when a small image is already below the
-  // preview bound. In that case the "preview" and original have identical
-  // dimensions. Advertising both makes Telegram's send reconciliation match
-  // the local full-size cache entry to the preview tier first, so the final
-  // photo has to be inserted and downloaded again. Keep native previews only
-  // when they are a genuinely distinct rendition.
+  // 小图小于 720p 时 QQ 预览图与原图尺寸相同；仅在尺寸不同时下发预览规格，避免客户端对账时把本地原图缓存误匹配到预览档位导致重新下载。
   const nativePreviewSize = projectedPhotoPreviewSize(media)
   const nativePreview = nativePreviewSize === undefined ? undefined : media.preview!
   const preview = nativePreview
@@ -6598,9 +7152,7 @@ export function makeTlMessageMedia(media: IMMediaRow, timestamp: number, dcId = 
   }
   const id = Long.fromNumber(media.id)
   const accessHash = Long.fromNumber(media.id)
-  // QQ voice notes have no client-reachable direct URL. Give them a distinct
-  // reference so patched clients skip crossgram.getFileUrl and immediately
-  // use the reliable upload.getFile relay path.
+  // QQ 语音无客户端可直连的 URL，使用专用前缀让打补丁客户端跳过 `crossgram.getFileUrl` 直接走 `upload.getFile`。
   const fileReference = new TextEncoder().encode(
     `${media.voice ? 'bridge-voice-media' : 'bridge-media'}:${media.id}`,
   )
@@ -6649,7 +7201,6 @@ export function makeTlMessageMedia(media: IMMediaRow, timestamp: number, dcId = 
   }
 }
 
-/** Project adapter media without persisting an IM message/media row. */
 export function makeTlTransientMessageMedia(
   media: IMMedia,
   id: number,
@@ -6695,12 +7246,7 @@ function shouldServeMediaPreview(
   return isDownloadablePreview(media.preview)
 }
 
-/**
- * QQ's native 720-tier image is remotely downloadable even when QQNT reports
- * thumbFileSize=0. Telegram refuses a zero-byte PhotoSize, so use the original
- * byte count as a conservative upper bound until the preview stream reaches
- * EOF. File loaders already accept an early short/empty chunk as completion.
- */
+/** QQNT 报告 `thumbFileSize=0` 时 720p 预览仍可下载；回退使用原图大小作为上限，避免 Telegram 拒绝 0 字节 `PhotoSize`。 */
 function projectedPhotoPreviewSize<T extends {
   size?: number | null
   preview?: { size: number, width: number, height: number } | null
@@ -6748,7 +7294,6 @@ function decodeFileReference(bytes: Uint8Array): string | undefined {
   }
 }
 
-/** Serialize the feature payload the patched clients parse. */
 function featuresJSON(features: CrossgramFeatures): tl.RawDataJSON {
   return { _: 'dataJSON', data: JSON.stringify(features) }
 }
@@ -6839,7 +7384,7 @@ const TELEGRAM_DISPLAY_PHOTO_SIDE = 1280
 const TELEGRAM_HIGH_QUALITY_PHOTO_SIDE = 2560
 const TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024
 
-/** Preserve very large originals as documents instead of pretending they are Telegram photos. */
+/** 超过 10 MiB 的静态图片按文件（`document`）下发。 */
 function requiresImageDocument(media: Pick<IMMediaRow, 'kind' | 'mimeType' | 'size'>): boolean {
   return media.kind === 'image' && !isAnimatedImageMime(media.mimeType)
     && Number.isSafeInteger(media.size) && media.size! > TELEGRAM_PHOTO_MAX_BYTES
@@ -6874,10 +7419,7 @@ function originalPhotoSizes(
   }
 
   const scale = TELEGRAM_DISPLAY_PHOTO_SIDE / maxSide
-  // Android chooses the largest photo size whose side is at most 1280. With
-  // only a stripped thumbnail plus an oversized original it keeps the 50px
-  // stripped image forever. Advertise a display-sized alias backed by the
-  // same original bytes, then retain the true dimensions as the `w` size.
+  // Android 选取边长不超过 1280 的最大规格展示；若仅有微缩图与超尺寸原图会一直停留在模糊微缩图，需额外提供指向同一原图字节的 `y` 档位。
   return [
     {
       _: 'photoSize', type: 'y',
@@ -6921,7 +7463,6 @@ function qqSequenceKey(conversationId: string, sequence: number): string {
   return `${conversationId}\u0000qq-sequence:${sequence}`
 }
 
-/** Telegram ids the published deletion update removed, so the RPC can report them. */
 function publishedDeletedTlMessageIds(payload: PlatformEventPublishResult): number[] {
   if (!payload || (payload._ !== 'updates' && payload._ !== 'updatesCombined')) return []
   return payload.updates.flatMap((update) => update._ === 'updateDeleteMessages'

@@ -1,36 +1,10 @@
-# IMPlatform 适配器实现规范
+# IMPlatform 适配器规范
 
-本文描述 `@mtproto-relay/bridge` 的平台适配契约。QQ、微信、Telegram、Discord 等实现都应只处理平台 API；消息缓存、Telegram 数字 ID、媒体分组和 MTProto 对象由 bridge 负责。
+本文定义 `@mtproto-relay/bridge` 的平台适配器接口契约。平台适配器只负责对接具体 IM 协议；消息入库、Telegram ID 分配、媒体分片与 MTProto TL 对象构造均由 Bridge 处理。
 
 ## 1. 注册与生命周期
 
-bridge 通过 `ctx.imPlatform` 暴露 Cordis registry service。平台实现本身也是 Cordis 插件，registry key 直接使用配置项的 `id`；`IMPlatform` 不再维护第二个 ID。
-
-静态参考平台的单实例配置：
-
-```yaml
-- id: bridge01
-  name: '@mtproto-relay/bridge'
-- id: static
-  name: '@mtproto-relay/platform-static'
-```
-
-同一个平台包可以加载多次，每个 Cordis entry 是完全独立的 adapter 实例：
-
-```yaml
-- id: static-primary
-  name: '@mtproto-relay/platform-static'
-  config:
-    transferChunkSize: 65536
-- id: static-secondary
-  name: '@mtproto-relay/platform-static'
-  config:
-    transferChunkSize: 262144
-```
-
-此处的 `static-primary` / `static-secondary` 就是写入 `PlatformSession.platformId`、HTTP 路径和数据库绑定的唯一平台 ID。不要在 adapter 配置中再定义 ID。
-
-自定义平台包的入口保持同样结构：
+Bridge 通过 `ctx.imPlatform` 提供适配器注册表，每个 Cordis 配置项的 `id` 即为该平台账号的唯一 `platformId`：
 
 ```ts
 import type { Context } from 'cordis'
@@ -44,486 +18,109 @@ export function apply(ctx: Context, config: Config) {
 }
 ```
 
-bridge 不注册默认 adapter。平台插件注册后，bridge 会调用 `getAccount()` 获取当前平台用户，自动创建或刷新该 Cordis entry 唯一的 active session，并为它分配稳定虚拟手机号；同一 session 的多个 MTProto 连接不会重复订阅。平台插件卸载时只停止该平台的订阅，其他实例不受影响。
+同一个适配器包可在 `app.yml` 中挂载多次，每个条目对应一个独立的平台账号和虚拟手机号：
 
-`subscribe()` handler 返回的 Promise 有背压语义。adapter 应等待它结束再确认/提交自己的消费游标，否则进程在入库前退出可能丢消息。
-
-### 1.1 当前平台账号
-
-账号资料必须由 adapter 自己提供，bridge 不接受外部注册请求，也不会生成用户 ID、姓名或头像：
-
-```ts
-interface IMPlatformAccount<L> {
-  user: IMUser<L> // id / firstName / lastName / username / avatar
-  credentials?: JsonValue
-}
-
-interface IMPlatform<L> {
-  getAccount(): Promise<IMPlatformAccount<L>>
-  // ...
-}
+```yaml
+- id: qq-primary
+  name: '@mtproto-relay/platform-qqnt'
+- id: qq-secondary
+  name: '@mtproto-relay/platform-qqnt'
 ```
 
-同一个 Cordis platform entry 对应一个账号和一个虚拟手机号。bridge 在 `/platform-accounts` 页面展示平台资料、手机号和每 30 秒轮换的六位 TOTP 登录码。`user.avatar` 继续使用 adapter 的 typed `IMMedia<L>`，页面头像由 bridge 调用 `downloadMedia()` 读取；TOTP secret 和 credentials 不会下发到浏览器。
+适配器注册后，Bridge 调用 `getAccount()` 获取当前登录用户资料，创建或更新持久化会话，并调用 `subscribe()` 监听实时事件。`subscribe()` 回调返回的 Promise 具有背压语义：适配器必须等待该 Promise 完成后再推进上游游标，防止进程退出导致消息丢失。
 
 ## 2. ID 与幂等
 
-- user、conversation、message、media 和 group ID 都是 opaque string。
-- 不得把 ID 转成 `number`、`bigint`、hash 或固定长度数据库字段。
-- adapter 提供的 opaque user ID 会原样保存为 `mtproto_im_user.platformUserId`；bridge 以
-  `(platformId, platformUserId)` 唯一确定用户，并使用该表的自增主键 `id` 作为 Telegram
-  `user_id`。因此同一 platform 下跨 session 的同一用户会得到同一个 Telegram ID，进程
-  重启后也不会变化。
-- 用户姓名、username、头像 locator 和 metadata 都保存在 `mtproto_im_user`；消息通过
-  `mtproto_im_message.senderUserId` 关联该用户行，不在消息 metadata 中复制用户资料。
-- `IMMessage.id` 表示逻辑消息 ID；`sourceIds` 保存被该逻辑消息覆盖的所有平台物理消息 ID。
-- bridge 按 `(platformSessionId, conversationId, sourceId)` 幂等入库。
-- 外部 ID 到 Telegram message ID 的映射持久化在数据库，重连和重启后保持不变。
+- 用户、会话、消息、媒体与消息组 ID 均为不透明字符串（opaque string），禁止强转为数字或定长哈希。
+- 用户按 `(platformId, platformUserId)` 唯一标识，数据库自增主键即为其 Telegram `user_id`。
+- `IMMessage.id` 为逻辑消息 ID，`sourceIds` 包含该逻辑消息对应的全部平台物理消息 ID（例如多图合并为一条逻辑消息时）。
+- Bridge 按 `(platformSessionId, conversationId, sourceId)` 幂等入库。
 
-Telegram album 示例：三条具有同一 `grouped_id` 的 Telegram message 应由 TG adapter 聚合成一个 `IMMessage`，三个原始 message ID 放进 `sourceIds`，三个媒体按原顺序放进 `content.parts`。
-
-## 3. Conversation
+## 3. 会话与成员
 
 ```ts
-interface IMConversation {
+interface IMConversation<L = unknown> {
   id: string
   kind: 'direct' | 'group' | 'channel'
   title: string
   parentId?: string
   spaceId?: string
-  avatar?: IMMedia<PlatformMediaLocator>
+  avatar?: IMMedia<L>
+  selfRole?: 'owner' | 'administrator' | 'member' | 'guest'
+  selfPermissions?: IMConversationPermissions
   metadata?: JsonObject
 }
 ```
 
-- QQ/微信群使用 `group`。
-- Discord guild/workspace ID 放入 `spaceId`。
-- Discord category、parent channel 或 thread owner 放入 `parentId`。
-- Discord channel/thread 使用 `channel`。当 `parentId` 指向同一 session 中另一个 channel 时，父 channel 映射为 Telegram forum，子 channel 映射为 `ForumTopic`；其他层级（例如 category ID）继续作为 opaque parent 信息保存。
-- `metadata.broadcast: true` 会生成 Telegram broadcast channel；其他 channel 生成 megagroup。
+- QQ/微信群使用 `group`（Bridge 统一投影为 Telegram Megagroup）。
+- Discord 服务器放入 `spaceId`，频道/子线程使用 `channel`，父频道或分类放入 `parentId`（当 `parentId` 指向同一会话下的另一个 `channel` 时，自动投影为 Forum Topic）。
+- 实时消息事件必须携带完整的 `IMConversation` 对象，以便在未拉取会话列表时直接入库。
+- 成员列表通过 `getConversationMembers()` 按游标分页，角色分为 `owner | administrator | member | guest`，具体权限通过 `IMConversationPermissions` 显式声明。
 
-消息事件必须携带完整 conversation，不能只给 conversation ID。这样 push-only 平台首次收到群消息时也能独立完成入库。
+## 4. 消息与媒体
 
-### 3.1 成员、管理员与权限
+### 4.1 媒体定位器（Locator）
 
-`getConversationMembers()` 使用 cursor 分页返回 `IMConversationMember`；`getConversationMember()` 用于单成员查询。角色只有 `owner / administrator / member / guest`，具体操作权限放在 `IMConversationPermissions`，不要通过角色名推断：
+`IMMedia<L>` 的 `locator` 是适配器自定义的强类型凭据，Bridge 仅在落库时将其序列化为 JSON，并在调用 `downloadMedia(session, media, options)` 时原样传回。
 
-```ts
-interface IMConversationMember<L> {
-  user: IMUser<L>
-  role: 'owner' | 'administrator' | 'member' | 'guest'
-  permissions: {
-    manageConversation: boolean
-    manageMembers: boolean
-    deleteAnyMessage: boolean
-    editAnyMessage: boolean
-    pinMessages: boolean
-    inviteMembers: boolean
-    manageAdministrators?: boolean
-  }
-  joinedAt?: number
-  title?: string
-}
-```
+图片可附带 `strippedThumbnail: Uint8Array`（Telegram `photoStrippedSize` 格式），Bridge 会将其直接内联进消息，无需客户端额外请求缩略图。
 
-`members.administrators` 表示平台能区分管理员，`members.permissions` 表示权限字段来自平台真实数据，`members.updateRoles` 表示 adapter 已实现 `setConversationMemberRole()`，能原生升降管理员。`manageMembers` 与 `manageAdministrators` 必须分开：前者用于踢人/封禁等成员管理，后者才会投影为 Telegram `add_admins`。
+### 4.2 发送与服务消息
 
-群会话应在能取得真实数据时填写 `conversation.selfRole` 与 `conversation.selfPermissions`。bridge 只在 `selfRole === 'owner'` 时设置 Telegram `creator`，只为 owner/administrator 投影 `admin_rights`；不能获取当前用户角色时不得伪造群主或管理员权限。
+`sendMessage(session, conversation, input, options)` 接收有序的 `parts`（支持文字、图片、文件、贴纸混排），返回带平台最终消息 ID 的 `IMMessage`。若平台消息正文原生为 Markdown（如 QQ 官方机器人），适配器除了提供渲染后的 `parts`，还可在 `content.richMarkdown` 中附上原始 Markdown，由 Bridge 转换为 Telegram 富文本（Article）消息块以支持表格、列表与多级标题。
 
-bridge 会把所有平台 `group` 投影为 Telegram megagroup，不使用 basic chat。客户端通过
-`channels.getParticipants(offset, limit)` 按需获取成员；bridge 负责把 Telegram offset
-映射到平台的 opaque cursor。
+系统提示使用 `content.serviceAction`：
+- `{ type: 'custom', text }`：通用灰条提示。
+- `{ type: 'phone-call' }`：通话记录提示。
+- `{ type: 'members-joined', text, members, actor?, viaInviteLink? }`：结构化入群通知，投影为可点击成员姓名的原生入群消息。
 
-## 4. 消息内容
+> **QQ 灰条特例**：QQ 灰条与伴随的普通消息共用同一个 `msgSeq`。Bridge 会将指向灰条的回复重定向到同序号的正文消息，且删除灰条时仅在本地隐藏，绝不向 QQ 发起撤回请求（避免误撤回同序号的正文消息）。
 
-`IMMedia` 的 locator 是 adapter 自己声明的泛型，不是 `JsonValue`。用户头像和群头像也使用同一套 `IMMedia<L>` / `downloadMedia()`：
+## 5. 历史分页与已读同步
 
-```ts
-interface QQMediaLocator {
-  fileId: string
-  downloadToken: string
-}
+- `getDialogs()` 与 `getHistory()` 每次调用只返回一页数据，严禁在单次调用内自动循环拉取后续游标。
+- 若平台支持标记已读，声明 `capabilities.readState.markRead = true` 并实现 `markRead()`；若支持其他端已读同步推送，声明 `capabilities.readState.events = true` 并推送 `{ type: 'read', conversationId, upToMessageId }`。
 
-class QQPlatform implements IMPlatform<QQMediaLocator> {
-  async *downloadMedia(session, media: IMMedia<QQMediaLocator>) {
-    // media.locator?.downloadToken 在此处保持静态类型。
-  }
-}
-```
-
-图片可以携带 adapter 已提取的 `preview: { mimeType, size, width, height, locator }`，供 bridge
-缓存和非图片文档预览复用。普通图片只投影最小的内联 `photoStrippedSize(type='i')` 和完整图片
-`photoSize(type='x')`，不再暴露中间档 `type='m'`。兼容旧消息缓存的 `thumb_size=m` 请求也会
-返回完整图片，避免客户端把可下载 preview 当成最终图片。
-adapter 还可以提供 `strippedThumbnail: Uint8Array`。它必须是 Telegram stripped JPEG 格式
-（版本字节、单字节高宽、quality-20 baseline JPEG scan data）；bridge 会将其作为
-`photoStrippedSize(type='i')` 直接内联在消息中并持久化，客户端显示占位图时不需要下载文件。
-
-消息、用户、会话和事件沿用同一个 locator 泛型。只有 bridge 的数据库持久化边界会把 locator 显式序列化；平台实现中不得用 `JsonValue` 或无类型字段代替 locator 模板。
-
-发送统一使用一个接口：
-
-```ts
-sendMessage(session, conversation, {
-  parts: [
-    { type: 'text', text: 'caption' },
-    { type: 'media', media: image },
-    { type: 'media', media: file },
-  ],
-}, options)
-```
-
-`parts` 有序，允许纯文字、单图、图文、多图和文件混合。adapter 返回的 `IMMessage` 必须包含平台最终确认的 message/media ID，不应复用客户端临时 ID。
-
-平台系统提示使用 `content.serviceAction`，不得伪装成普通 text part。通用表达为
-`{ type: 'custom', text }`，bridge 将其投影为 Telegram `messageService` / `messageActionCustomAction`，
-因此历史和实时 update 都由客户端按灰字系统消息渲染。系统消息的 `parts` 可以为空。
-`{ type: 'phone-call' }` 投影为 `messageActionPhoneCall`。
-
-平台能点名成员的入群提示应改用结构化表达，让 Telegram 客户端渲染原生入群服务消息
-（成员名字可点击、可打开资料）：
-
-```ts
-{
-  type: 'members-joined'
-  text: string        // 平台原文，无法投影原生动作时回退成 custom
-  members: Array<{ id: string, name?: string }>   // 入群成员
-  actor?: { id: string, name?: string }           // 邀请/拉人者，平台未点名时省略
-  viaInviteLink?: boolean                         // 通过分享的二维码或邀请链接入群
-}
-```
-
-bridge 把 `members-joined` 投影为 `messageActionChatAddUser`（`viaInviteLink` 时为
-`messageActionChatJoinedByLink`），并保证 `members`/`actor` 里的用户在这一条 update 与历史
-响应中都能被客户端解析；成员资料缺失时按 `name` 建一条占位用户，连 `name` 都没有才退回
-`custom` 文案。
-
-QQ 的灰条是它伴随的那条消息的 sidecar：QQ 会给灰条分配同一条 `msgSeq`，并把对灰条的回复和
-撤回都按该序号解析到那条内容消息。因此 bridge 需要把落在灰条上的回复目标改指到同序号的内容
-消息（`MessageStore.preferContentReplyTarget`），并且绝不能把灰条的删除转发给平台——QQ 会把
-它当成对同序号内容消息的撤回。灰条只在本 relay 内删除。
-
-一条逻辑消息有多个媒体时，bridge 为每个媒体生成一条连续 Telegram message，共享持久化 `groupedId`；第一条携带文本 caption，其余文本为空。
-
-## 5. History 分页
-
-`getDialogs()` 和 `getHistory()` 都只返回一页。禁止 adapter 在一次调用中自行遍历全部 cursor。
-
-```ts
-interface IMHistoryQuery {
-  cursor?: string
-  limit?: number
-  before?: { id: string, timestamp: number }
-  after?: { id: string, timestamp: number }
-}
-```
-
-bridge 会把 Telegram `offsetId/offsetDate/limit` 解析成平台 anchor，并只请求当前窗口。平台返回的 `nextCursor` 只描述下一页，不表示 bridge 会在当前 RPC 中继续读取。
-
-返回顺序可以是平台原生顺序；bridge 会在当前页内按 timestamp 归一化。history 回填 ID 从中间水位向下分配，subscribe/send 的 live ID 向上分配，因此读取更老页面不会修改已暴露的 ID。
-
-如果未实现 `getHistory`，`capabilities.history` 必须是 `false`。此时 Telegram history 完全读取 subscribe 已落库的数据。如果实现了 history，bridge 先拉当前平台页、幂等入库，再从数据库返回。
-
-### 5.1 已读边界
-
-平台用 opaque message ID 表达当前账号的 incoming read boundary：
-
-```ts
-interface IMReadTarget {
-  conversationId: string
-  messageId: string
-}
-
-interface IMPlatform {
-  markRead?(session: PlatformSession, target: IMReadTarget): Promise<void>
-}
-```
-
-实现下行已读时声明 `capabilities.readState.markRead = true`；bridge 会把
-`messages.readHistory` / `channels.readHistory` 的 Telegram `max_id` 反查成逻辑平台消息，
-再调用 `markRead()`。反查不到、目标不属于该 conversation 或平台没有声明能力时不会猜测边界。
-
-当平台上的另一个客户端推进已读位置时，adapter 发送
-`{ type: 'read', conversationId, upToMessageId }`，并声明
-`capabilities.readState.events = true`。bridge 会持久化新的未读计数并投影为
-`updateReadHistoryInbox` 或 `updateReadChannelInbox`。`upToMessageId` 必须是已经通过 history、
-dialog preview 或 message event 暴露过的逻辑 ID；未知 ID 的事件会被安全忽略。
-
-## 6. Subscribe 事件
+## 6. 实时事件与消息操作
 
 ```ts
 type IMEvent =
   | { type: 'message', conversation: IMConversation, message: IMMessage }
-  | {
-      type: 'message-edit'
-      eventId: string
-      conversation: IMConversation
-      message: IMMessage
-    }
-  | {
-      type: 'message-delete'
-      eventId: string
-      conversation: IMConversation
-      messageIds: string[]
-      timestamp: number
-    }
+  | { type: 'message-edit', eventId: string, conversation: IMConversation, message: IMMessage }
+  | { type: 'message-delete', eventId: string, conversation: IMConversation, messageIds: string[], timestamp: number }
+  | { type: 'message-reactions', eventId: string, conversation: IMConversation, target: IMReactionTarget, context: IMReactionContext, timestamp: number }
   | { type: 'conversation', conversation: IMConversation }
   | { type: 'read', conversationId: string, upToMessageId: string }
 ```
 
-`message-edit` 必须携带编辑后的完整 `IMMessage`，并保持原 message ID；`message-delete.messageIds` 可以使用主 ID 或任意 `sourceIds` alias。mutation 的 `eventId` 是平台侧 opaque 操作 ID，同一 edit/delete 重投时必须保持不变。
+- 撤回采用 Tombstone 机制：消息从会话与历史中隐藏（或按配置标记为已撤回），但平台 ID 与 Telegram ID 映射永久保留。
+- `capabilities.messageActions` 声明撤回、编辑（`native | delete-and-resend | unsupported`）与转发能力。
+- 支持「戳一戳」的平台声明 `capabilities.poke = { maxCount }` 并实现 `sendPoke()`。
 
-message、mutation 和 read 事件先事务入库并生成/复用投影，再通过进程内有界 delivery journal 保留 `pts/seq`，最后只向绑定该 platform session 的 auth key 推送 `updateNew*`、`updateEdit*`、`updateDelete*` 或 `updateRead*`。`pts/seq` 状态仍持久化；进程重启会丢失增量 journal，客户端下次同步时收到 `updates.differenceTooLong` 并走全量同步。发送失败时平台重投会复用原 `pts/seq`；已成功发布的事件不会重复推送。
+## 7. 媒体上传与下载
 
-撤回采用 tombstone：消息不会再出现在 dialogs/history/getMessages，但外部 ID、alias 和 Telegram message ID 映射继续保留，确保撤回 update、重试和重启后的 ID 都稳定。
+### 7.1 预检秒传与流式直传
 
-### 6.1 下游主动 mutation
+支持 `crossgram.prepareMediaUpload` 的客户端在上传分片前会先提交文件哈希（MD5、SHA-1、前 10 MiB MD5 及分块 SHA-1 状态）。适配器实现 `prepareMediaUpload()`：
 
-`capabilities.messageActions` 同时声明策略和语义：
+- **秒传命中**：返回不含 `sink` 的结果，客户端跳过所有 `upload.saveFilePart` 分片上传。
+- **流式直传**：返回带 `sink` 的上传计划，Bridge 在内存中重排乱序分片（上限 32 个分片 / 16 MiB）并直接按序写入 `sink`（如 QQ Highway 1 MiB 分块直传），全程不落盘临时文件。
+- **回退模式**：未预检的客户端上传分片暂存至磁盘，发送时通过 `media.source.stream()` 边读边传。
 
-- `delete.own / delete.others` 分别声明是否支持撤回自己的消息和管理员撤回他人消息；`maxAgeSeconds` 省略表示不限时间。
-- `edit.mode` 为 `native / delete-and-resend / unsupported`。`delete-and-resend` 由 bridge 严格按“成功撤回旧消息后再发送新消息”执行；撤回失败时不会发送。
-- `forward.mode` 为 `native / copy / unsupported`，`preservesAuthor` 明确平台是否保留原作者署名。
+### 7.2 按需下载与直链
 
-原子方法为 `deleteMessages()`、`editMessage()` 和 `forwardMessages()`。目标 ID 使用 `sourceIds` 中对应的物理 ID；adapter 不解析 Telegram 数字 ID。原生编辑必须保持平台逻辑 message ID；撤回重发会向 Telegram 客户端发布 delete + new update，而不是伪造保持 ID 的 edit。
+适配器必须实现 `downloadMedia(session, media, { offset, limit, signal })` 支持字节区间读取。若平台支持客户端直连 CDN，可额外实现 `resolveDirectDownload()` 返回带过期时间的 HTTP(S) URL。
 
-adapter 可以提供 at-least-once 事件；不要求自己实现 exactly-once。事件 handler 抛错时不得静默推进不可恢复的远端 cursor。
+## 8. 贴纸与表情回应
 
-## 7. 流式媒体与进度
+### 8.1 Sticker Provider（`ctx.imSticker`）
 
-支持 `crossgram.prepareMediaUpload` 的客户端会在分片上传前提交目标会话、文件名、大小、媒体类型、MD5、SHA-1 和前 10 MiB MD5。adapter 的 `prepareMediaUpload()` 返回：
+贴纸目录独立于 `IMPlatform`，通过 `ctx.imSticker.register(provider, id)` 注册：
+- 提供 `listPacks()`、`getPack()`、`getSticker()`、`openAsset()` 与可选的 `prepareSend()`。
+- QQ 收藏表情作为独立的 `qq-favorites` 贴纸包暴露，客户端收藏/取消收藏直接映射为 QQ 收藏夹操作。
 
-- 不带 `sink` 的 `IMMediaUploadPreparation`：平台已秒传命中，bridge 按 `file_id` 暂存可发送的 `media`，RPC 返回 `BoolTrue`；
-- 带 `sink` 的 preparation：平台已申请上传 plan 但仍缺文件字节，bridge 保留 plan，RPC 仍返回 `BoolFalse`，让原 uploader 继续发送 `upload.saveFilePart`；
-- `undefined`：无法预检，使用旧的磁盘 fallback。
+### 8.2 表情回应（Reaction）
 
-有 `sink` 时，bridge 只保留最多 32 个 / 16 MiB 的乱序 part 窗口。连续 part 会立即按顺序喂给 sink；QQ adapter 在内部凑满 Highway plan 的 1 MiB block 后立刻发出。MD5、SHA-1 和前 10 MiB MD5 在同一字节流上增量计算，全部字节到齐后先校验 hash，再完成最后一个 Highway block。`messages.sendMedia` 只消费已完成的 opaque 平台结果，不再打开分片文件、重新 hash 或申请第二个 plan。
-
-没有预检能力的客户端在 `upload.saveFilePart` 到达后，bridge 才将每个 part 独立写入临时文件。调用 adapter 时仍不会构造完整文件 Buffer：
-
-```ts
-for await (const chunk of media.source.stream({ signal: options.signal })) {
-  await platformUploader.write(chunk)
-  transferred += chunk.length
-  await options.onProgress?.({
-    phase: 'upload', mediaIndex, transferredBytes: transferred,
-    totalBytes: media.source.size,
-  })
-}
-```
-
-磁盘 fallback 中 adapter 必须边读取 `source.stream()` 边向平台上传。不要先将所有 chunk 收集到内存或另一个完整临时文件后再开始平台上传。成功返回后 bridge 清理 Telegram upload parts；失败时保留 parts，允许客户端以同一个 random ID 重试。预检直传路径不会创建这些 part 文件；hash 或 Highway 失败会终止该 plan，也不会退回到“先完整落盘再重读”的同一次上传。
-
-Telegram Desktop 通常不会把 `inputMediaUploadedPhoto` / `inputMediaUploadedDocument` 直接交给 `messages.sendMedia`，而是使用两阶段流程：
-
-```text
-upload.saveFilePart / upload.saveBigFilePart
-  -> messages.uploadMedia
-  -> messageMediaPhoto / messageMediaDocument
-  -> messages.sendMedia(inputMediaPhoto / inputMediaDocument)
-```
-
-bridge 会在 `messages.uploadMedia` 后暂存媒体引用，并允许客户端通过 `upload.getFile` 读取预览。暂存状态属于整个 bridge 服务及 platform session，不属于单个 MTProto 连接，因此上传连接与发送连接可以不同。只有 adapter 已确认发送且消息完成入库后才删除暂存引用和磁盘分片；平台失败时同一引用和 random ID 都可重试。`upload.getFile` 的 layer 224 long offset 会先做安全整数校验，媒体对象中的 `dcId` 始终与 bridge 配置一致。
-
-进度是传输过程的观测值，不是第二套上传协议。每个媒体独立使用 `mediaIndex`，`transferredBytes` 必须单调递增；未知总长度时可以不传 `totalBytes`。取消通过 `AbortSignal` 传播。
-
-下载实现 `downloadMedia(session, media, { offset, limit, signal, onProgress })`，range 语义由 adapter
-负责；远端只支持整文件时，adapter 可以从本地缓存读取 range，或边流式丢弃 offset 前的数据。
-bridge 会再次限制单次 `upload.getFile` 的输出不超过 `limit`，不会把完整远端文件装入内存。
-
-## 8. Capability 与错误
-
-adapter 必须准确声明 `send.text/images/files/mixed/maxTextLength/maxMedia` 和 conversation 能力。bridge 会在调用平台前完成通用校验；平台限流、权限和内容审核错误应保留可诊断的 error message。
-
-以下情况不得返回伪成功：缺上传 part、已取消、平台未确认 message ID、媒体读取不完整、history cursor 无效或 session 已失效。
-
-### 8.1 戳一戳（poke）能力
-
-平台有原生提醒动作（QQ 的“戳一戳”）时声明 `capabilities.poke = { maxCount }`，并实现：
-
-```ts
-sendPoke(
-  session,
-  conversation,          // 目标 chat：私聊或群
-  { userId },            // 被戳的平台用户 ID
-  count,                 // 1..maxCount
-): Promise<IMMessage | undefined>   // 平台确认的提醒消息，未确认时返回 undefined
-```
-
-未声明 `poke` 的平台不会向客户端暴露该动作：`crossgram.getFeatures` 只返回
-`{ "poke": { "maxCount": n } }`，客户端据此决定头像菜单里是否出现入口。
-poke 本身是平台侧动作，产生的提醒消息由 bridge 作为普通消息事件投影，因而 history、未读和多端
-同步与其他消息完全一致；`sendPoke` 同时返回的提醒消息只是一次“本地回显”，bridge 会按 platform
-message ID 幂等入库，不会和随后的事件重复。
-
-## 9. Sticker Provider
-
-Sticker catalog 不属于 `IMPlatform`。bridge 通过 `ctx.imSticker` 聚合平台原生 Provider 和独立贴纸插件：
-
-```ts
-ctx.imSticker.register(provider, 'qq-main:native')
-ctx.imSticker.register(companyStickerProvider, 'company-stickers')
-```
-
-全局 sticker identity 为 `(providerId, stickerId)`，pack identity 为 `(providerId, packId)`。Provider 负责：
-
-- `listPacks()` / `getPack()` / `getSticker()` / `search()`。
-- 通过 `openAsset()` 提供 Telegram 预览、下载和跨平台上传所需的流。
-- 可选通过 `prepareSend()` 返回平台 native reference；没有 native 表达时 bridge 使用 asset upload。
-
-平台插件可以共享同一个底层 client，同时注册 `IMPlatform` 和平台原生 `IMStickerProvider`。独立贴纸包只注册 Provider，不需要依赖任何具体 IM API。
-
-`messages.getRecentStickers`、`saveRecentSticker` 和 clear 操作由 bridge 数据库统一管理。发送经平台确认并完成入库后才进入 recent。
-
-QQ 的收藏夹不是 Telegram 的 `getFavedStickers`：QQ Provider 将它作为唯一的、账户关联的 `qq-favorites` sticker set 暴露，避免 Telegram 有限额的收藏夹与 QQ 收藏夹重复。QQ 客户端发出的 `faveSticker` / `unfave` 会直接调用 Provider 的 `setSavedSticker()`，继而映射为 QQNT 的加入/移出收藏夹操作；不再写入 bridge 本地 favorite 表。
-
-其它平台本身已有的用户收藏可由 Provider 的 `listSavedStickers()` 暴露。此列表允许返回不属于任何 pack 的 sticker：
-
-```ts
-{
-  providerId: 'qq-main:native',
-  stickerId: 'user-saved-123',
-  packId: undefined,
-  format: 'static',
-  mimeType: 'image/webp',
-}
-```
-
-bridge 会将这种 loose sticker 投影为：
-
-```ts
-{
-  _: 'documentAttributeSticker',
-  stickerset: { _: 'inputStickerSetEmpty' },
-}
-```
-
-对于非 QQ 平台，它会出现在统一 `messages.getFavedStickers` 中，仍然可以下载、发送、进入 recent，并可由 bridge 再次收藏；但不会伪造 sticker set，也不会出现在 `getAllStickers`。本地收藏和 Provider 收藏按 `(providerId, stickerId)` 去重。QQ 则只通过 `qq-favorites` sticker set 提供收藏。
-
-Sticker set 的安装状态同样属于 bridge 用户状态。`installStickerSet`、`uninstallStickerSet`、`toggleStickerSets` 和 `reorderStickerSets` 写入 bridge 数据库；安装后的 set 通过 `StickerSet.installedDate` 返回，服务重启后保持。
-
-`IMMessagePart` 和 `IMMessageInputPart` 支持 `type: 'sticker'`。发送计划分为：
-
-```ts
-type IMStickerSendPlan =
-  | { type: 'native', providerId: string, stickerId: string, reference: JsonValue }
-  | { type: 'upload', providerId: string, stickerId: string, format: 'static' | 'animated' | 'video', source: IMMediaSource, ... }
-```
-
-adapter 只负责执行最终 native/upload 输入，不实现 Telegram sticker set、收藏或最近使用逻辑。
-
-### 群文件
-
-平台可选实现 `listGroupFiles(session, conversation, { folderId, cursor, limit })`，返回原生群文件夹和文件。
-文件项必须携带可由 `downloadMedia()` 打开的 `IMMedia`；文件夹 ID、文件 ID 和分页 cursor 都作为 opaque
-字符串传递，bridge 不解析平台内部结构。
-
-对实现该能力的平台，bridge 提供两层映射：
-
-- Telegram 群聊“共享媒体 → 文件”使用 `messages.search + inputMessagesFilterDocument`，将原生群文件投影为
-  只读 document 搜索结果；由于 Telegram 没有文件夹模型，只映射当前原生列表中能表示为 document 的文件。
-- Telegram 附件菜单提供“群文件”Mini App，保留文件夹导航、分页、当前目录搜索和 Range 下载。
-  Mini App URL 使用短期 HMAC token 绑定平台 session 与群聊，浏览器侧不会接触 QQNT bridge token 或媒体 locator。
-
-移动端需要把 `bridge.groupFilesMiniApp.publicUrl` 配置为 Telegram 客户端可访问的 HTTPS 地址；默认值使用
-Cordis server 的本地 `baseUrl`，适合本机桌面客户端与开发调试。
-
-## 10. Reaction
-
-Reaction 是消息 mutation，不属于 message text/media，也不能通过 `message-edit` 模拟。平台使用 opaque native key：
-
-```ts
-interface IMReactionSummary {
-  key: string
-  count: number
-  selected?: boolean
-  recentActors?: Array<{ userId: string, timestamp?: number }>
-}
-```
-
-发送使用最终状态语义：
-
-```ts
-setMessageReactions(session, target, reactionKeys)
-```
-
-Reaction 定义由平台按 chat 或具体消息动态返回：
-
-```ts
-interface IMReactionDefinition {
-  key: string
-  title?: string
-  presentation:
-    | { type: 'emoji', emoticon: string }
-    | { type: 'custom', alt: string, resource: IMReactionResource }
-}
-
-interface IMReactionContext {
-  available: IMReactionDefinition[]
-  reactions: IMReactionSummary[]
-  maxSelected: number
-}
-```
-
-- `presentation.type === 'emoji'` 只提供平台 native key 到 Telegram 标准 emoji 的映射。标准 reaction 的图标和动画由 bridge 的 Telegram reaction catalog 提供，adapter 不提供资源。
-- `presentation.type === 'custom'` 用于 Discord guild emoji 等 chat/message scoped reaction。资源由 `downloadReactionResource()` 下载，不经过 Sticker Provider。
-- `getAvailableReactions(session, { conversationId })` 返回 chat 默认能力。
-- 传入 `messageId/targetId` 时返回具体消息能力，允许同一 chat 中不同消息有不同 reaction allow-list。
-- `getMessageReactions()` 返回消息当前 count；history 返回的 `IMMessage.reactionContext` 使用相同结构。
-
-这样 Telegram `messages.sendReaction` 的 vector 可以直接映射到平台，不需要 bridge 猜测 add/remove 操作。平台推送使用完整 context：
-
-```ts
-{
-  type: 'message-reactions',
-  eventId,
-  conversation,
-  target,
-  context,
-  timestamp,
-}
-```
-
-bridge 将 context 独立入库，通过进程内 delivery journal 发布 `updateMessageReactions`。Custom resource 的 synthetic Document ID 包含 session、conversation、native key 和 resource version，避免跨 guild 泄漏或资源更新后命中旧缓存。
-
-`messages.getAvailableReactions` 是 bridge 账号级 Telegram 标准 reaction catalog；`ChatFull.availableReactions` 才是平台针对当前 chat 返回的允许集合。
-
-## 11. 最小 conformance 清单
-
-每个平台实现至少覆盖：
-
-1. subscribe 重复事件幂等、handler 背压、unsubscribe。
-2. 8K 以上 message ID 和包含特殊字符的 conversation ID。
-3. history 第一页、before anchor、limit 不越界，且单次调用不遍历 nextCursor。
-4. 纯文字、单图、图文、两媒体 album、普通文件。
-5. source 被逐 chunk 消费，进度单调、取消可中断、失败可重试。
-6. download offset/limit 字节一致。
-7. direct/group/channel/subchannel sender 与层级信息完整。
-8. history 与 subscribe 同时返回同一消息时只保留一条。
-9. 服务重启后相同外部 ID 对应相同 Telegram message/group ID。
-10. edit 保持 message/TL ID，delete 从 history 隐藏且重复 mutation 不重复推进 pts。
-11. 至少 1000 条并发 subscribe 事件不丢 message、alias 或 TL projection。
-12. 万级历史只返回请求窗口，深分页不在单次 RPC 中全量入库。
-13. 平台 native sticker 与独立 Provider sticker 同时出现在 catalog，均可下载、发送并进入统一 recent/favorite。
-14. Unicode/custom-emoji reaction 均可从 reaction pack 映射、发送、写入历史并通过 push update 发布。
-15. owner/admin/member、权限、成员分页和管理员筛选与平台数据一致。
-16. 用户/群头像通过带类型 locator 的 `IMMedia` range 下载；原生编辑、撤回重发、限时/不限时撤回及转发策略均有覆盖。
-17. 原生 poke 声明 `capabilities.poke` 后，`crossgram.getFeatures` 返回 `maxCount`，`crossgram.sendPoke` 按 count 触发一次批量提醒且不产生重复消息。
-
-bridge 内部行为测试位于 `packages/bridge/src`，包括 `message-store.test.ts`、`platform-manager.test.ts`、`media-projection.test.ts`、`media-send.test.ts` 和 `conversation-kinds.test.ts`。
-
-跨包契约测试独立位于 `@mtproto-relay/test-suite`，依赖方向固定为：
-
-```text
-test-suite -> platform-static -> bridge -> mtproto
-           -> bridge -----------^
-```
-
-- `platform-static.test.ts` 直接验证 Cordis 多例、Group A 每秒 new/edit/delete、Group B→C 用户镜像、Group D 万级分页、混合媒体、传输进度、subscribe 背压和错误行为。
-- `login.e2e.test.ts` 通过真实 MTProto socket 验证登录/重连/重启、new/edit/delete 推送和 tombstone、主动编辑/撤回/转发、成员与管理员权限、用户/群头像下载、B→C bridge history、万级历史窗口入库、群相册、文件传输及 channel/subchannel。
-
-运行 adapter 契约与跨包 e2e：
-
-```bash
-pnpm --filter @mtproto-relay/test-suite exec vitest run
-```
+- 标准 Emoji 回应声明 `presentation: { type: 'emoji', emoticon }`，复用 Bridge 内置的 Telegram 动画资源。
+- 平台自定义回应声明 `presentation: { type: 'custom', alt, resource }`，由 `downloadReactionResource()` 提供图片字节。
+- `setMessageReactions(session, target, reactionKeys)` 接收消息最终选中的回应 Key 列表。

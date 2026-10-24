@@ -4,22 +4,19 @@ import type Long from 'long'
 import type { ServerConnection } from '../transport/server-connection.js'
 import type { ServerSession } from '../session/server-session.js'
 
-/** Metadata owned by the lifetime fiber of one TCP connection. */
+/** 单个客户端连接生命周期内绑定的上下文信息 */
 export interface MtprotoConnectionScope {
   id: string
   connection: ServerConnection
   session: ServerSession
   remoteAddress?: string
   remotePort?: number
-  /** Wall-clock time when this TCP connection was accepted. */
   connectedAt?: number
-  /** Most recent decoded API RPC received on this connection. */
   lastActiveAt?: number
-  /** Client metadata announced by initConnection. */
+  /** `initConnection` 上报的客户端设备与应用信息 */
   clientInfo?: MtprotoClientInfo
 }
 
-/** Stable device/application metadata announced by Telegram's initConnection wrapper. */
 export interface MtprotoClientInfo {
   apiId: number
   deviceModel: string
@@ -30,14 +27,13 @@ export interface MtprotoClientInfo {
   langCode: string
 }
 
-/** Metadata attached to the derived context of one decoded transport packet. */
+/** 单个传输层数据包对应的派生上下文信息 */
 export interface MtprotoPacketScope {
   connection: MtprotoConnectionScope
   sequence: number
   data: Uint8Array
 }
 
-/** Raw TCP traffic observed at the transport boundary. */
 export interface MtprotoTrafficSample {
   connection: MtprotoConnectionScope
   direction: 'received' | 'sent'
@@ -45,7 +41,7 @@ export interface MtprotoTrafficSample {
   timestamp: number
 }
 
-/** Metadata attached to the short-lived fiber of one RPC invocation. */
+/** 单次 RPC 调用的派生上下文信息 */
 export interface MtprotoRpcScope {
   connection: MtprotoConnectionScope
   request: tl.RpcMethod
@@ -53,54 +49,31 @@ export interface MtprotoRpcScope {
   receivedAt: number
 }
 
-/**
- * Context passed to every RPC handler. Gives handlers access to the connection,
- * the current auth/session identity, a way to push server-initiated updates, and
- * a per-session scratch slot for backend state (e.g. the resolved platform session).
- */
 export interface ServerRpcContext {
-  /** The Cordis derived context for this invocation, when dispatched by Mtproto. */
   readonly cordis?: Context
-  /** Connection-level metadata inherited from the connection fiber. */
   readonly mtprotoConnection?: MtprotoConnectionScope
-  /** Invocation-level metadata owned by the current RPC fiber. */
   readonly mtprotoRpc?: MtprotoRpcScope
-  /** The underlying client connection. */
   connection: ServerConnection
-  /** API layer declared by invokeWithLayer, retained for the whole MTProto session. */
+  /** `invokeWithLayer` 协商的 API layer，在整个会话期间保留 */
   readonly apiLayer: number | null
-  /** Client metadata retained from the latest initConnection on this connection. */
   readonly clientInfo?: MtprotoClientInfo
-  /** Wall-clock time when this TCP connection was accepted. */
   readonly connectedAt?: number
-  /** Wall-clock time of this decoded RPC. */
   readonly lastActiveAt?: number
-  /** The permanent auth key id (8 bytes), or null before authorization. */
+  /** 8 字节永久 auth_key_id，未完成握手前为 null */
   authKeyId: Uint8Array | null
-  /** The client's MTProto session id. */
   sessionId: Long
-  /** Whether the DH handshake has completed. */
   isAuthorized: boolean
-  /** Push a server-initiated update to this client. */
   sendUpdate: (update: tl.TypeUpdates) => void
-  /**
-   * Register work that must start only after this RPC's `rpc_result` has been
-   * queued on the connection. This is used by state machines whose update is
-   * meaningful only after the client has consumed the matching RPC result.
-   */
+  /** 在当前 `rpc_result` 入队发送后执行的回调（用于依赖客户端先收到响应再处理后续 update 的场景） */
   afterResponse?: (task: () => void | Promise<void>) => void
-  /** Register work that runs after the successful response transport settles. */
+  /** 在当前成功响应底层写入完成后执行的回调 */
   afterResponseSettled?: (task: () => void | Promise<void>) => void
-  /**
-   * Read reconstructible backend state shared by this auth key's connections.
-   * May return null after the device has been disconnected and idle for five minutes.
-   */
+  /** 读取绑定到该永久 auth key 的内存态数据（空闲超时后可能为 null） */
   getPlatformData: <T>() => T
-  /** Cache backend state for this auth key; persist durable state separately. */
+  /** 缓存绑定到该永久 auth key 的内存态数据 */
   setPlatformData: (data: unknown) => void
 }
 
-/** Actual runtime shape used by the Cordis-native server dispatch path. */
 export type CordisServerRpcContext = Context & ServerRpcContext & {
   readonly cordis: Context
   readonly mtprotoConnection: MtprotoConnectionScope

@@ -2601,6 +2601,144 @@ describe('QQNT join notice E2E', () => {
   })
 })
 
+describe('QQNT unstorable text E2E', () => {
+  it('persists a NUL nickname, remark, body and request note, and keeps the checkpoint moving', async () => {
+    const ctx = new Context()
+    const fibers = [
+      ctx.plugin(Database),
+      ctx.plugin(SQLiteDriver, { path: ':memory:' }),
+    ]
+    await Promise.all(fibers)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    defineModels(ctx)
+    defineQQNTEventCheckpointModel(ctx)
+    await ctx.database.prepared()
+    disposals.push(async () => {
+      for (const fiber of fibers.reverse()) await Promise.resolve((fiber as any).dispose?.())
+    })
+
+    const checkpointSession = { ...session, platformSessionId: 'qqnt-unstorable-text-e2e' }
+    const conversation = {
+      id: 'unstorable-group', kind: 'group' as const, title: 'Gr\u0000oup',
+      peerUid: 'unstorable-group', peerUin: '43', chatType: 2 as const,
+    }
+    const webSocketServer = new WebSocketServer({ noServer: true })
+    const server = createServer()
+    server.on('upgrade', (request, socket, head) => {
+      webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+        webSocketServer.emit('connection', webSocket, request)
+      })
+    })
+    webSocketServer.on('connection', (webSocket) => {
+      // QQ hands over a NUL in a group title, a nickname, a remark and a body,
+      // and a lone surrogate in the remark: PostgreSQL stores none of them, so
+      // before the fix the whole event failed and this checkpoint never moved.
+      webSocket.send(JSON.stringify({
+        id: '7001',
+        event: {
+          type: 'message', conversation,
+          message: {
+            id: 'unstorable-message', conversationId: conversation.id, senderId: 'peer',
+            timestamp: 1_787_215_100, outgoing: false,
+            sender: { id: 'peer', name: 'Bad\u0000Name', alias: 're\uD800mark' },
+            parts: [{
+              type: 'text', text: '@alice\u0000 hello',
+              entities: [{ type: 'mention', offset: 0, length: 6, userId: 'alice' }],
+            }],
+          },
+        },
+      }))
+      webSocket.send(JSON.stringify({
+        id: '7002',
+        event: {
+          type: 'request',
+          request: {
+            id: 'unstorable-request', kind: 'group-join', status: 'pending',
+            requester: { id: 'requester', name: 'Frie\u0000nd' },
+            group: { id: conversation.id, name: 'Gr\u0000oup' },
+            message: 'let me in\u0000',
+            timestamp: 1_787_215_101,
+          },
+        },
+      }))
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('missing unstorable text test address')
+    disposals.push(async () => {
+      for (const client of webSocketServer.clients) client.terminate()
+      webSocketServer.close()
+      if (!server.listening) return
+      const closed = new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve())
+      })
+      server.closeAllConnections()
+      await closed
+    })
+
+    const platform = new QQNTPlatform({
+      endpoint: 'http://127.0.0.1:1/v1',
+      webSocketEndpoint: `ws://127.0.0.1:${address.port}/events`,
+    }, 'qqnt:stickers', undefined, undefined, ctx.database)
+    platform.client.getReactionCatalog = vi.fn(async () => ({
+      available: [], reactions: [], maxSelected: 20,
+    }))
+    platform.client.getDialogs = vi.fn(async () => ({ conversations: [] }))
+    const store = new MessageStore(ctx.database)
+    const handled: string[] = []
+    const done = Promise.withResolvers<void>()
+    const unsubscribe = await platform.subscribe(checkpointSession, async (event) => {
+      if (event.type === 'message') await store.ingest(checkpointSession, event.conversation, event.message)
+      else if (event.type === 'request') await store.ingestRequest(checkpointSession, event.request)
+      else return
+      handled.push(event.type)
+      if (handled.length === 2) done.resolve()
+    })
+    try {
+      await Promise.race([
+        done.promise,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('unstorable text E2E timed out')), 5_000)),
+      ])
+      expect(handled).toEqual(['message', 'request'])
+      // The reported symptom: the checkpoint stops before the event that cannot
+      // be persisted, and every later event waits behind it.
+      await vi.waitFor(async () => expect(await ctx.database.get(
+        'mtproto_qqnt_event_checkpoint', { platformSessionId: checkpointSession.platformSessionId },
+      )).toMatchObject([{ lastEventId: '7002' }]))
+      await expect(ctx.database.get('mtproto_im_conversation', {
+        platformSessionId: checkpointSession.platformSessionId, platformConversationId: conversation.id,
+      })).resolves.toMatchObject([{ title: 'Gr.oup' }])
+      await expect(ctx.database.get('mtproto_im_user', {
+        platformId: 'qqnt', platformUserId: 'peer',
+      })).resolves.toMatchObject([{ firstName: 'Bad.Name' }])
+      const [message] = await ctx.database.get('mtproto_im_message', {
+        platformSessionId: checkpointSession.platformSessionId,
+        primaryPlatformMessageId: 'unstorable-message',
+      })
+      expect(message.text).toBe('@alice. hello')
+      // The mention still covers the same six code units it covered in QQ's text.
+      expect(message.content).toMatchObject({
+        parts: [{
+          type: 'text', text: '@alice. hello',
+          entities: [{ type: 'mention', offset: 0, length: 6, userId: 'alice' }],
+        }],
+      })
+      expect(message.metadata).toMatchObject({ __mtprotoRelaySenderTitle: 're.mark' })
+      const [requestRow] = await ctx.database.get('mtproto_im_request', {
+        platformSessionId: checkpointSession.platformSessionId, platformRequestId: 'unstorable-request',
+      })
+      expect(requestRow.request).toMatchObject({
+        message: 'let me in.',
+        requester: { id: 'requester', firstName: 'Frie.nd' },
+        group: { id: conversation.id, title: 'Gr.oup' },
+      })
+    } finally {
+      await unsubscribe()
+    }
+  })
+})
+
 async function collect(source: AsyncIterable<Uint8Array>): Promise<Buffer> {
   const chunks: Buffer[] = []
   for await (const chunk of source) chunks.push(Buffer.from(chunk))

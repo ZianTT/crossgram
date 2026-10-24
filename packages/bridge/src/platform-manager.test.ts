@@ -862,6 +862,54 @@ describe('PlatformDataService', () => {
     expect(second.messages.at(-1)!.id).toBeLessThan(anchor!)
   })
 
+  it('answers an unanchored first page with the newest messages when the store only knows the unread region', async () => {
+    const database = await createDatabase()
+    const platform = new PushPlatform()
+    platform.capabilities.history = true
+    const conversation: IMConversation = { id: 'lagging-store-room', kind: 'group', title: 'Lagging store' }
+    const build = (prefix: string, base: number, senderId: string): IMMessage[] =>
+      Array.from({ length: 20 }, (_, index) => ({
+        id: `${prefix}-${index}`,
+        conversationId: conversation.id,
+        senderId,
+        sender: { id: senderId, firstName: senderId },
+        timestamp: base + index,
+        content: { parts: [{ type: 'text' as const, text: `${prefix} ${index}` }] },
+      }))
+    const stored = build('stored', 100, 'alice')
+    const unreadWindow = build('unread', 200, 'bob')
+    const latestWindow = build('latest', 300, 'carol')
+    const store = new MessageStore(database)
+    await store.ingestMany(session, conversation, stored, { allocation: 'history' })
+    platform.getDialogs = async () => ({
+      dialogs: [{ conversation, unreadCount: 5, lastMessage: latestWindow.at(-1) }],
+    })
+    // platform-qqnt 的现实行为：未锚定且没要 `latest` 的历史请求会被当成「未读窗口」。
+    const queries: Array<Record<string, unknown>> = []
+    platform.getHistory = async (_session, _conversation, query) => {
+      queries.push({ ...query })
+      return { messages: query?.latest ? latestWindow : unreadWindow }
+    }
+    const rpc = new DialogRpc(platform, session, store)
+    const peer = {
+      _: 'inputPeerChannel' as const,
+      channelId: rpc.peerTlId(conversation.id),
+      accessHash: Long.ONE,
+    }
+
+    const page = await rpc.getHistory({
+      _: 'messages.getHistory', peer,
+      offsetId: 0, offsetDate: 0, addOffset: 0, limit: 20,
+      maxId: 0, minId: 0, hash: Long.ZERO,
+    }) as tl.messages.RawMessages
+
+    expect(queries.some((query) => query.latest === true)).toBe(true)
+    const newest = await store.findProjectedByPlatformId(
+      session.platformSessionId, conversation.id, 'latest-19',
+    )
+    expect(page.messages[0]?.id).toBe(newest!.parts[0].tlMessageId)
+  })
+
   it('fetches one requested history window at a time and persists both windows', async () => {
     const database = await createDatabase()
     const platform = new PushPlatform()

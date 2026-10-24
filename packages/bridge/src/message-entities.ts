@@ -20,9 +20,8 @@ interface EntityRange {
 }
 
 /**
- * Adds Telegram URL entities for links which are plain text at the platform
- * boundary. Offsets and lengths deliberately use JavaScript string indexes,
- * which are UTF-16 code units just like Telegram's MessageEntity fields.
+ * 为纯文本中的链接补充 Telegram `messageEntityUrl`。
+ * 偏移与长度均按 UTF-16 码元计算，与 JS 字符串索引及 Telegram 实体字段一致。
  */
 export function withAutoLinkEntities(
   text: string,

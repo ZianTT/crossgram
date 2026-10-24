@@ -15,7 +15,7 @@ import type {
   QQMediaLocator, QQStickerReference, WireConversation, WireEvent, WireMemberPage, WireMessage, WireMultiForwardLocator,
   WirePokeResult,
   WireReactionActorPage, WireReactionContext, WireReactionState, WireRequest, WireRequestPage, WireSticker, WireStickerPack, WireStickerPackSummary,
-  WireFlashTransferManifest, WireFlashTransferResult, WireReactionAssetMeta, WireStickerAssetMeta, WireTextPart,
+  WireFlashTransferManifest, WireFlashTransferResult, WireReactionAssetMeta, WireStickerAssetMeta, WireSendOptions, WireSendPart, WireUploadMedia, WireTextPart,
 } from './protocol.js'
 import { QQHighwayUploadWriter, uploadHighway, type QQMediaUploadPlan } from './highway.js'
 import { Sha1CompressionState } from './sha1-state.js'
@@ -68,7 +68,6 @@ export interface DirectUrl {
   supportsRange?: boolean
 }
 
-/** The QQNT message endpoint permanently rejected this exact send. */
 export class QQNTMessageSendRejectedError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options)
@@ -105,15 +104,32 @@ interface CachedDirectRangeBlock {
   bytes: Uint8Array
 }
 
-/** One short-lived, local-only capability for the QQ Bridge PCM gateway. */
 export interface QQNTMediaLease {
   version: 1
   socketPath: string
   leaseId: string
   token: Uint8Array
-  /** Monotonic gateway expiry; only the gateway compares it to its local clock. */
+  /** 网关侧单调时钟过期时间。 */
   expiry: number
 }
+
+export interface QQOutboundMedia {
+  kind: 'image' | 'file'
+  voice?: boolean
+  name: string
+  mimeType?: string
+  width?: number
+  height?: number
+  duration?: number
+  source: IMMediaSource
+}
+
+export type QQSendPart =
+  | WireTextPart
+  | {
+      type: 'media'
+      media: QQOutboundMedia
+    }
 
 export class QQNTClient {
   readonly endpoint: string
@@ -302,20 +318,13 @@ export class QQNTClient {
     afterId?: string
     aroundUnreadSeq?: string
     latest?: number
-  } = {}): Promise<{ messages: WireMessage[], nextCursor?: string }> {
+    beforeSeq?: string
+  } = {}): Promise<{
+    messages: WireMessage[]
+    nextCursor?: string
+    sequenceRange?: { min: string, max: string }
+  }> {
     return this.revalidatedJson(`/conversations/${encodeURIComponent(id)}/history${queryString(query)}`)
-  }
-
-  searchMessages(id: string, query: {
-    q: string
-    cursor?: string
-    limit?: number
-    fromUserId?: string
-    minTimestamp?: number
-    maxTimestamp?: number
-    mediaKind?: 'image' | 'file'
-  }): Promise<{ messages: WireMessage[], nextCursor?: string }> {
-    return this.json(`/conversations/${encodeURIComponent(id)}/search${queryString(query)}`)
   }
 
   getGroupFiles(id: string, query: {
@@ -350,10 +359,6 @@ export class QQNTClient {
     )
   }
 
-  /**
-   * Send poke notices. QQ appends its own notice message per poke; the bridge
-   * returns the newest one when it confirmed it before answering.
-   */
   async sendPoke(conversationId: string, userId: string, count: number): Promise<WirePokeResult> {
     if (this.bridgeProtocol === undefined) await this.status()
     if (this.bridgeProtocol! < 33) {
@@ -570,20 +575,7 @@ export class QQNTClient {
 
   async prepareMediaUpload(
     conversationId: string,
-    media: {
-      kind: 'image' | 'video' | 'file'
-      name: string
-      mimeType?: string
-      size: number
-      md5: string
-      sha1: string
-      sha1Checkpoints?: string[]
-      file10MMd5: string
-      width?: number
-      height?: number
-      duration?: number
-      thumbnail?: ReturnType<typeof videoThumbnailMetadata>
-    },
+    media: WireUploadMedia,
     signal?: AbortSignal,
   ): Promise<QQMediaUploadPlan> {
     const response = await this.fetchImpl(`${this.endpoint}/uploads/prepare`, {
@@ -598,45 +590,49 @@ export class QQNTClient {
     return responseJson(response)
   }
 
+  /** bridge 协议 >= 35 支持图文混排元素保序；旧版退化为单段文本后接全部媒体的扁平结构。 */
+  private async supportsSendParts(): Promise<boolean> {
+    if (this.bridgeProtocol === undefined) {
+      try {
+        await this.status()
+      } catch {
+        return false
+      }
+    }
+    return (this.bridgeProtocol ?? 0) >= 35
+  }
+
   async sendMessage(
     conversationId: string,
-    text: string | undefined,
-    media: Array<{
-      kind: 'image' | 'file'
-      voice?: boolean
-      name: string
-      mimeType?: string
-      width?: number
-      height?: number
-      duration?: number
-      source: IMMediaSource
-    }> | undefined,
+    parts: readonly QQSendPart[],
     options: IMTransferOptions = {},
-    originRequestId?: string,
-    sticker?: QQStickerReference,
-    textParts?: WireTextPart[],
-    replyToId?: string,
-    replyToSequence?: string,
+    transfer: WireSendOptions = {},
   ): Promise<WireMessage> {
-    const voice = media?.find((item) => item.voice)
+    const { originRequestId, sticker, replyToId, replyToSequence } = transfer
+    const textParts: WireTextPart[] = parts.flatMap((part) => part.type === 'text' ? [part] : [])
+    const mediaParts: QQOutboundMedia[] = parts.flatMap((part) => part.type === 'media' ? [part.media] : [])
+    const text = textParts.length ? textParts.map((part) => part.text).join('\n') : undefined
+    const voice = mediaParts.find((item) => item.voice)
     if (voice) {
       if (this.bridgeProtocol === undefined) await this.status()
       if (this.bridgeProtocol! < 21) {
         throw new Error('QQNT bridge protocol 21 is required for voice messages')
       }
-      if (media?.length !== 1 || text || textParts?.length || sticker || replyToSequence) {
+      if (mediaParts.length !== 1 || text || sticker || replyToSequence) {
         throw new Error('QQNT voice messages must contain exactly one voice item')
       }
       const manifest = {
         conversationId, replyToId, replyToSequence, originRequestId,
-        media: [{ kind: 'voice', name: voice.name, mimeType: voice.mimeType, duration: voice.duration }],
+        media: [{
+          kind: 'voice', name: voice.name,
+          mimeType: voice.mimeType, duration: voice.duration,
+        }],
       }
       const response = await this.fetchImpl(`${this.endpoint}/messages`, {
         method: 'POST', headers: this.headers({
           'x-qqnt-manifest': Buffer.from(JSON.stringify(manifest)).toString('base64url'),
         }),
         body: sourceReadableStream(voice.source, options.signal), signal: options.signal,
-        // Node's fetch requires this for a streaming request body.
         duplex: 'half',
       } as RequestInit & { duplex: 'half' })
       if (response.status === 403 || response.status === 422) {
@@ -646,14 +642,14 @@ export class QQNTClient {
       }
       return responseJson(response)
     }
-    const hasVideo = media?.some((item) => outboundMediaKind(item) === 'video')
+    const hasVideo = mediaParts.some((item) => outboundMediaKind(item) === 'video')
     if (hasVideo) {
       if (this.bridgeProtocol === undefined) await this.status()
       if (this.bridgeProtocol! < 24) {
         throw new Error('QQNT bridge protocol 24 is required for playable video messages')
       }
     }
-    const preparedMedia = media && await Promise.all(media.map(async (item) => {
+    const preparedMedia = await Promise.all(mediaParts.map(async (item) => {
       const kind = outboundMediaKind(item)
       const fast = fastUpload(item.source)
       if (fast) {
@@ -671,16 +667,12 @@ export class QQNTClient {
       ])
       return { item, kind, hashes, thumbnail, plan: undefined, uploaded: false }
     }))
-    const uploadedMedia = preparedMedia && await Promise.all(preparedMedia.map(async ({
+    const specs = preparedMedia.map(({ item, kind, hashes, thumbnail }) =>
+      sendMediaSpec(item, kind, hashes, thumbnail))
+    const uploadedMedia = await Promise.all(preparedMedia.map(async ({
       item, kind, hashes, thumbnail, plan: fastPlan, uploaded,
     }, mediaIndex) => {
-      const mediaSpec = {
-        kind, name: item.name, mimeType: item.mimeType, size: hashes.size,
-        md5: hashes.md5, sha1: hashes.sha1, sha1Checkpoints: hashes.sha1Checkpoints,
-        file10MMd5: hashes.file10MMd5,
-        width: item.width, height: item.height, duration: item.duration,
-        ...(thumbnail ? { thumbnail: videoThumbnailMetadata(thumbnail) } : {}),
-      }
+      const mediaSpec = specs[mediaIndex]!
       const plan = fastPlan ?? await this.prepareMediaUpload(conversationId, mediaSpec, options.signal)
       if (plan.prepared.kind !== kind) throw new Error('QQNT bridge returned the wrong prepared media kind')
       if (plan.highway && !uploaded) {
@@ -723,22 +715,26 @@ export class QQNTClient {
       }
       return plan.prepared
     }))
-    const manifest = {
-      conversationId,
-      text,
-      textParts,
-      replyToId,
-      replyToSequence,
-      originRequestId,
-      sticker,
-      media: preparedMedia?.map(({ item, kind, hashes, thumbnail }) => ({
-        kind, name: item.name, mimeType: item.mimeType, size: hashes.size,
-        md5: hashes.md5, sha1: hashes.sha1, sha1Checkpoints: hashes.sha1Checkpoints,
-        file10MMd5: hashes.file10MMd5,
-        width: item.width, height: item.height, duration: item.duration,
-        ...(thumbnail ? { thumbnail: videoThumbnailMetadata(thumbnail) } : {}),
-      })),
-      uploadedMedia,
+    let manifest: Record<string, unknown>
+    if (await this.supportsSendParts()) {
+      let mediaIndex = 0
+      const wireParts: WireSendPart[] = parts.map((part) => part.type === 'text'
+        ? { type: 'text', text: part.text, entities: part.entities }
+        : {
+            type: 'media',
+            media: specs[mediaIndex]!,
+            prepared: uploadedMedia[mediaIndex++],
+          })
+      manifest = {
+        conversationId, replyToId, replyToSequence, originRequestId, sticker,
+        parts: wireParts,
+      }
+    } else {
+      manifest = {
+        conversationId, text, textParts, replyToId, replyToSequence, originRequestId, sticker,
+        media: specs,
+        uploadedMedia,
+      }
     }
     const headers = this.headers({
       'x-qqnt-manifest': Buffer.from(JSON.stringify(manifest)).toString('base64url'),
@@ -823,11 +819,7 @@ export class QQNTClient {
     return this.json('/reactions/catalog')
   }
 
-  /**
-   * Reads the exact size and content identity of a reaction asset. The bridge
-   * answers this from the archive directory (or the local file), so it is far
-   * cheaper than streaming the face itself.
-   */
+  /** 读取表情资源的字节大小与版本（bridge 从归档目录或本地文件直接读取，无需流式下载原图）。 */
   getReactionAssetMeta(reactionKey: string): Promise<WireReactionAssetMeta | null> {
     return this.json('/reactions/meta', true, {
       method: 'POST',
@@ -836,7 +828,6 @@ export class QQNTClient {
     })
   }
 
-  /** Size and content identity of the image one QQ sticker reference serves. */
   resolveStickerAssetMeta(reference: QQStickerReference): Promise<WireStickerAssetMeta | null> {
     return this.json('/stickers/meta', true, {
       method: 'POST',
@@ -891,6 +882,14 @@ export class QQNTClient {
       method: 'POST',
       headers: this.headers({ 'content-type': 'application/json' }),
       body: JSON.stringify(input),
+    })
+  }
+
+  acceptGroupInvite(invite: { groupCode: string, msgSeq: string }): Promise<Record<string, never>> {
+    return this.json('/group-invites/accept', false, {
+      method: 'POST',
+      headers: this.headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify(invite),
     })
   }
 
@@ -993,8 +992,7 @@ export class QQNTClient {
     }
     if (directKey && response.status === 206) this.markDirectRangeSupport(directKey, true)
     const reader = response.body.getReader()
-    // QQ CDN and qlogo normally apply Range. Retain local slicing for a whole-file
-    // 200 response so a CDN that ignores Range still satisfies upload.getFile.
+    // 兼容忽略 Range 并返回 200 全量响应的 CDN，在本地做切片。
     let skipped = response.status === 206 ? offset : 0
     let remaining = limit ?? Number.POSITIVE_INFINITY
     let completed = false
@@ -1099,8 +1097,7 @@ export class QQNTClient {
     return resolved
   }
 
-  /** Fetch a cached direct URL; when QQ rejects it with a retryable stale-key
-   *  retcode, drop the cached entry, resolve a fresh URL, and retry once. */
+  /** 请求缓存直链；若 QQ 返回密钥过期的可重试错误码，则重新解析直链并重试一次。 */
   private async fetchDirectUrlWithRefresh(
     locator: QQMediaLocator,
     identity: string | undefined,
@@ -1123,10 +1120,7 @@ export class QQNTClient {
     if (locator.imageSpec === undefined || locator.imageSpec === 0) {
       throw new Error(await nativeResponseError(response))
     }
-    // QQ rejects some thumbnail specs (720) with a retryable DFS error even
-    // under a freshly signed key, while the original spec keeps working.
-    // Fall back to the original image and remember the substitution under the
-    // thumbnail identity so later requests skip the two failed round trips.
+    // 部分 720 缩略图即使刷新签名也会被 QQ DFS 拒绝，回退为原图并缓存到该缩略图键下。
     const original = await this.resolveFileUrl({ ...locator, imageSpec: 0 }, init.signal)
     const fallback = await request(original.url)
     if (!fallback.ok) throw new Error(await nativeResponseError(fallback))
@@ -1146,14 +1140,7 @@ export class QQNTClient {
     return inspected
   }
 
-  /**
-   * Measures a QQ expression-CDN asset without downloading it.
-   *
-   * The expression CDN answers a two-byte range with the total length in
-   * `content-range`, which is how the relay publishes a document size for a
-   * sticker the bridge can only describe. Clients schedule sticker downloads
-   * from that size, so a zero keeps the cell empty forever.
-   */
+  /** 发送 `bytes=0-1` 探测 QQ 表情 CDN，从 `Content-Range` 获取完整大小与 MIME 类型。 */
   async probeRemoteSticker(
     url: string,
     signal?: AbortSignal,
@@ -1290,10 +1277,7 @@ export class QQNTClient {
   private async probeDirectRange(url: string, signal?: AbortSignal): Promise<boolean> {
     try {
       const response = await this.fetchImpl(url, {
-        // QQ multimedia has URLs that return `200` with an empty body for the
-        // degenerate 0-0 probe while serving every real multi-byte range as
-        // proper 206. Probe two bytes so capability detection matches the
-        // client's actual chunk requests without downloading a full chunk.
+        // 部分 QQ 多媒体 URL 对单字节 `0-0` 探测返回空体 200，对多字节范围才正常返回 206，故探测 2 字节。
         headers: { 'accept-encoding': 'identity', range: 'bytes=0-1' },
         signal,
         redirect: 'follow',
@@ -1353,9 +1337,7 @@ export class QQNTClient {
     const cached: CachedUnrangedFile = {
       path, size: 0, complete: false, accounted: false, waiters: new Set(),
     }
-    // Keep consuming the single whole-file response after the first Telegram
-    // getFile chunk has been satisfied. Later 128 KiB requests wait only for
-    // their byte boundary to reach disk instead of starting another HTTP GET.
+    // 后台继续消费单次全量响应写入磁盘，后续 `upload.getFile` 分片只需等待对应偏移落盘即可。
     void this.populateUnrangedFile(key, cached, response, file)
     return cached
   }
@@ -1461,8 +1443,7 @@ export class QQNTClient {
   private evictUnrangedFiles(): void {
     while (this.unrangedFileBytes > MAX_UNRANGED_CACHE_BYTES
       || this.unrangedFiles.size > MAX_UNRANGED_CACHE_ENTRIES) {
-      // Retain one oversized file so its later upload.getFile chunks never
-      // fall back to re-downloading the same whole response.
+      // 至少保留当前最后一个文件，防止超大文件在后续分片读取时重新触发全量下载。
       if (this.unrangedFiles.size <= 1) return
       const oldest = [...this.unrangedFiles].find(([, cached]) => cached.complete)
       if (!oldest) return
@@ -1692,6 +1673,21 @@ function videoThumbnailMetadata(thumbnail: HashedVideoThumbnail) {
   }
 }
 
+function sendMediaSpec(
+  item: { name: string, mimeType?: string, width?: number, height?: number, duration?: number },
+  kind: 'image' | 'video' | 'file',
+  hashes: { size: number, md5: string, sha1: string, sha1Checkpoints?: string[], file10MMd5: string },
+  thumbnail: HashedVideoThumbnail | undefined,
+): WireUploadMedia {
+  return {
+    kind, name: item.name, mimeType: item.mimeType, size: hashes.size,
+    md5: hashes.md5, sha1: hashes.sha1, sha1Checkpoints: hashes.sha1Checkpoints,
+    file10MMd5: hashes.file10MMd5,
+    width: item.width, height: item.height, duration: item.duration,
+    ...(thumbnail ? { thumbnail: videoThumbnailMetadata(thumbnail) } : {}),
+  }
+}
+
 function matchingAuxiliaryBytes(
   plan: { fileSize: number, fileMd5: string },
   ...candidates: Array<Uint8Array | undefined>
@@ -1821,7 +1817,7 @@ async function hashMediaSource(
         offset += length
         sha1Bytes += length
         if (sha1Bytes === QQ_VIDEO_SHA1_CHECKPOINT_BYTES) {
-          // QQ expects the raw compression state, not the padded prefix digest.
+          // QQ 要求上报原始 SHA-1 内部压缩状态，而非填充后的前缀摘要。
           sha1Checkpoints.push(sha1State.stateLittleEndian().toString('hex'))
           sha1Bytes = 0
         }
@@ -1837,8 +1833,7 @@ async function hashMediaSource(
     throw new Error(`incomplete media source: expected ${source.size} bytes, streamed ${size}`)
   }
   const sha1Digest = sha1.digest('hex')
-  // The final checkpoint is always the whole-file digest; for an exact
-  // multiple of the block size it replaces the last intermediate state.
+  // 最后一个分片固定为整文件 SHA-1 摘要；文件大小恰好是分片整数倍时覆盖最后一个中间状态。
   if (sha1Checkpoints && sha1Bytes > 0) sha1Checkpoints.push(sha1Digest)
   else if (sha1Checkpoints?.length) sha1Checkpoints[sha1Checkpoints.length - 1] = sha1Digest
   return {
@@ -1992,7 +1987,6 @@ async function nativeResponseError(response: Response): Promise<string> {
   return `QQNT native media ${response.status}: ${text || response.statusText}`
 }
 
-/** Public URL of a QQ user or group avatar locator, when QQ names one. */
 export function qqAvatarUrl(locator: QQMediaLocator): string | undefined {
   const direct = httpUrl(locator.avatarUrl)
   if (direct) return direct
@@ -2022,9 +2016,7 @@ function hasDirectUrlIdentity(locator: QQMediaLocator): boolean {
   return Boolean(locator.originImageUrl || locator.fileUuid)
 }
 
-// QQ rotates its rich-media signing keys server-side. A URL cached under the
-// key's nominal TTL can start failing with these "retryable" retcodes long
-// before that TTL elapses; the only recovery is a freshly signed URL.
+// QQ 服务端会提前轮换富媒体签名密钥，未到名义 TTL 也可能返回 `-28030`，需重新申请签名 URL。
 const RETRYABLE_DIRECT_URL_RETCODE = /"retcode"\s*:\s*-28030\b/u
 
 function directUrlIdentity(locator: QQMediaLocator): string {

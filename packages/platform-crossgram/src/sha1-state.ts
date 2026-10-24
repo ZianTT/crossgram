@@ -1,11 +1,6 @@
 /**
- * Incremental SHA-1 that can expose its unpadded compression state.
- *
- * QQ video Highway uploads carry one checkpoint per 1 MiB prefix. Each
- * checkpoint is the raw SHA-1 state (h0..h4, little-endian) after that prefix,
- * not the padded digest of the prefix; only the last entry is a normal digest.
- * QQ accepts blocks with wrong checkpoints but never stores the file, so the
- * sent message later reports that the resource has expired.
+ * 支持导出未填充中间压缩状态（h0..h4 小端序）的增量 SHA-1。
+ * QQ 视频 Highway 上传要求每 1 MiB 边界上报原始 SHA-1 内部状态而非填充后的摘要，最后一个分片才上报完整摘要。
  */
 export class Sha1CompressionState {
   private readonly _state = new Uint32Array([0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0])
@@ -32,7 +27,7 @@ export class Sha1CompressionState {
     }
   }
 
-  /** The unpadded state; only valid on a 64-byte boundary. */
+  /** 导出未填充的内部状态，仅在 64 字节块边界上有效。 */
   stateLittleEndian(): Buffer {
     if (this._blockLength) throw new Error('SHA-1 state checkpoint is not aligned to a 64-byte block')
     const output = Buffer.allocUnsafe(20)

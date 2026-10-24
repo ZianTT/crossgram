@@ -3,31 +3,26 @@ import type {
   IMConversation, IMMedia, IMMediaInput, IMMessage, IMPlatform, PlatformSession,
 } from './platform.js'
 
-/** Input passed to speech-to-text providers through the Cordis waterfall. */
 export interface SpeechTranscriptionInput<TMediaLocator = unknown> {
   platform: IMPlatform<TMediaLocator>
   session: PlatformSession
   conversation?: IMConversation<TMediaLocator>
-  /** Source message when transcription was requested for an existing voice note. */
   message?: IMMessage<TMediaLocator>
   media: IMMedia<TMediaLocator>
-  /** Optional BCP-47 language hint (for example `zh-CN` or `en-US`). */
+  /** BCP-47 语言提示（如 `zh-CN`、`en-US`）。 */
   language?: string
-  /** True when this request was generated automatically for an incoming message. */
+  /** 是否为收消息时自动触发的转写请求。 */
   automatic?: boolean
   signal?: AbortSignal
 }
 
-/** Provider result. Returning `undefined` from the waterfall means unsupported. */
 export interface SpeechTranscriptionResult {
   text: string
   language?: string
   confidence?: number
-  /** Provider identifier, useful for diagnostics and Telegram feedback. */
   provider?: string
 }
 
-/** A source-platform transcript notification for an existing voice message. */
 export interface SpeechTranscriptEvent<TMediaLocator = unknown> {
   platform: IMPlatform<TMediaLocator>
   session: PlatformSession
@@ -38,28 +33,21 @@ export interface SpeechTranscriptEvent<TMediaLocator = unknown> {
   timestamp: number
 }
 
-/** Input passed to text-to-speech providers through the Cordis waterfall. */
 export interface SpeechSynthesisInput<TMediaLocator = unknown> {
   platform: IMPlatform<TMediaLocator>
   session: PlatformSession
   conversation?: IMConversation<TMediaLocator>
   text: string
   language?: string
-  /** Voice name/model requested by the caller, if any. */
   voice?: string
   signal?: AbortSignal
 }
 
-/** Provider result containing a platform-ready voice media input. */
 export interface SpeechSynthesisResult {
   media: IMMediaInput
   provider?: string
 }
 
-/**
- * Cordis speech provider waterfalls. Plugins may implement either operation
- * independently (for example QQNT native STT and a remote TTS plugin).
- */
 export class SpeechPipeline extends Service {
   constructor(ctx: Context) {
     super(ctx, 'speech')

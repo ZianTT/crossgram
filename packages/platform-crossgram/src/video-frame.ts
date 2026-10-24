@@ -1,9 +1,9 @@
 import { spawn } from 'node:child_process'
 
 export interface RemoteVideoFrame {
-  /** One display-oriented still frame encoded as JPEG. */
+  /** 已应用旋转元数据的首帧 JPEG。 */
   bytes: Uint8Array
-  /** Container duration in seconds, when ffmpeg reports one. */
+  /** 视频容器时长（秒）。 */
   duration?: number
 }
 
@@ -12,17 +12,12 @@ export type RemoteVideoFrameExtractor = (url: string, signal?: AbortSignal) => P
 const MAX_FRAME_BYTES = 32 * 1024 * 1024
 const MAX_STDERR_CHARS = 32_768
 const FRAME_TIMEOUT_MS = 30_000
-// ffmpeg's socket timeout is expressed in microseconds.
+// ffmpeg socket 超时单位为微秒。
 const SOCKET_TIMEOUT_US = '15000000'
 
 /**
- * Reads the first video frame directly from an HTTP(S) media URL.
- *
- * ffmpeg drives the demuxer over HTTP Range requests, so MP4 files whose
- * `moov` atom sits at the end still only fetch the index and the first
- * keyframe instead of the whole video. The frame keeps its original
- * resolution (after rotation metadata is applied) so the caller can recover
- * display dimensions for media the platform did not describe.
+ * 通过 HTTP Range 直接从视频 URL 抽取首帧。
+ * 即使 MP4 的 `moov` 位于文件末尾，ffmpeg 也只拉取索引与首个关键帧，并保留旋转后的原始分辨率以供调用方恢复显示宽高。
  */
 export async function extractRemoteVideoFrame(
   url: string,
@@ -46,8 +41,7 @@ export async function extractRemoteVideoFrame(
   child.stderr.on('data', (chunk: string) => {
     if (stderr.length < MAX_STDERR_CHARS) stderr += chunk.slice(0, MAX_STDERR_CHARS - stderr.length)
   })
-  // Settle on abort/timeout immediately. Waiting for `close` can hang when a
-  // launcher shim is killed while its real ffmpeg child still holds the pipes.
+  // 超时或取消时立即 reject，避免子进程句柄被孙进程继承导致等待 `close` 挂起。
   const cancelled = Promise.withResolvers<never>()
   const timeout = setTimeout(() => {
     child.kill()
@@ -81,7 +75,6 @@ export async function extractRemoteVideoFrame(
   }
 }
 
-/** Parse the input container duration from ffmpeg's banner output. */
 export function parseFfmpegDuration(stderr: string): number | undefined {
   const match = /Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/.exec(stderr)
   if (!match) return

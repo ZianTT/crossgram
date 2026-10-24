@@ -1,28 +1,14 @@
 import type { CapturedMtprotoEvent } from './types.js'
 
 /**
- * Captured events are stored as a map of chunk index to event array rather than
- * a flat array, because the chunk is the unit of eviction.
- *
- * Muon (which encodes the mutations sent to the client) can express appending
- * to an array, truncating it from the end, deleting an object key, or replacing
- * a value wholesale — but not removing from the front. A flat ring buffer
- * trimmed with `events.splice(0, overflow)` therefore degrades to a full
- * `replace` of the entire buffer on every flush once it reaches capacity, which
- * forces the client to rebuild every event object (and its reactive proxy) each
- * time. Appending to the newest chunk and `delete`-ing the oldest key keeps
- * every steady-state delta small.
+ * 按分块索引存放捕获的事件。
+ * Muon 增量同步不支持数组头部移除，扁平数组的 `splice(0, overflow)` 会退化为全量替换；
+ * 向最新分块追加并 `delete` 最旧分块键可保持每次增量最小。
  */
 export type EventChunks = Record<number, CapturedMtprotoEvent[]>
 
-/** Upper bound on a single chunk, so one eviction never discards too much history. */
 export const MAX_CHUNK_SIZE = 250
 
-/**
- * Eviction is whole-chunk, so the retained window sits within one chunk of
- * `maxEvents`. Sixteen chunks keeps that slack at ~6% while leaving evictions
- * infrequent.
- */
 export function resolveChunkSize(maxEvents: number): number {
   return Math.max(1, Math.min(MAX_CHUNK_SIZE, Math.ceil(maxEvents / 16)))
 }
@@ -43,12 +29,7 @@ export function countChunkedEvents(chunks: EventChunks): number {
   return total
 }
 
-/**
- * Append `batch` to the newest chunk (opening new chunks as needed) and evict
- * whole chunks from the front until the buffer fits `maxEvents`. Mutates
- * `chunks` in place so the caller's muon proxy observes the change. Returns how
- * many events were dropped.
- */
+/** 原地向最新分块追加 `batch`，并从头部整块淘汰直到总数不超过 `maxEvents`，返回淘汰条数。 */
 export function appendChunkedEvents(
   chunks: EventChunks,
   batch: readonly CapturedMtprotoEvent[],
@@ -72,7 +53,6 @@ export function appendChunkedEvents(
   return evictChunks(chunks, maxEvents)
 }
 
-/** Reset `chunks` in place to hold exactly `events`, preserving the object identity. */
 export function replaceChunks(
   chunks: EventChunks,
   events: readonly CapturedMtprotoEvent[],
@@ -82,7 +62,6 @@ export function replaceChunks(
   if (events.length) appendChunkedEvents(chunks, events, Number.MAX_SAFE_INTEGER, chunkSize)
 }
 
-/** Build a fresh chunk map from a flat event list. */
 export function chunkEvents(
   events: readonly CapturedMtprotoEvent[],
   chunkSize = MAX_CHUNK_SIZE,
@@ -92,7 +71,6 @@ export function chunkEvents(
   return chunks
 }
 
-/** Drop whole chunks from the front until the buffer fits. Always keeps the newest chunk. */
 function evictChunks(chunks: EventChunks, maxEvents: number): number {
   const keys = chunkKeys(chunks)
   let total = countChunkedEvents(chunks)

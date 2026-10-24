@@ -11,8 +11,8 @@ import {
 export interface SatoriExportConfig {
   platformId: string
   platform?: string
-  /** Maximum bytes read for each outbound Satori media stream. */
   maxMediaBytes?: number
+  userIdSpace?: 'uin' | 'uid'
 }
 
 const DEFAULT_MAX_MEDIA_BYTES = 8 * 1024 * 1024
@@ -40,7 +40,6 @@ interface Logger {
   warn(format: string, ...args: unknown[]): void
 }
 
-/** Exposes one provisioned bridge platform session as a Satori Bot. */
 export class SatoriExporter {
   private readonly _conversations = new Map<string, IMConversation>()
   private _bot?: SatoriExportBot
@@ -63,7 +62,7 @@ export class SatoriExporter {
     if (!this._bot) this._bot = new SatoriExportBot(
       this._ctx, this, ++this._generation, this._config.platform ?? platform.platformKind ?? session.platformId,
     )
-    const selfId = typeof session.metadata.qq === 'string' && session.metadata.qq ? session.metadata.qq : session.userId
+    const selfId = this._numericUserIds && typeof session.metadata.qq === 'string' && session.metadata.qq ? session.metadata.qq : session.userId
     this._bot.user = { id: selfId, name: selfId }
     this._bot.online()
   }
@@ -87,6 +86,11 @@ export class SatoriExporter {
     return this._bot?.generation === generation && this._generation === generation
   }
 
+  /** 导出的用户 ID 是否优先使用数字 QQ 号（uin），而非不透明的 NT UID。 */
+  private get _numericUserIds(): boolean {
+    return this._config.userIdSpace !== 'uid'
+  }
+
   handleMessage(
     session: PlatformSession,
     conversation: IMConversation,
@@ -106,10 +110,10 @@ export class SatoriExporter {
     this._queue = this._queue.then(async () => {
       const elements = await this._messageElements(message, conversation, platform, canonical)
       if (!this.isActive(bot, generation) || this._session !== canonical) return
-      if (!elements.length) return // system messages with no renderable text stay silent
+      if (!elements.length) return
       const avatar = await this._avatarUrl(message.sender, platform, canonical)
       if (!this.isActive(bot, generation) || this._session !== canonical) return
-      const user = satoriMessageUser(message, avatar)
+      const user = satoriMessageUser(message, avatar, this._numericUserIds)
       const member = conversation.kind === 'direct' ? undefined : satoriMessageMember(message, user)
       bot.dispatch(bot.session({
         type: 'message-created',
@@ -211,7 +215,7 @@ export class SatoriExporter {
     if (!this.isActive(bot, generation) || this._platform !== platform || this._session !== session) {
       throw new Error('Satori exporter bot is no longer active')
     }
-    return satoriGuildMember(member, avatar)
+    return satoriGuildMember(member, avatar, this._numericUserIds)
   }
 
   async sendMessage(
@@ -247,7 +251,7 @@ export class SatoriExporter {
     const outgoing = { ...message, conversationId: conversation.id, outgoing: true }
     await this._ctx.imPlatform.ingestLocalMessage(session, conversation, outgoing)
     const elements = (await this._messageElements(outgoing, conversation, platform, session)).join('')
-    const user = satoriUser(message.senderId, message.sender, await this._avatarUrl(message.sender, platform, session))
+    const user = satoriUser(message.senderId, message.sender, await this._avatarUrl(message.sender, platform, session), this._numericUserIds)
     return [{
       id: outgoing.id,
       content: elements,
@@ -271,12 +275,7 @@ export class SatoriExporter {
     return await this._listedMessage(message, conversation, platform, session)
   }
 
-  /**
-   * Pages through upstream history for `message.list`.
-   *
-   * The pagination token is a platform message ID. `before`/`after` exclude
-   * the anchor itself; `around` includes it when the platform can look it up.
-   */
+  /** 分页查询历史消息：游标为平台消息 ID，`before`/`after` 不含锚点本身，`around` 尽量包含锚点。 */
   async getMessageList(
     bot: SatoriExportBot,
     generation: number,
@@ -301,10 +300,7 @@ export class SatoriExporter {
       }
       return page
     }
-    // Platforms drop gray tips and recalls after paging, so a short page does
-    // not mean the end. Only an empty upstream page does, as with Discord.
-    // QQ's first-screen APIs may also ignore the requested count, so every
-    // side is trimmed to the messages nearest its anchor.
+    // 平台侧会在分页后过滤灰条和撤回消息，且 QQ 首屏可能返回超出请求条数的消息，因此按靠近锚点的方向截断到 `count`。
 
     let messages: IMMessage[]
     let prev: string | undefined
@@ -374,7 +370,6 @@ export class SatoriExporter {
     return conversation
   }
 
-  /** One unrenderable history item degrades to its text instead of failing the whole page. */
   private async _listedMessage(
     message: IMMessage,
     conversation: IMConversation,
@@ -389,9 +384,9 @@ export class SatoriExporter {
         'Satori history message render degraded conversation=%s message=%s error=%s',
         conversation.id, message.id, formatError(error),
       )
-      elements = message.content.parts.flatMap((part) => part.type === 'text' ? textElements(part) : [h.text(`[${part.type}]`)])
+      elements = message.content.parts.flatMap((part) => part.type === 'text' ? textElements(part, this._numericUserIds) : [h.text(`[${part.type}]`)])
     }
-    const user = satoriMessageUser(message, await this._avatarUrl(message.sender, platform, session))
+    const user = satoriMessageUser(message, await this._avatarUrl(message.sender, platform, session), this._numericUserIds)
     const member = conversation.kind === 'direct' ? undefined : satoriMessageMember(message, user)
     return {
       id: message.id,
@@ -404,7 +399,6 @@ export class SatoriExporter {
     }
   }
 
-  /** A missing avatar never holds back the message or member it decorates. */
   private async _avatarUrl(
     user: Pick<IMUser, 'id' | 'avatar'> | undefined,
     platform: IMPlatform,
@@ -431,7 +425,7 @@ export class SatoriExporter {
     if (serviceText) output.push(h.text(serviceText))
     for (const part of message.content.parts) {
       if (part.type === 'text') {
-        output.push(...textElements(part))
+        output.push(...textElements(part, this._numericUserIds))
       } else if (part.type === 'media') {
         const url = await platform.resolveMediaUrl?.(session, part.media)
         if (!url) throw new Error(`Satori exporter cannot resolve media URL: ${part.media.id}`)
@@ -631,7 +625,7 @@ function mediaSource(ctx: Context, src: string, size: number | undefined, maxByt
       } catch {
         throw new Error('unsupported media source')
       }
-      // ponytail: IP-literal hosts are always refused (SSRF/NAT64 loopback bypass); relax to a blocklist if direct-IP media beds ever matter
+      // 拒绝 IP 字面量主机名以防 SSRF / NAT64 回环绕过。
       if (url.protocol !== 'https:' || isIP(url.hostname.replace(/^\[|\]$/gu, ''))) {
         throw new Error('unsupported media source')
       }
@@ -809,14 +803,14 @@ function stableJsonStringify(value: JsonValue): string {
   return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJsonStringify(value[key]!)}`).join(',')}}`
 }
 
-function textElements(part: Extract<IMMessagePart, { type: 'text' }>): h[] {
+function textElements(part: Extract<IMMessagePart, { type: 'text' }>, numeric = true): h[] {
   const output: h[] = []
   let offset = 0
   for (const entity of [...(part.entities ?? [])].sort((left, right) => left.offset - right.offset)) {
     if (entity.offset < offset || entity.offset > part.text.length) continue
     if (entity.offset > offset) output.push(h.text(part.text.slice(offset, entity.offset)))
     const value = part.text.slice(entity.offset, entity.offset + entity.length)
-    if (entity.type === 'mention') output.push(h.at(entity.numericId ?? entity.userId, { name: value.replace(/^@/u, '') }))
+    if (entity.type === 'mention') output.push(h.at(numeric ? entity.numericId ?? entity.userId : entity.userId, { name: value.replace(/^@/u, '') }))
     else if (entity.type === 'custom-emoji') output.push(h.emoji(entity.definition.key, { name: value }))
     else output.push(h.text(value))
     offset = entity.offset + entity.length
@@ -825,7 +819,6 @@ function textElements(part: Extract<IMMessagePart, { type: 'text' }>): h[] {
   return output.length ? output : [h.text(part.text)]
 }
 
-/** Oldest first, without duplicates or the pagination anchor itself. */
 function chronological(messages: readonly IMMessage[], excludeId?: string): IMMessage[] {
   const unique = new Map<string, IMMessage>()
   for (const message of messages) if (message.id !== excludeId) unique.set(message.id, message)
@@ -843,35 +836,28 @@ function satoriGuild(conversation: IMConversation): Universal.Guild {
   return { id: conversation.spaceId ?? conversation.id, name: conversation.title }
 }
 
-/** Prefer the numeric QQ account (user.metadata.qq) over the opaque NT UID. */
-function satoriUser(id: string, user: IMMessage['sender'], avatar?: string): Universal.User {
+/** 优先使用数字 QQ 号（`user.metadata.qq`）作为用户 ID，而非不透明的 NT UID。 */
+function satoriUser(id: string, user: IMMessage['sender'], avatar?: string, numeric = true): Universal.User {
   const numericId = typeof user?.metadata?.qq === 'string' && user.metadata.qq ? user.metadata.qq : undefined
-  const userId = numericId ?? id
+  const userId = numeric ? numericId ?? id : id
   const name = user ? [user.firstName, user.lastName].filter(Boolean).join(' ') || userId : userId
   return { id: userId, name, nick: name, ...(avatar ? { avatar } : {}), ...(user?.metadata?.bot === true ? { isBot: true } : {}) }
 }
 
-/** System messages whose only sender is the platform placeholder get an explicit label. */
-function satoriMessageUser(message: IMMessage, avatar?: string): Universal.User {
+function satoriMessageUser(message: IMMessage, avatar?: string, numeric = true): Universal.User {
   if (message.content.serviceAction && (!message.senderId || message.senderId === '0')) {
     return { id: message.senderId || '0', name: '系统消息', nick: '系统消息' }
   }
-  return satoriUser(message.senderId, message.sender, avatar)
+  return satoriUser(message.senderId, message.sender, avatar, numeric)
 }
 
-/**
- * The sender as a member of a group conversation.
- *
- * Its name is the group card when the sender set one, and the global name
- * otherwise, which is what `session.author.nickname` reads.
- */
 function satoriMessageMember(message: IMMessage, user: Universal.User): Universal.GuildMember {
   const name = message.senderTitle?.trim() || user.nick || user.name || user.id
   return { name, nick: name, ...(user.avatar ? { avatar: user.avatar } : {}) }
 }
 
-function satoriGuildMember(member: IMConversationMember, avatar?: string): Universal.GuildMember {
-  const user = satoriUser(member.user.id, member.user, avatar)
+function satoriGuildMember(member: IMConversationMember, avatar?: string, numeric = true): Universal.GuildMember {
+  const user = satoriUser(member.user.id, member.user, avatar, numeric)
   const name = member.title?.trim() || user.nick!
   return {
     user,

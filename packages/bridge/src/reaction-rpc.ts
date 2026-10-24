@@ -4,7 +4,8 @@ import Long from 'long'
 import { RpcError } from '@mtproto-relay/mtproto'
 import { stableId } from './dialogs.js'
 import type {
-  IMDirectDownload, IMMessage, IMPlatform, IMReactionContext, IMReactionDefinition, IMReactionResource, PlatformSession,
+  IMDirectDownload, IMMessage, IMPlatform, IMReactionContext, IMReactionDefinition, IMReactionResource,
+  PlatformSession,
 } from './platform.js'
 
 const CATALOG_VERSION = 2
@@ -17,26 +18,18 @@ interface CustomEntry {
 interface RecentReaction {
   reactionType: 'emoji' | 'custom'
   reactionValue: string
-  /** Platform key of a custom reaction; survives the document id changing with the asset version. */
+  /** 自定义表情的平台 key；资源版本升级导致 documentId 变更时用于关联到当前版本。 */
   definitionKey?: string | null
   lastUsedAt: Date
 }
 
 export class ReactionRpc {
   private readonly _custom = new Map<number, CustomEntry>()
-  /**
-   * Documents published under a retired identity.
-   *
-   * The live update path keyed an inline custom emoji document by the
-   * conversation as well, so every cached message carried a per-conversation
-   * id. Keep those ids resolvable next to the canonical one, otherwise a client
-   * that already rendered such a message can never fetch its document or bytes.
-   */
+  /** 兼容旧版按会话维度生成的行内自定义表情 documentId，确保客户端已缓存的旧消息仍能拉取资源。 */
   private readonly _aliases = new Map<number, CustomEntry>()
   private readonly _memoryRecent = new Map<string, RecentReaction>()
-  /** Current published document id of every custom key seen in a platform catalog. */
   private readonly _currentByKey = new Map<string, number>()
-  private _recentWrite = Promise.resolve()
+  private _recentWrite = Promise.resolve<unknown>(undefined)
 
   constructor(
     private readonly _platform: IMPlatform,
@@ -58,18 +51,43 @@ export class ReactionRpc {
     return makeReactionList(await this._recentReactions(limit))
   }
 
-  markUsed(conversationId: string, definitions: readonly IMReactionDefinition[]): Promise<void> {
-    if (!definitions.length) return Promise.resolve()
+  /**
+   * 记录一次回应使用。
+   *
+   * `append` 对应 `messages.sendReaction` 的 `add_to_recent`：客户端只在用户从回应面板里
+   * 主动挑选时置位。没置位时（双击快速回应、气泡内联条等）只刷新列表里已有的记录，
+   * 不把新的回应塞进去，避免最近使用被随手一点的默认回应刷满。
+   * @returns 是否改动了列表，调用方据此决定要不要推送 `updateRecentReactions`。
+   */
+  markUsed(
+    conversationId: string,
+    definitions: readonly IMReactionDefinition[],
+    options: { append?: boolean } = {},
+  ): Promise<boolean> {
+    if (!definitions.length) return Promise.resolve(false)
+    const append = options.append ?? true
     const write = this._recentWrite.then(async () => {
-      const reactions = definitions.map((definition) => this.toTlReaction(conversationId, definition))
       const existing = await this._recentRows()
-      let timestamp = Math.max(Date.now(), ...existing.map((row) => row.lastUsedAt.getTime() + 1))
-      for (const [index, reaction] of reactions.entries()) {
-        const definition = definitions[index]!
-        const recent = serializeReaction(
-          reaction, new Date(timestamp++),
-          definition.presentation.type === 'custom' ? definition.key : undefined,
-        )
+      const trackedValues = new Set(existing.map((row) => `${row.reactionType}\u0000${row.reactionValue}`))
+      const trackedKeys = new Set(existing.flatMap((row) => (row.definitionKey ? [row.definitionKey] : [])))
+      const pending = definitions.map((definition) => ({
+        definition,
+        reaction: this.toTlReaction(conversationId, definition),
+      })).filter(({ definition, reaction }) => {
+        if (append) return true
+        if (trackedKeys.has(definition.key)) return true
+        return reaction._ === 'reactionEmoji'
+          ? trackedValues.has(`emoji\u0000${reaction.emoticon}`)
+          : reaction._ === 'reactionCustomEmoji'
+            && trackedValues.has(`custom\u0000${reaction.documentId.toString()}`)
+      })
+      if (!pending.length) return false
+      let timestamp = existing.reduce(
+        (latest, row) => Math.max(latest, new Date(row.lastUsedAt).getTime() + 1),
+        Date.now(),
+      )
+      for (const { definition, reaction } of pending) {
+        const recent = serializeReaction(reaction, new Date(timestamp++), definition)
         if (this._database) {
           await this._database.upsert('mtproto_reaction_recent', [{
             platformSessionId: this._session.platformSessionId,
@@ -79,6 +97,7 @@ export class ReactionRpc {
           this._memoryRecent.set(reactionKey(reaction), recent)
         }
       }
+      return true
     })
     this._recentWrite = write.catch(() => {})
     return write
@@ -96,14 +115,11 @@ export class ReactionRpc {
   }
 
   /**
-   * Recent reactions the client can still render.
+   * 获取客户端可渲染的最近使用回应。
    *
-   * A custom reaction is stored by document id, and that id changes whenever
-   * the platform re-versions the asset. Telegram Desktop keeps a placeholder
-   * forever for a recent custom emoji that `getCustomEmojiDocuments` cannot
-   * resolve, so once this session knows its platform catalog, replace an id
-   * that is no longer published with its key's current document and drop the
-   * entry when the key itself left the catalog.
+   * 自定义回应的 documentId 会随资源版本变化。解析顺序是：会话目录里出现过的 key 用当前版本；
+   * 否则退回记录自带的历史定义（新设备、服务重启后还没有任何会话目录）；
+   * 两者都没有时，目录已知就说明这个回应已经下架，跳过；目录未知则保留原始 id 交给客户端缓存处理。
    */
   private async _recentReactions(limit: number): Promise<tl.TypeReaction[]> {
     if (limit <= 0) return []
@@ -111,6 +127,7 @@ export class ReactionRpc {
     const rows = await this._recentRows()
     const catalogKnown = this._currentByKey.size > 0
     const seen = new Set<string>()
+    const seenKeys = new Set<string>()
     const reactions: tl.TypeReaction[] = []
     for (const row of rows) {
       if (reactions.length >= limit) break
@@ -118,9 +135,13 @@ export class ReactionRpc {
       if (row.reactionType === 'emoji') {
         reaction = { _: 'reactionEmoji', emoticon: row.reactionValue }
       } else {
-        const id = Number(row.reactionValue)
-        const resolved = catalogKnown ? this._currentDocumentId(id, row.definitionKey) : id
+        const resolved = this._recentDocumentId(row, catalogKnown)
         if (resolved === undefined) continue
+        // 同一个 key 的不同资源版本会留下多行，按最近时间保留一条。
+        if (row.definitionKey) {
+          if (seenKeys.has(row.definitionKey)) continue
+          seenKeys.add(row.definitionKey)
+        }
         reaction = { _: 'reactionCustomEmoji', documentId: Long.fromNumber(resolved) }
       }
       const key = reactionKey(reaction)
@@ -131,7 +152,24 @@ export class ReactionRpc {
     return reactions
   }
 
-  /** The published document for a recent id, following a retired id to its key's current version. */
+  private _recentDocumentId(row: RecentReaction, catalogKnown: boolean): number | undefined {
+    const id = Number(row.reactionValue)
+    if (catalogKnown) {
+      const current = this._currentDocumentId(id, row.definitionKey)
+      if (current !== undefined) return current
+    }
+    if (this._custom.has(id)) return id
+    return catalogKnown ? undefined : id
+  }
+
+  /** 把定义登记为可渲染的自定义表情，返回它对应的 documentId。 */
+  private _remember(definition: IMReactionDefinition): number | undefined {
+    if (definition.presentation.type !== 'custom') return undefined
+    const id = this.customDocumentId(definition)
+    this._custom.set(id, { definition: definition as CustomEntry['definition'] })
+    return id
+  }
+
   private _currentDocumentId(id: number, definitionKey?: string | null): number | undefined {
     const key = definitionKey ?? this._entry(id)?.definition.key
     if (key !== undefined) return this._currentByKey.get(key)
@@ -152,20 +190,9 @@ export class ReactionRpc {
   }
 
   registerContext(_conversationId: string, context?: IMReactionContext): void {
-    for (const definition of context?.available ?? []) {
-      if (definition.presentation.type !== 'custom') continue
-      this._custom.set(this.customDocumentId(definition), {
-        definition: definition as CustomEntry['definition'],
-      })
-    }
+    for (const definition of context?.available ?? []) this._remember(definition)
   }
 
-  /**
-   * Record the platform's current catalog of a conversation.
-   *
-   * Only a catalog decides which version of a key is current: a message may
-   * still carry the definition it was reacted with before a re-version.
-   */
   private _registerCatalog(conversationId: string, context?: IMReactionContext): void {
     this.registerContext(conversationId, context)
     for (const definition of context?.available ?? []) {
@@ -174,14 +201,7 @@ export class ReactionRpc {
     }
   }
 
-  /**
-   * Register the document an inline custom emoji entity points at and return
-   * its canonical id.
-   *
-   * Both identities stay resolvable: the canonical id is what every projection
-   * and lookup uses, and the legacy per-conversation id keeps messages a client
-   * cached while the update path still emitted it renderable.
-   */
+  /** 注册行内自定义表情并返回规范 documentId，同时保留旧版按会话计算的别名 ID。 */
   registerInlineCustomEmoji(
     conversationId: string,
     definition: IMReactionDefinition,
@@ -197,7 +217,6 @@ export class ReactionRpc {
     return id
   }
 
-  /** A document this session published, by canonical or retired id. */
   private _entry(id: number): CustomEntry | undefined {
     return this._custom.get(id) ?? this._aliases.get(id)
   }
@@ -278,10 +297,7 @@ export class ReactionRpc {
       return false
     })
     if (found) return found
-    // A client keeps handing back the document id of a definition it cached
-    // before the relay re-keyed it (a changed asset version). Translate that
-    // retired id into the key it belonged to and use the current definition,
-    // so a recent reaction keeps working instead of failing as invalid.
+    // 客户端可能传入旧版本资源的 documentId，通过平台 key 映射回当前版本的定义。
     if (reaction._ === 'reactionCustomEmoji') {
       const retired = this._entry(reaction.documentId.toNumber())?.definition
       const current = retired && context.available.find((definition) => definition.key === retired.key)
@@ -417,12 +433,7 @@ export function customReactionDocumentId(
   ].join(':'))
 }
 
-/**
- * Document id the live update path used to publish for an inline custom emoji
- * before it shared the canonical identity with the history path: it mixed the
- * conversation id into the key and used the first catalog version. Clients keep
- * asking for it for messages they cached back then.
- */
+/** 旧版实时推送路径生成的行内自定义表情 documentId（含 conversationId，使用 v1 版本号）。 */
 export function legacyInlineCustomEmojiDocumentId(
   platformSessionId: string,
   conversationId: string,
@@ -444,15 +455,15 @@ function reactionKey(reaction: tl.TypeReaction): string {
 function serializeReaction(
   reaction: tl.TypeReaction,
   lastUsedAt: Date,
-  definitionKey?: string,
+  definition: IMReactionDefinition,
 ): RecentReaction {
   if (reaction._ === 'reactionEmoji') {
-    return { reactionType: 'emoji', reactionValue: reaction.emoticon, lastUsedAt }
+    return { reactionType: 'emoji', reactionValue: reaction.emoticon, definitionKey: null, lastUsedAt }
   }
   if (reaction._ === 'reactionCustomEmoji') {
     return {
       reactionType: 'custom', reactionValue: reaction.documentId.toString(),
-      definitionKey: definitionKey ?? null, lastUsedAt,
+      definitionKey: definition.key, lastUsedAt,
     }
   }
   throw new RpcError(400, 'REACTION_INVALID')

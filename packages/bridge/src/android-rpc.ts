@@ -4,12 +4,7 @@ import Long from 'long'
 
 type AndroidRpcHandler = (request: tl.RpcMethod) => RpcResult
 
-/**
- * Optional resources requested by Telegram Android after login or while a chat
- * is open. The bridge has no Telegram premium, gifts, stories, saved messages,
- * or read-receipt backend, so these handlers expose valid empty layer-228
- * responses instead of making the client retry METHOD_NOT_IMPLEMENTED errors.
- */
+/** Telegram Android 登录后及会话内请求的可选资源；返回 layer 228 合法空响应，避免客户端重试 `METHOD_NOT_IMPLEMENTED`。 */
 export const androidRpcHandlers: Readonly<Record<string, AndroidRpcHandler>> = {
   'account.getAutoDownloadSettings': () => makeAutoDownloadSettings(),
   'account.getDefaultProfilePhotoEmojis': () => ({
@@ -98,9 +93,6 @@ export const androidRpcHandlers: Readonly<Record<string, AndroidRpcHandler>> = {
   'messages.getSavedDialogs': () => ({
     _: 'messages.savedDialogs', dialogs: [], messages: [], chats: [], users: [],
   } as unknown as tl.TlObject),
-  'messages.getSearchResultsPositions': () => ({
-    _: 'messages.searchResultsPositions', count: 0, positions: [],
-  } as unknown as tl.TlObject),
   'messages.getSponsoredMessages': () => ({
     _: 'messages.sponsoredMessagesEmpty',
   } as unknown as tl.TlObject),
@@ -151,7 +143,7 @@ export const androidRpcHandlers: Readonly<Record<string, AndroidRpcHandler>> = {
   } as unknown as tl.TlObject),
 }
 
-/** Telegram Android's own fallback presets, returned in layer-228 wire shape. */
+/** Telegram Android 内置的自动下载预设（layer 228 结构）。 */
 function makeAutoDownloadSettings(): tl.account.RawAutoDownloadSettings {
   return {
     _: 'account.autoDownloadSettings',

@@ -21,9 +21,8 @@ export interface UploadedFile {
 export interface StagedMedia {
   media: IMMediaInput
   upload: UploadedFile
-  /** Telegram `upload.file.mtime` and photo/document `date`, in seconds. */
+  /** 秒级时间戳（对应 Telegram `upload.file.mtime` 及 photo/document `date`）。 */
   timestamp: number
-  /** Last stage or part accepted, in milliseconds, for abandoned-upload sweeps. */
   updatedAt: number
 }
 
@@ -41,28 +40,23 @@ interface PreparedUpload {
   sha1: ReturnType<typeof createHash>
   file10MMd5: ReturnType<typeof createHash>
   file10MBytes: number
-  /** Last part accepted, so an abandoned stream can be told from a slow one. */
   updatedAt: number
   tail: Promise<void>
   failed?: unknown
 }
 
-/** Result of one abandoned-upload sweep, for logging and tests. */
 export interface UploadSweepResult {
   staged: number
   prepared: number
   directories: number
 }
 
-/**
- * How long an upload may sit without progress before it is treated as
- * abandoned. A client sends the media it staged within seconds; the generous
- * hour only exists so a slow legacy part upload (whose directory mtime is
- * refreshed by every part) is never cut off mid-transfer.
- */
+export type UploadKeepPredicate = (platformSessionId: string, fileId: string) => boolean
+
+/** 上传无进展的过期清理阈值（慢速分片上传每次收到分片都会刷新 mtime）。 */
 export const UPLOAD_ABANDONED_TTL_MS = 60 * 60 * 1_000
 
-/** Telegram uploads: prepared native sinks stay in memory; legacy clients use disk-backed parts. */
+/** 管理 Telegram 文件上传：原生直传 sink 保存在内存中，传统分片上传落盘存储。 */
 export class UploadManager {
   private readonly _staged = new Map<string, StagedMedia>()
   private readonly _prepared = new Map<string, PreparedUpload>()
@@ -136,8 +130,6 @@ export class UploadManager {
       native: true,
       cleanup: async () => {},
     }
-    // `timestamp` is the Telegram mtime in seconds; a prepared stage used to
-    // publish milliseconds here, which reached clients as a year-56000 date.
     const staged: StagedMedia = {
       media, upload, timestamp: Math.floor(Date.now() / 1000), updatedAt: Date.now(),
     }
@@ -197,41 +189,36 @@ export class UploadManager {
   }
 
   /**
-   * Release uploads nobody finished.
-   *
-   * Only a send reaches `complete()`, and `remove()` has no caller on the
-   * abandonment paths, so a client that stages media and never sends it leaves
-   * its `StagedMedia` entry behind, a prepared upload whose client disconnected
-   * keeps a sink plus up to `MAX_PREPARED_OUT_OF_ORDER_BYTES` of parts, and a
-   * legacy part upload that was abandoned leaves the directory `savePart()`
-   * wrote. Production had accumulated 920 MiB of those directories over two
-   * months before this sweep existed.
-   *
-   * A directory is kept while a surviving entry still owns it, and the ones
-   * without any owner are judged by their own mtime: a legacy upload in flight
-   * has no entry at all, but every accepted part refreshes that mtime.
+   * 清理超时未完成的上传记录与临时分片目录。
+   * 传统分片上传进行中尚无内存记录，但每次写入分片都会刷新目录 mtime；`keep` 回调可用于豁免未发送草稿仍在引用的文件。
    */
-  async sweep(maxIdleMs: number, now = Date.now()): Promise<UploadSweepResult> {
+  async sweep(
+    maxIdleMs: number,
+    now = Date.now(),
+    options: { keep?: UploadKeepPredicate } = {},
+  ): Promise<UploadSweepResult> {
     if (!Number.isFinite(maxIdleMs) || maxIdleMs < 0) {
       throw new RangeError('maxIdleMs must be a non-negative finite number')
     }
     const cutoff = now - maxIdleMs
+    const keep = options.keep
     let staged = 0
     let prepared = 0
     let directories = 0
 
     for (const [key, entry] of [...this._staged]) {
       if (entry.updatedAt >= cutoff) continue
+      if (keep?.(entry.upload.platformSessionId, entry.upload.fileId)) continue
       this._staged.delete(key)
       staged++
     }
     for (const [key, entry] of [...this._prepared]) {
       if (entry.updatedAt >= cutoff) continue
+      if (keep?.(entry.platformSessionId, entry.fileId)) continue
       this._prepared.delete(key)
       try {
         await entry.sink.abort(new Error('upload abandoned'))
       } catch {
-        // An already-broken sink must not keep the entry alive.
       }
       prepared++
     }

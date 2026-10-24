@@ -11,29 +11,25 @@ export class AuthKeyStorePublishedError extends Error {
 }
 
 export interface StoredAuthKey {
-  /** The 256-byte MTProto auth key. */
+  /** 256 字节 MTProto auth key */
   key: Uint8Array
-  /** Present for a temporary PFS key and points at its permanent identity. */
+  /** 临时 PFS key 所绑定的永久 auth_key_id */
   permanentKeyId?: Uint8Array
-  /** Unix timestamp after which a temporary key must be rejected. */
+  /** 临时 key 的过期 Unix 时间戳（秒） */
   expiresAt?: number
-  /** Last API layer negotiated by the permanent key. */
+  /** 永久 key 最近一次协商的 API layer */
   apiLayer?: number
 }
 
-/** Persistent store for permanent keys and their bound temporary PFS keys. */
 export interface AuthKeyStore {
-  /** Look up an auth key by its 8-byte id. */
   get(id: Uint8Array): Promise<StoredAuthKey | undefined> | StoredAuthKey | undefined
-  /** Persist a permanent key or temporary key association under its 8-byte id. */
   save(id: Uint8Array, record: StoredAuthKey): Promise<void> | void
-  /** Write a durable fail-closed marker before a permanent key is revoked. */
+  /** 在吊销永久 key 前写入持久化 tombstone，防止并发连接或崩溃恢复时重新启用旧 key */
   beginRevocation(id: Uint8Array): Promise<void> | void
-  /** Remove revoked key material, then clear its marker only after that succeeds. */
+  /** 清理被吊销的 key 及其绑定的临时 key，完成后移除 tombstone */
   finishRevocation(id: Uint8Array): Promise<boolean> | boolean
-  /** Complete any revocations that survived a process restart. */
+  /** 完成进程重启前未走完的吊销流程 */
   recoverPendingRevocations(): Promise<void> | void
-  /** Revoke a permanent key and every temporary key bound to it. */
   delete(id: Uint8Array): Promise<boolean> | boolean
 }
 
@@ -49,7 +45,6 @@ function fromHex(s: string): Uint8Array {
   return u
 }
 
-/** In-memory store — survives across connections within one process, not restarts. */
 export class MemoryAuthKeyStore implements AuthKeyStore {
   private _keys = new Map<string, StoredAuthKey>()
   private _revoked = new Set<string>()
@@ -117,7 +112,6 @@ interface SerializedAuthKeyEnvelope {
   revoked: string[]
 }
 
-/** Injectable synchronous filesystem boundary for deterministic persistence-failure tests. */
 export interface FileAuthKeyStoreFileSystem {
   readFileSync: typeof readFileSync
   writeFileSync: typeof writeFileSync
@@ -151,10 +145,7 @@ function isEnvelope(value: unknown): value is SerializedAuthKeyEnvelope {
     && Array.isArray((value as { revoked?: unknown }).revoked))
 }
 
-/**
- * JSON-file-backed store — survives server restarts. The whole snapshot is
- * written through a temporary file before replacing in-memory state.
- */
+/** 基于 JSON 文件的持久化存储，通过临时文件原子替换落盘后再更新内存状态 */
 export class FileAuthKeyStore implements AuthKeyStore {
   private _keys = new Map<string, SerializedAuthKey>()
   private _revoked = new Set<string>()
@@ -175,13 +166,12 @@ export class FileAuthKeyStore implements AuthKeyStore {
         ? raw.keys
         : raw as Record<string, string | SerializedAuthKey>
       for (const [id, value] of Object.entries(keys)) {
-        // Files written before temporary-key support stored the key as a bare
-        // hex string. Treat those entries as permanent keys during migration.
+        // 兼容旧版直接将永久 key 存为裸 hex 字符串的格式
         this._keys.set(id, typeof value === 'string' ? { key: value } : value)
       }
       if (isEnvelope(raw)) this._revoked = new Set(raw.revoked)
     } catch {
-      // A corrupt main snapshot contains no trusted key material.
+      // 主快照损坏时忽略
     }
     if (this._platform === 'win32') this._loadWindowsJournal()
   }
@@ -246,7 +236,7 @@ export class FileAuthKeyStore implements AuthKeyStore {
         deleted = true
       }
     }
-    // Keep the tombstone through the durable key-material purge.
+    // 先在保留 tombstone 的前提下把删除后的 key 列表落盘，再清理 tombstone
     this._commit(keys, new Set(this._revoked))
     if (this._platform === 'win32') {
       this._appendWindowsJournal('done', idHex)
@@ -357,10 +347,7 @@ export class FileAuthKeyStore implements AuthKeyStore {
   }
 
   private _syncPath(path: string): void {
-    // Windows rejects FlushFileBuffers/fsync for handles opened without write
-    // access (Node 24 surfaces this as EPERM). The temporary snapshot is ours,
-    // so open it read/write there while retaining the least-privilege read-only
-    // directory/file handle used by POSIX.
+    // Windows 下对只读句柄调用 FlushFileBuffers/fsync 会报 EPERM，需以 r+ 打开临时文件
     const fd = this._fs.openSync(path, this._platform === 'win32' ? 'r+' : 'r')
     try {
       this._fs.fsyncSync(fd)

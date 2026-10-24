@@ -12,7 +12,6 @@ export interface WebhookRequestOptions {
   headers: Record<string, string | number>
 }
 
-/** Small test seam: resolution and the already-pinned HTTPS request. */
 export interface WebhookTransport {
   resolve(hostname: string): Promise<string[]>
   request(options: WebhookRequestOptions, body: string): Promise<number>
@@ -58,14 +57,13 @@ const nodeWebhookTransport: WebhookTransport = {
   },
 }
 
-/** Deliver directly to an audited public address; never consult proxy environment variables. */
+/** 直连已校验的公网地址投递 webhook，忽略系统代理环境变量。 */
 export async function postPublicWebhook(url: URL, body: string, secretToken?: string, transport = nodeWebhookTransport): Promise<void> {
   if (url.protocol !== 'https:' || url.username || url.password) throw new Error('webhook url must use HTTPS')
   const hostname = hostnameForResolution(url.hostname)
   const addresses = await resolvePublicAddresses(hostname, transport.resolve)
   const statusCode = await transport.request({
-    // Use the audited address for the TCP connection, but retain the hostname for
-    // TLS SNI and the default TLS hostname/certificate verification.
+    // TCP 直连已校验的公网 IP，保留原域名用于 TLS SNI 与证书主机名校验。
     hostname: addresses[0],
     servername: hostname,
     port: Number(url.port) || 443,
@@ -77,7 +75,6 @@ export async function postPublicWebhook(url: URL, body: string, secretToken?: st
       ...(secretToken ? { 'x-telegram-bot-api-secret-token': secretToken } : {}),
     },
   }, body)
-  // node:https never follows redirects. Treat every one as an unsuccessful delivery.
   if (statusCode < 200 || statusCode >= 300) throw new Error(`webhook returned HTTP ${statusCode}`)
 }
 

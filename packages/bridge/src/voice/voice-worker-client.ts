@@ -33,7 +33,6 @@ export interface VoiceWorkerEndpoint {
   readonly peerTag: Uint8Array
 }
 
-/** One WebRTC ICE server shared with both native tgcalls peers. */
 export interface VoiceWorkerRtcServer {
   readonly id: number
   readonly host: string
@@ -44,7 +43,6 @@ export interface VoiceWorkerRtcServer {
   readonly tcp: boolean
 }
 
-/** Public relay settings copied into the worker only with its private auth key. */
 export interface VoiceWorkerMediaStartConfig {
   readonly initializationTimeoutMs: number
   readonly receiveTimeoutMs: number
@@ -66,7 +64,6 @@ export interface VoiceWorkerSocketClientOptions {
   readonly socketPath: string
   readonly timeoutMs?: number
   readonly onEvent?: (call: VoiceWorkerCall, event: VoiceWorkerEvent) => Promise<void> | void
-  /** Redacted lifecycle diagnostics; never includes call IDs, capabilities, or media. */
   readonly onDiagnostic?: (phase: VoiceWorkerDiagnosticPhase, code: string) => void
 }
 
@@ -109,7 +106,6 @@ class VoiceWorkerTransportError extends Error {
   }
 }
 
-/** Encodes one complete IPC v3 request frame for a local voice worker. */
 export function encodeVoiceWorkerRequest(request: VoiceWorkerIpcRequest): Buffer {
   const payload: Buffer[] = [Buffer.from([VOICE_WORKER_PROTOCOL_VERSION, request.tag])]
   payload.push(u64(request.callId))
@@ -144,7 +140,6 @@ export function encodeVoiceWorkerRequest(request: VoiceWorkerIpcRequest): Buffer
   return frame(Buffer.concat(payload))
 }
 
-/** Decodes exactly one IPC v3 response payload after its length prefix. */
 export function decodeVoiceWorkerResponse(payload: Uint8Array): VoiceWorkerIpcResponse {
   if (payload.length < 2 || payload.length > VOICE_WORKER_MAX_FRAME_BYTES
     || payload[0] !== VOICE_WORKER_PROTOCOL_VERSION) throw unavailable()
@@ -192,14 +187,8 @@ export function decodeVoiceWorkerResponse(payload: Uint8Array): VoiceWorkerIpcRe
   return response
 }
 
-/**
- * Minimal production adapter for the Rust worker's local IPC v3 protocol.
- * It owns no worker process or media backend; every operation uses a fresh
- * Unix connection so a restarted worker can be reached by the same instance.
- */
+/** Rust 语音 worker 的本地 IPC v3 客户端（每次请求建立独立短连接，兼容 worker 重启）。 */
 export class VoiceWorkerSocketClient implements VoiceWorkerClient {
-  // The pinned native adapter registers InstanceImpl and starts ProtocolVersion::V1.
-  // Its upstream source advertises version 5.0.0 with call layers 65 through 92.
   readonly protocol: tl.TypePhoneCallProtocol = {
     _: 'phoneCallProtocol', udpP2p: true, udpReflector: false,
     minLayer: 65, maxLayer: 92, libraryVersions: ['5.0.0'],
@@ -291,7 +280,6 @@ export class VoiceWorkerSocketClient implements VoiceWorkerClient {
     if (response.tag !== 0x85 || response.requestId !== requestId) throw unavailable()
   }
 
-  /** Attaches the worker's single fixed-format PCM endpoint after media is active. */
   async attachMedia(call: VoiceWorkerCall): Promise<VoiceWorkerMediaEndpoint> {
     const callId = this._callId(call)
     const requestId = this._nextId('_nextRequestId')
@@ -307,8 +295,7 @@ export class VoiceWorkerSocketClient implements VoiceWorkerClient {
     if (!callId) return
     this._eventAborts.get(callId)?.abort()
     const pump = this._eventPumpSettlements.get(callId)
-    // A native-error handler can discard its own call; waiting for that pump
-    // would deadlock because it is awaiting this handler's return.
+    // native-error 回调内部可能调用 discardCall，等待自身所在的事件泵结束会导致死锁。
     if (pump && !this._deliveringEvents.has(callId)) await pump.catch(() => {})
     try {
       const response = await this._request({ tag: 0x06, callId })
@@ -321,7 +308,6 @@ export class VoiceWorkerSocketClient implements VoiceWorkerClient {
     }
   }
 
-  /** Aborts in-flight local requests; this does not start, stop, or manage the worker. */
   close(): void {
     if (this._closed) return
     this._closed = true
@@ -427,7 +413,6 @@ export class VoiceWorkerSocketClient implements VoiceWorkerClient {
     try {
       this._options.onDiagnostic?.(phase, code)
     } catch {
-      // Diagnostics must never change media lifecycle behavior.
     }
   }
 
@@ -509,8 +494,7 @@ export class VoiceWorkerSocketClient implements VoiceWorkerClient {
         signal?.removeEventListener('abort', abort)
         this._sockets.delete(socket)
         socket.removeAllListeners()
-        // `destroy()` may asynchronously surface a reset after listeners were
-        // removed; keep this terminal listener so it cannot escape the exchange.
+        // destroy() 可能在移除监听器后异步触发 error 事件，挂一个空监听器防止未捕获异常。
         socket.once('error', () => {})
         socket.destroy()
         if (error) reject(error)

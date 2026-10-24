@@ -11,7 +11,7 @@ import {
   type IMMedia, type PlatformSession, type VoiceWorkerClient,
 } from '@mtproto-relay/bridge'
 import { parseQQMarkdown, QQNTPlatform } from './index.js'
-import type { QQMediaLocator, WireReactionContext } from './protocol.js'
+import type { QQMediaLocator, WireMessage, WireReactionContext } from './protocol.js'
 import { QQStickerProvider } from './sticker-provider.js'
 
 const session: PlatformSession = {
@@ -24,6 +24,18 @@ async function collect(source: AsyncIterable<Uint8Array>): Promise<Uint8Array[]>
   const chunks: Uint8Array[] = []
   for await (const chunk of source) chunks.push(chunk)
   return chunks
+}
+
+/**
+ * An entity list as `type:slice` pairs, so a test states what a client draws
+ * instead of only the offsets it draws it at.
+ */
+function entitySlices(part: {
+  text: string
+  entities?: ReadonlyArray<{ type: string, offset: number, length: number }>
+}): string[] {
+  return (part.entities ?? [])
+    .map((entity) => `${entity.type}:${part.text.slice(entity.offset, entity.offset + entity.length)}`)
 }
 
 afterEach(async () => {
@@ -58,6 +70,57 @@ describe('QQNTPlatform mapping', () => {
         voice: true, mimeType: 'audio/ogg', duration: 3, transcript: '你好，世界',
       } },
     ])
+  })
+
+  it('keeps a mention range and the sender text when QQ hands over a NUL', async () => {
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: [{
+        id: 'nul-message', conversationId: 'group', senderId: 'peer', timestamp: 1, outgoing: false,
+        sender: { id: 'peer', name: 'Bad\u0000Name', alias: 're\u0000mark' },
+        parts: [{
+          type: 'text' as const, text: '@alice\u0000 hello',
+          entities: [{ type: 'mention' as const, offset: 0, length: 6, userId: 'alice' }],
+        }],
+      }],
+    }))
+
+    const [message] = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(message.sender).toMatchObject({ firstName: 'Bad.Name' })
+    expect((message.sender?.metadata as { qqName?: string }).qqName).toBe('Bad.Name')
+    expect(message.senderTitle).toBe('re.mark')
+    const part = message.content.parts[0]
+    expect(part).toMatchObject({ type: 'text', text: '@alice. hello' })
+    expect(entitySlices(part as never)).toEqual(['mention:@alice'])
+  })
+
+  it('keeps a group title and a request note free of the units PostgreSQL rejects', async () => {
+    const platform = new QQNTPlatform()
+    platform.client.getConversation = vi.fn(async () => ({
+      id: 'group', kind: 'group' as const, title: 'Gr\u0000oup\uD800',
+      peerUid: 'group', peerUin: '42', chatType: 2 as const,
+    }))
+    platform.client.getRequests = vi.fn(async () => ({ requests: [{
+      id: 'request', kind: 'friend' as const, status: 'pending' as const,
+      requester: { id: 'peer', name: 'Frie\u0000nd' },
+      group: { id: 'group', name: 'Gr\u0000oup' },
+      message: 'let me in\u0000',
+      timestamp: 1,
+    }] }))
+    platform.client.getUser = vi.fn(async () => ({
+      id: 'peer', name: 'Na\u0000me', signature: 'sig\uD800',
+    }))
+
+    await expect(platform.getConversation(session, 'group')).resolves.toMatchObject({ title: 'Gr.oup.' })
+    const [request] = (await platform.getRequests(session)).requests
+    expect(request).toMatchObject({
+      requester: { firstName: 'Frie.nd' },
+      group: { title: 'Gr.oup' },
+      message: 'let me in.',
+    })
+    await expect(platform.getUser(session, 'peer')).resolves.toMatchObject({
+      firstName: 'Na.me', about: 'sig.',
+    })
   })
 
   it('maps QQNT ranged-read past EOF responses to an empty Telegram chunk', async () => {
@@ -238,6 +301,46 @@ describe('QQNTPlatform mapping', () => {
     })
   })
 
+  it('renders an accept button for official group-invite cards', async () => {
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async (): Promise<{ messages: WireMessage[] }> => ({
+      messages: [{
+        id: 'invite-message', conversationId: 'direct', senderId: 'friend', timestamp: 1, outgoing: false,
+        parts: [{ type: 'card' as const, card: {
+          kind: 'application', title: '邀请你加入群聊',
+          description: '邀请你加入群聊“测试群聊”，进入可查看详情。\n群号 123456789',
+          source: '邀请加群',
+          groupInvite: { groupCode: '123456789', msgSeq: '1791449541900000' },
+        } }],
+      }],
+    }))
+    const [message] = (await platform.getHistory(session, { id: 'direct' })).messages
+    expect(message.content.inlineKeyboard).toEqual({
+      rows: [{ buttons: [{
+        type: 'callback', text: '同意加群',
+        data: 'group-invite:123456789:1791449541900000', style: 'success',
+      }] }],
+    })
+
+    platform.client.acceptGroupInvite = vi.fn(async () => ({} as Record<string, never>))
+    const button = message.content.inlineKeyboard!.rows[0].buttons[0] as any
+    await expect(platform.clickInlineButton!(session, {
+      conversationId: 'direct', messageId: 'invite-message',
+    }, button)).resolves.toEqual({ message: '已接受邀请；若群开启了入群审核，还需管理员通过', refresh: true })
+    expect(platform.client.acceptGroupInvite).toHaveBeenCalledWith({
+      groupCode: '123456789', msgSeq: '1791449541900000',
+    })
+
+    platform.client.acceptGroupInvite = vi.fn(async () => {
+      throw new Error('native rejected')
+    })
+    await expect(platform.clickInlineButton!(session, {
+      conversationId: 'direct', messageId: 'invite-message',
+    }, button)).resolves.toEqual({
+      message: '同意失败，请稍后重试或在 QQ 客户端处理该邀请', alert: true,
+    })
+  })
+
   it('drops QQ bot template metadata links, escapes and the plain-text fallback', async () => {
     expect(parseQQMarkdown('[](%7B%22version%22%3A2%7D)\n\n卫戍协议控制台\n私聊 /token 可获取设置页 JWT。\n')).toEqual({
       type: 'text', text: '卫戍协议控制台\n私聊 /token 可获取设置页 JWT。', entities: undefined,
@@ -289,6 +392,314 @@ describe('QQNTPlatform mapping', () => {
     ])
   })
 
+  it('renders QQ bot blockquotes as one quote entity instead of the markdown source', async () => {
+    // A QQ bot reply carries QQ's reply box as a markdown blockquote line
+    // (`> 名字：被引用的那句话`), which QQ itself draws as a quoted block.
+    // Telegram has `blockquote` for that: leaving the markers in the text made
+    // clients show the markdown source, and one entity per line drew one quote
+    // per line.
+    expect(parseQQMarkdown(
+      '> 小明：今天上午的航班在哪里看\n\n'
+      + '顺手修了两处 [PR #7](https://github.com/std-microblock/crossgram/pull/7) 已提 **加粗**\n',
+    )).toEqual({
+      type: 'text',
+      text: '小明：今天上午的航班在哪里看\n\n'
+        + '顺手修了两处 PR #7 已提 加粗',
+      entities: [
+        { type: 'blockquote', offset: 0, length: 14 },
+        {
+          type: 'text-link', offset: 23, length: 5,
+          url: 'https://github.com/std-microblock/crossgram/pull/7',
+        },
+        { type: 'bold', offset: 32, length: 2 },
+      ],
+    })
+    expect(parseQQMarkdown('> 第一行\n> 第二行\n\n正文')).toEqual({
+      type: 'text',
+      text: '第一行\n第二行\n\n正文',
+      entities: [{ type: 'blockquote', offset: 0, length: 7 }],
+    })
+    // Inline markup inside the quote is a quote too, and a blank line ends it.
+    expect(parseQQMarkdown('> **粗**引\n\n> 另一段\n> 接着')).toEqual({
+      type: 'text',
+      text: '粗引\n\n另一段\n接着',
+      entities: [
+        { type: 'blockquote', offset: 0, length: 2 },
+        { type: 'bold', offset: 0, length: 1 },
+        { type: 'blockquote', offset: 4, length: 6 },
+      ],
+    })
+    // Only a line's first `>` quotes: an escaped or inline one is body text.
+    expect(parseQQMarkdown('\\> 不是引用\n\na > b')).toEqual({
+      type: 'text', text: '> 不是引用\n\na > b', entities: undefined,
+    })
+    // A quoted line inside a fence is code, not a quote.
+    expect(parseQQMarkdown('```\n> 代码里的\n```\n> 引用')).toEqual({
+      type: 'text',
+      text: '> 代码里的\n\n引用',
+      entities: [
+        { type: 'pre', offset: 0, length: 7, language: undefined },
+        { type: 'blockquote', offset: 8, length: 2 },
+      ],
+    })
+  })
+
+  it('keeps a QQ bot reply quoted once, whichever rendition the fallback uses', async () => {
+    const markdown = '> 名字：被引用的那句话\n\n正文 [文档](https://example.com/docs)'
+    const body = '名字：被引用的那句话\n\n正文 文档'
+    const fallbacks = [
+      // QQ's plain-text rendition of the body, with and without the markers.
+      body,
+      '> 名字：被引用的那句话\n\n正文 文档',
+    ]
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: fallbacks.map((fallback, index) => ({
+        id: `bot-quote-${index}`, conversationId: 'group', senderId: 'bot', timestamp: index + 1,
+        outgoing: false, msgSeq: `90${index}`,
+        // Production order: markdown body, then QQ's plain-text fallback.
+        parts: [
+          { type: 'markdown' as const, content: markdown },
+          { type: 'text' as const, text: fallback },
+        ],
+      })),
+    }))
+    const messages = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(messages).toHaveLength(2)
+    for (const message of messages) {
+      expect(message.content.parts).toEqual([{
+        type: 'text',
+        text: body,
+        entities: [
+          { type: 'blockquote', offset: 0, length: 10 },
+          { type: 'text-link', offset: 15, length: 2, url: 'https://example.com/docs' },
+        ],
+      }])
+    }
+  })
+
+  it('renders a whole QQ bot markdown body, construct by construct', async () => {
+    // QQ sends the entire body as markdown (the bridge reports it as one
+    // `markdown` part), so every construct the platform documents has to come
+    // out rendered rather than as source: heading, bold, underlined bold,
+    // italic, bold italic, strikethrough, code, links, autolink, image, both
+    // list kinds, quote and table.
+    const part = parseQQMarkdown([
+      '# 标题',
+      '**加粗** __粗下划线__ _斜体_ *星号斜体* ***加粗斜体*** ~~删除~~ `码`',
+      '[文档](https://example.com/docs) 和 <https://doc.qq.com>',
+      '![示意图 #208px #320px](https://example.com/a.png)',
+      '- 无序一',
+      '- 无序二',
+      '1. 有序一',
+      '    - 缩进子项',
+      '> 引用一行',
+      '> 引用二行',
+      '| 名字 | 数量 |',
+      '| --- | --- |',
+      '| 橘子 | 3 |',
+      '| 奶茶 | 16 |',
+      '```ts',
+      'const a = 1',
+      '```',
+    ].join('\n'))
+    expect(part.text).toEqual([
+      // A heading has no Telegram entity; QQ's headings read as bold.
+      '标题',
+      '加粗 粗下划线 斜体 星号斜体 加粗斜体 删除 码',
+      // `<https://…>` is an autolink: the target is what it reads as.
+      '文档 和 https://doc.qq.com',
+      // An image cannot ride a message body; its alt text links to the target,
+      // with QQ's `#208px #320px` size hints dropped.
+      '示意图',
+      // Telegram has no list entity: unordered items get a bullet, ordered
+      // items keep the number QQ wrote, and nesting keeps its indent.
+      '• 无序一',
+      '• 无序二',
+      '1. 有序一',
+      '    • 缩进子项',
+      // The quote is one block, without its `>` markers.
+      '引用一行',
+      '引用二行',
+      // The table loses its `--- | ---` delimiter and is padded for monospace.
+      '名字 | 数量',
+      '橘子 | 3',
+      '奶茶 | 16',
+      'const a = 1',
+    ].join('\n'))
+    expect(entitySlices(part)).toEqual([
+      'bold:标题',
+      'bold:加粗',
+      'bold:粗下划线',
+      // QQ documents `__x__` as underlined bold and draws it as both.
+      'underline:粗下划线',
+      'italic:斜体',
+      'italic:星号斜体',
+      'bold:加粗斜体',
+      'italic:加粗斜体',
+      'strikethrough:删除',
+      'code:码',
+      'text-link:文档',
+      'text-link:https://doc.qq.com',
+      'text-link:示意图',
+      'blockquote:引用一行\n引用二行',
+      'pre:名字 | 数量\n橘子 | 3\n奶茶 | 16',
+      'pre:const a = 1',
+    ])
+  })
+
+  it('degrades a markdown table to the monospace block Telegram has', async () => {
+    // Telegram message entities have no table, and a table left as text keeps
+    // its pipes and its delimiter row — markdown source in the bubble. One `pre`
+    // entity with aligned columns is what a client can draw, and inline markup
+    // inside a cell is rendered away rather than kept (inside code the reader
+    // must not see `**` either).
+    expect(entitySlices(parseQQMarkdown([
+      '| 名字 | 数量 | 备注 |',
+      '| --- | :---: | --- |',
+      '| 橘子 | 3 | **很甜** |',
+      '| tea | 16 | ok |',
+    ].join('\n')))).toEqual([
+      // Column one is as wide as `名字`/`橘子` (four monospace columns), so `tea`
+      // is padded to it; the last column needs no padding.
+      'pre:名字 | 数量 | 备注\n橘子 | 3    | 很甜\ntea  | 16   | ok',
+    ])
+    // A quoted table keeps its quote on top of the monospace block.
+    expect(entitySlices(parseQQMarkdown([
+      '> | 名字 | 数量 |',
+      '> | --- | --- |',
+      '> | 橘子 | 3 |',
+    ].join('\n')))).toEqual([
+      'blockquote:名字 | 数量\n橘子 | 3',
+      'pre:名字 | 数量\n橘子 | 3',
+    ])
+    // A pipe does not make a table: the delimiter row decides, so ordinary
+    // punctuation stays text.
+    expect(parseQQMarkdown('价格 | 数量\n橘子 3 元\n|---|---|')).toEqual({
+      type: 'text', text: '价格 | 数量\n橘子 3 元\n|---|---|', entities: undefined,
+    })
+  })
+
+  it('passes QQ punctuation through untouched, so a rich-text parse cannot reject a send', async () => {
+    // Telegram's MarkdownV2 would demand escaping every one of these characters,
+    // and one missed escape fails the whole send. The relay carries entities
+    // instead, so the text is handed over verbatim whatever it holds.
+    const punctuation = '特价 3.5 元/份 (含税) 100% 完 \\ 备选 _ 未闭合 * 星号 [见说明 `未闭合 + 粗 | 表 # 号 ! 冒号:'
+    expect(parseQQMarkdown(punctuation)).toEqual({ type: 'text', text: punctuation, entities: undefined })
+    // The same characters inside real markup stay intact.
+    expect(entitySlices(parseQQMarkdown('**a_b** [x](https://e.com/p?q=1&r=2) `c|d` +e=f'))).toEqual([
+      'bold:a_b',
+      'text-link:x',
+      'code:c|d',
+    ])
+  })
+
+  it('hands a QQ bot markdown body over as a rich message source beside its text', async () => {
+    // Telegram draws a table only in a rich message, so the markdown body is
+    // handed over as markdown as well; the text parts stay the message text.
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: [{
+        id: 'bot-table', conversationId: 'group', senderId: 'bot', timestamp: 1, outgoing: false,
+        parts: [
+          {
+            type: 'markdown' as const,
+            // Production: the body opens with QQ's empty-label template link.
+            content: '[](%7B%22version%22%3A2%7D)\n\n| 名字 | 数量 |\n| --- | --- |\n| 橘子 | 3 |\n',
+          },
+          { type: 'text' as const, text: '名字 | 数量\n橘子 | 3' },
+        ],
+      }, {
+        id: 'plain', conversationId: 'group', senderId: 'alice', timestamp: 2, outgoing: false,
+        parts: [{ type: 'text' as const, text: '- 不是列表\n| a | b |\n| --- | --- |' }],
+      }],
+    }))
+    const [rich, plain] = (await platform.getHistory(session, { id: 'group' })).messages
+    // The template link is dropped and the body is otherwise untouched.
+    expect(rich!.content.richMarkdown).toBe('| 名字 | 数量 |\n| --- | --- |\n| 橘子 | 3 |')
+    expect(entitySlices(rich!.content.parts[0] as never)).toEqual([
+      'pre:名字 | 数量\n橘子 | 3',
+    ])
+    // Only a markdown part is markdown.
+    expect(plain!.content.richMarkdown).toBeUndefined()
+    expect(plain!.content.parts).toEqual([
+      { type: 'text', text: '- 不是列表\n| a | b |\n| --- | --- |' },
+    ])
+  })
+
+  it('keeps a plain QQ message exactly as it arrived', async () => {
+    // Only a `markdown` part is markdown. A text part is what QQ sent, so its
+    // `>` lines, dashes and pipes are not converted into anything.
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: [{
+        id: 'plain', conversationId: 'group', senderId: 'alice', timestamp: 1, outgoing: false,
+        parts: [{ type: 'text' as const, text: '- 不是列表\n> 不是引用\n| a | b |\n| --- | --- |' }],
+      }],
+    }))
+    const [message] = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(message.content.parts).toEqual([
+      { type: 'text', text: '- 不是列表\n> 不是引用\n| a | b |\n| --- | --- |' },
+    ])
+  })
+
+  it('shows a quoted body once even when QQ also sends a reply reference', async () => {
+    // The bot writes QQ's reply box into the markdown body, because a native
+    // `message_reference` on a markdown message makes QQ attach the body twice.
+    // The relay therefore shows the quote once and keeps the reference as the
+    // Telegram reply on top of it — nothing is rendered twice.
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: [{
+        id: 'bot-reply', conversationId: 'group', senderId: 'bot', timestamp: 1, outgoing: false,
+        replyToId: 'quoted', replyToSequence: '9001',
+        parts: [
+          { type: 'markdown' as const, content: '> 小明：今天上午的航班在哪里看\n\n正文' },
+          { type: 'text' as const, text: '小明：今天上午的航班在哪里看\n\n正文' },
+        ],
+      }],
+    }))
+    const [message] = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(message.replyToId).toBe('quoted')
+    expect(message.content.parts).toEqual([{
+      type: 'text',
+      text: '小明：今天上午的航班在哪里看\n\n正文',
+      entities: [{ type: 'blockquote', offset: 0, length: 14 }],
+    }])
+  })
+
+  it('drops the rendition of a list and table body whichever markers it keeps', async () => {
+    // QQ's plain-text rendition is written by QQ: it may keep the list markers
+    // and the table pipes or replace them. Either spelling is the same body.
+    const markdown = '- 第一项\n- 第二项\n\n| 名字 | 数量 |\n| --- | --- |\n| 橘子 | 3 |'
+    const fallbacks = [
+      '• 第一项\n• 第二项\n\n名字 数量\n橘子 3',
+      '- 第一项\n- 第二项\n\n名字 数量\n橘子 3',
+      '• 第一项\n• 第二项\n\n名字 | 数量\n橘子 | 3',
+    ]
+    const platform = new QQNTPlatform()
+    platform.client.getHistory = vi.fn(async () => ({
+      messages: fallbacks.map((fallback, index) => ({
+        id: `bot-list-${index}`, conversationId: 'group', senderId: 'bot', timestamp: index + 1,
+        outgoing: false, msgSeq: `91${index}`,
+        // Production order: markdown body, then QQ's plain-text fallback.
+        parts: [
+          { type: 'markdown' as const, content: markdown },
+          { type: 'text' as const, text: fallback },
+        ],
+      })),
+    }))
+    const messages = (await platform.getHistory(session, { id: 'group' })).messages
+    expect(messages).toHaveLength(3)
+    for (const message of messages) {
+      expect(message.content.parts).toEqual([{
+        type: 'text',
+        text: '• 第一项\n• 第二项\n\n名字 | 数量\n橘子 | 3',
+        entities: [{ type: 'pre', offset: 13, length: 14 }],
+      }])
+    }
+  })
+
   it('uses the service environment token unless configuration overrides it', async () => {
     vi.stubEnv('QQNT_BRIDGE_TOKEN', 'service-token')
     const authorizations: Array<string | null> = []
@@ -317,16 +728,23 @@ describe('QQNTPlatform mapping', () => {
   })
 
   it('maps QQ permission and upload preparation rejections to typed platform send errors', async () => {
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(Response.json({
+    const rejections = [
+      () => Response.json({
         error: 'QQ message send rejected: 发送失败，请先添加对方为好友 (16)', result: 16,
-      }, { status: 403 }))
-      .mockResolvedValueOnce(Response.json({
+      }, { status: 403 }),
+      () => Response.json({
         error: 'QQ group file upload preparation failed: 永久空间不足, 请清理文件列表后重试 (-403)',
-      }, { status: 422 }))
-      .mockResolvedValueOnce(Response.json({
+      }, { status: 422 }),
+      () => Response.json({
         error: 'QQ transport temporarily unavailable',
-      }, { status: 500 })) as typeof globalThis.fetch
+      }, { status: 500 }),
+    ]
+    const fetch = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/status')) return Response.json({ protocolVersion: 34, ready: true })
+      const rejection = rejections.shift()
+      if (!rejection) throw new Error('unexpected QQ bridge request')
+      return rejection()
+    }) as typeof globalThis.fetch
     const platform = new QQNTPlatform({ fetch })
     const send = () => platform.sendMessage(session, { id: 'u_non_friend' }, {
       parts: [{ type: 'text', text: 'hello' }],
@@ -560,71 +978,40 @@ describe('QQNTPlatform mapping', () => {
     })
   })
 
-  it('maps native message-search pages and forwards every filter', async () => {
+  it('loads history by sequence and keeps the raw sequence range as coverage', async () => {
     const platform = new QQNTPlatform()
     platform.client.getReactionCatalog = vi.fn(async () => ({ available: [], reactions: [], maxSelected: 20 }))
-    platform.client.searchMessages = vi.fn(async () => ({
-      nextCursor: 'native-next',
+    platform.client.status = vi.fn(async () => ({ ready: true, protocolVersion: 36 })) as never
+    platform.client.getHistory = vi.fn(async () => ({
       messages: [{
-        id: 'found', conversationId: '2:group', senderId: 'alice', timestamp: 10, outgoing: false,
-        parts: [{ type: 'text' as const, text: 'needle' }],
+        id: 'seq-41', conversationId: '2:group', senderId: 'alice', timestamp: 10, outgoing: false,
+        parts: [{ type: 'text' as const, text: 'older' }],
       }],
+      sequenceRange: { min: '38', max: '42' },
     }))
 
-    await expect(platform.searchMessages(session, { id: '2:group' }, {
-      query: 'needle', cursor: 'native-cursor', limit: 30, fromUserId: 'alice',
-      minTimestamp: 5, maxTimestamp: 20, mediaKind: 'image',
-    })).resolves.toMatchObject({
-      messages: [{ id: 'found', content: { parts: [{ type: 'text', text: 'needle' }] } }],
-      nextCursor: 'native-next',
-    })
-    expect(platform.client.searchMessages).toHaveBeenCalledWith('2:group', {
-      q: 'needle', cursor: 'native-cursor', limit: 30, fromUserId: 'alice',
-      minTimestamp: 5, maxTimestamp: 20, mediaKind: 'image',
-    })
+    await expect(platform.getHistory(session, { id: '2:group' }, { beforeSequence: '42', limit: 5 }))
+      .resolves.toMatchObject({
+        messages: [{ id: 'seq-41', content: { parts: [{ type: 'text', text: 'older' }] } }],
+        coverage: { minSequence: '38', maxSequence: '42' },
+      })
+    expect(platform.client.getHistory).toHaveBeenCalledWith('2:group', { beforeSeq: '42', limit: 5 })
   })
 
-  it('projects QQ group files into Telegram document-search messages', async () => {
+  it('refuses sequence history on bridges that would silently return the latest page', async () => {
     const platform = new QQNTPlatform()
-    platform.client.searchMessages = vi.fn()
-    platform.client.getGroupFiles = vi.fn(async () => ({
-      total: 2,
-      nextCursor: '2',
-      items: [{
-        type: 'folder' as const, id: 'folder', parentId: '', name: '资料',
-        createTime: 1, modifyTime: 2, creatorId: '1', creatorName: 'Alice', fileCount: 1,
-      }, {
-        type: 'file' as const, id: 'uuid', parentId: '', name: 'manual.pdf', size: 9,
-        uploadTime: 100, modifyTime: 110, downloadCount: 4, uploaderId: '42', uploaderName: 'Bob',
-        busId: 102,
-        media: {
-          id: 'group-file:uuid', kind: 'file' as const, name: 'manual.pdf', size: 9,
-          locator: {
-            messageId: 'group-file:uuid', elementId: 'element', chatType: 2 as const,
-            peerUid: 'group', kind: 'file' as const, fileName: 'manual.pdf',
-            fileSize: '9', fileUuid: 'uuid', fileBizId: 102,
-          },
-        },
-      }],
-    }))
+    platform.client.status = vi.fn(async () => ({ ready: true, protocolVersion: 35 })) as never
+    platform.client.getHistory = vi.fn()
 
-    await expect(platform.searchMessages(session, { id: '2:group' }, {
-      query: 'manual', cursor: '0', limit: 20, mediaKind: 'file',
-    })).resolves.toMatchObject({
-      total: 2,
-      nextCursor: '2',
-      messages: [{
-        id: 'qq-group-file:uuid', senderId: '42', timestamp: 100,
-        content: { parts: [
-          { type: 'text', text: 'manual.pdf' },
-          { type: 'media', media: { name: 'manual.pdf', locator: { fileUuid: 'uuid' } } },
-        ] },
-      }],
-    })
-    expect(platform.client.getGroupFiles).toHaveBeenCalledWith('2:group', { cursor: '0', limit: 20 })
-    expect(platform.client.searchMessages).not.toHaveBeenCalled()
+    await expect(platform.getHistory(session, { id: '2:group' }, { beforeSequence: '42' }))
+      .rejects.toThrow('does not support sequence history')
+    await expect(platform.getHistory(session, { id: '2:group' }, { beforeSequence: 'x' }))
+      .rejects.toThrow('invalid beforeSequence')
+    expect(platform.client.getHistory).not.toHaveBeenCalled()
+    expect(platform.capabilities.sequenceHistory).toBe('group')
+    expect('search' in platform.capabilities).toBe(false)
+    expect('searchMessages' in platform).toBe(false)
   })
-
 
   it('maps QQ wire serviceAction into IMMessage.content.serviceAction', async () => {
     const platform = new QQNTPlatform()
@@ -689,7 +1076,7 @@ describe('QQNTPlatform mapping', () => {
     })
   })
 
-  it('filters reaction gray tips from history, search, direct lookup, and dialog previews by default', async () => {
+  it('filters reaction gray tips from history, sequence history, direct lookup, and dialog previews by default', async () => {
     const platform = new QQNTPlatform()
     const reactionTip = {
       id: 'reaction-tip', conversationId: '2:group', senderId: 'alice', timestamp: 2, outgoing: false,
@@ -701,7 +1088,7 @@ describe('QQNTPlatform mapping', () => {
     }
     platform.client.getReactionCatalog = vi.fn(async () => ({ available: [], reactions: [], maxSelected: 20 }))
     platform.client.getHistory = vi.fn(async () => ({ messages: [reactionTip, memberTip] }))
-    platform.client.searchMessages = vi.fn(async () => ({ messages: [reactionTip] }))
+    platform.client.status = vi.fn(async () => ({ ready: true, protocolVersion: 36 })) as never
     platform.client.getMessage = vi.fn(async () => reactionTip)
     platform.client.getDialogs = vi.fn(async () => ({ conversations: [{
       id: '2:group', kind: 'group' as const, title: 'Group', peerUid: 'group', peerUin: 'group',
@@ -711,8 +1098,8 @@ describe('QQNTPlatform mapping', () => {
     await expect(platform.getHistory(session, { id: '2:group' })).resolves.toMatchObject({
       messages: [{ id: 'member-tip' }],
     })
-    await expect(platform.searchMessages(session, { id: '2:group' }, { query: '回应' }))
-      .resolves.toMatchObject({ messages: [] })
+    await expect(platform.getHistory(session, { id: '2:group' }, { beforeSequence: '9' }))
+      .resolves.toMatchObject({ messages: [{ id: 'member-tip' }] })
     await expect(platform.getMessage(session, { id: '2:group' }, 'reaction-tip')).resolves.toBeNull()
     await expect(platform.getDialogs(session)).resolves.toMatchObject({
       dialogs: [{ lastMessage: undefined, readInboxMaxMessage: { id: 'member-tip' } }],
@@ -843,8 +1230,8 @@ describe('QQNTPlatform mapping', () => {
     await expect(platform.getAccount()).rejects.toThrow('not ready')
   })
 
-  it('rejects bridge protocols outside the supported 19-34 range', async () => {
-    for (const protocolVersion of [18, 35, 19.5, Number.NaN, '19', undefined]) {
+  it('rejects a bridge older than the minimum protocol, or one that reports nothing usable', async () => {
+    for (const protocolVersion of [18, 19.5, Number.NaN, '19', undefined]) {
       const platform = new QQNTPlatform()
       const status = {
         protocolVersion, ready: true, selfUin: '10001', selfUid: 'u_self',
@@ -852,17 +1239,27 @@ describe('QQNTPlatform mapping', () => {
       platform.client.status = vi.fn(async () => status)
       platform.client.getUser = vi.fn()
 
-      await expect(platform.getAccount()).rejects.toThrow('supported range is 19-34')
+      await expect(platform.getAccount()).rejects.toThrow('protocol 19 or newer is required')
       expect(platform.client.getUser).not.toHaveBeenCalled()
     }
+  })
+
+  it('accepts a bridge whose protocol is newer than this relay knows', async () => {
+    const platform = new QQNTPlatform()
+    platform.client.status = vi.fn(async () => ({
+      protocolVersion: 99, ready: true, selfUin: '10001', selfUid: 'u_self',
+    } as unknown as Awaited<ReturnType<typeof platform.client.status>>))
+    platform.client.getUser = vi.fn(async () => ({ id: 'u_self', name: 'Platform Alice' }))
+
+    await expect(platform.getAccount()).resolves.toMatchObject({ user: { id: 'u_self' } })
   })
 
   it('edits QQ messages by recalling the old message and resending the replacement', async () => {
     const platform = new QQNTPlatform()
     platform.client.deleteMessages = vi.fn(async () => {})
-    platform.client.sendMessage = vi.fn(async (_conversation, text) => ({
+    platform.client.sendMessage = vi.fn(async (_conversation, parts) => ({
       id: 'replacement', conversationId: '2:group', senderId: 'self', timestamp: 20, outgoing: true,
-      parts: [{ type: 'text' as const, text: text! }],
+      parts: parts.map((part) => part.type === 'text' ? part : { type: 'text' as const, text: '' }),
     }))
     const actions = new PlatformMessageActions(platform, session)
 
@@ -920,6 +1317,45 @@ describe('QQNTPlatform mapping', () => {
     ])
   })
 
+  it('derives the dialog read boundary from the first unread cursor and caches it per cursor', async () => {
+    const platform = new QQNTPlatform()
+    const conversation = (msgSeq: string) => ({
+      id: '2:group', kind: 'group' as const, title: 'Group',
+      peerUid: 'group', peerUin: 'group', chatType: 2 as const,
+      unreadCount: 3, firstUnread: { msgSeq, msgTime: '10' },
+    })
+    platform.client.getDialogs = vi.fn(async () => ({ conversations: [conversation('30')] }))
+    platform.client.getReactionCatalog = vi.fn(async () => ({ available: [], reactions: [], maxSelected: 20 }))
+    platform.client.getHistory = vi.fn(async () => ({ messages: [
+      {
+        id: 'still-unread', conversationId: '2:group', senderId: 'alice', timestamp: 31, msgSeq: '31',
+        outgoing: false, parts: [{ type: 'text' as const, text: 'unread' }],
+      },
+      {
+        id: 'read-so-far', conversationId: '2:group', senderId: 'alice', timestamp: 29, msgSeq: '29',
+        outgoing: false, parts: [{ type: 'text' as const, text: 'read' }],
+      },
+    ] }))
+
+    // QQ 只在按需拉取未读窗口时才知道已读边界，第一次列表拿不到，边界异步补上。
+    const first = await platform.getDialogs(session)
+    expect(first.dialogs[0].readInboxMaxMessage).toBeUndefined()
+
+    await vi.waitFor(() => expect(platform.client.getHistory).toHaveBeenCalledWith('2:group', expect.objectContaining({
+      aroundUnreadSeq: '30',
+    })))
+    const second = await platform.getDialogs(session)
+    expect(second.dialogs[0].readInboxMaxMessage).toMatchObject({ id: 'read-so-far' })
+
+    // 游标没变就不会重复拉取未读窗口。
+    await platform.getDialogs(session)
+    expect(platform.client.getHistory).toHaveBeenCalledTimes(1)
+
+    platform.client.getDialogs = vi.fn(async () => ({ conversations: [conversation('40')] }))
+    await platform.getDialogs(session)
+    await vi.waitFor(() => expect(platform.client.getHistory).toHaveBeenCalledTimes(2))
+  })
+
   it('filters and cleans zero-peer dialogs without hiding real QQ service messages', async () => {
     const remove = vi.fn(async () => {})
     const database = {
@@ -966,7 +1402,7 @@ describe('QQNTPlatform mapping', () => {
     })
     await expect(platform.getConversation(session, '0')).resolves.toBeNull()
     await expect(platform.getHistory(session, { id: '0' })).resolves.toEqual({ messages: [] })
-    await expect(platform.searchMessages(session, { id: '0' }, { query: 'ignored' })).resolves.toEqual({ messages: [] })
+    await expect(platform.getHistory(session, { id: '0' }, { beforeSequence: '1' })).resolves.toEqual({ messages: [] })
     await expect(platform.getMessage(session, { id: '0' }, 'ghost')).resolves.toBeNull()
     await expect(platform.markRead(session, {
       conversationId: '0', messageId: 'ghost',
@@ -1310,10 +1746,13 @@ describe('QQNTPlatform mapping', () => {
       parts: [{ type: 'text' as const, text: `copy ${messageId}` }],
     }))
     platform.client.forwardMessages = vi.fn()
-    platform.client.sendMessage = vi.fn(async (_conversation, text) => ({
-      id: `resent-${text}`, conversationId: 'to', senderId: 'self', timestamp: 2, outgoing: true,
-      parts: [{ type: 'text' as const, text: text! }],
-    }))
+    platform.client.sendMessage = vi.fn(async (_conversation, parts) => {
+      const text = parts.flatMap((part) => part.type === 'text' ? [part.text] : []).join('\n')
+      return {
+        id: `resent-${text}`, conversationId: 'to', senderId: 'self', timestamp: 2, outgoing: true,
+        parts: [{ type: 'text' as const, text }],
+      }
+    })
 
     const outputs = await platform.forwardMessages(
       session, { id: 'from' }, ['a', 'b'], { id: 'to' }, { dropAuthor: true },
@@ -1330,10 +1769,13 @@ describe('QQNTPlatform mapping', () => {
       throw new Error('QQNT bridge 500: forwardMsg: forward failed (2004004)')
     })
     platform.client.getMessage = vi.fn()
-    platform.client.sendMessage = vi.fn(async (_conversation, text) => ({
-      id: `resent-${text}`, conversationId: 'to', senderId: 'self', timestamp: 2, outgoing: true,
-      parts: [{ type: 'text' as const, text: text! }],
-    }))
+    platform.client.sendMessage = vi.fn(async (_conversation, parts) => {
+      const text = parts.flatMap((part) => part.type === 'text' ? [part.text] : []).join('\n')
+      return {
+        id: `resent-${text}`, conversationId: 'to', senderId: 'self', timestamp: 2, outgoing: true,
+        parts: [{ type: 'text' as const, text }],
+      }
+    })
 
     const outputs = await platform.forwardMessages(
       session,
@@ -1411,7 +1853,7 @@ describe('QQNTPlatform mapping', () => {
       parts: [{ type: 'text' as const, text: '🙂' }],
     }))
     await platform.sendMessage(session, { id: '2:group' }, { parts: [text as any] })
-    expect((platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![6]).toMatchObject([{
+    expect((platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![1]).toMatchObject([{
       type: 'text', text: '🙂',
       entities: [{ type: 'qq-face', offset: 0, length: 2, faceId: '14', faceType: 1 }],
     }])
@@ -1708,12 +2150,12 @@ describe('QQNTPlatform mapping', () => {
     })
 
     const call = (platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]!
-    expect(call[6]).toEqual([{
+    expect(call[1]).toEqual([{
       type: 'text', text: 'hello @Alice',
       entities: [{ type: 'mention', offset: 6, length: 6, userId: 'u_alice', numericId: '12345' }],
     }])
-    expect(call[7]).toBe('opaque-original')
-    expect(call[8]).toBe('571')
+    expect(call[3]?.replyToId).toBe('opaque-original')
+    expect(call[3]?.replyToSequence).toBe('571')
     expect(platform.client.getUser).toHaveBeenCalledWith('u_alice')
     expect(sent).toMatchObject({
       replyToId: 'opaque-original',
@@ -1809,7 +2251,7 @@ describe('QQNTPlatform mapping', () => {
       },
     }] })
 
-    expect((platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![5]).toEqual(reference)
+    expect((platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![3]?.sticker).toEqual(reference)
     expect(sent.content.parts).toMatchObject([{
       type: 'sticker', sticker: {
         providerId: 'qq-provider', stickerId: 'market:42:wave', format: 'animated',
@@ -1894,9 +2336,9 @@ describe('QQNTPlatform mapping', () => {
       wireHandler = handler
       await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
     })
-    platform.client.sendMessage = vi.fn(async (_conversation, _text, _media, _options, originRequestId) => ({
+    platform.client.sendMessage = vi.fn(async (_conversation, _parts, _options, transfer) => ({
       id: 'sent', conversationId: 'u', senderId: 'self', timestamp: 10, outgoing: true,
-      originRequestId, parts: [{ type: 'text' as const, text: 'hello' }],
+      originRequestId: transfer?.originRequestId, parts: [{ type: 'text' as const, text: 'hello' }],
     }))
     const other = { ...session, platformSessionId: 'other-session' }
     const ownEvents: unknown[] = []
@@ -1907,7 +2349,7 @@ describe('QQNTPlatform mapping', () => {
     const sent = await platform.sendMessage(session, { id: 'u' }, {
       parts: [{ type: 'text', text: 'hello' }],
     })
-    const originRequestId = (platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![4]
+    const originRequestId = (platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![3]?.originRequestId
     const echo = {
       type: 'message' as const,
       conversation: { id: 'u', kind: 'direct' as const, title: 'u', peerUid: 'u', peerUin: '1', chatType: 1 as const },
@@ -3731,13 +4173,68 @@ describe('QQNTPlatform mapping', () => {
     expect(progress).toEqual([1, 2])
   })
 
+  it('passes the message element order to the bridge', async () => {
+    const platform = new QQNTPlatform()
+    const image = (name: string) => ({
+      kind: 'image' as const, name, mimeType: 'image/png', size: 3, width: 1, height: 1,
+      source: { size: 3, async *stream() { yield new Uint8Array([1, 2, 3]) } },
+    })
+    const mediaPart = (id: string, name: string) => ({
+      type: 'media' as const,
+      media: { id, kind: 'image' as const, name, mimeType: 'image/png', width: 1, height: 1 },
+    })
+    const sendWire = vi.fn(async () => ({
+      id: 'm', conversationId: '1:u', senderId: 'self', timestamp: 10, outgoing: true,
+      parts: [
+        { type: 'text' as const, text: 'lead' },
+        mediaPart('a', 'a.png'),
+        { type: 'text' as const, text: 'tail' },
+        mediaPart('b', 'b.png'),
+      ],
+    }))
+    platform.client.sendMessage = sendWire as unknown as typeof platform.client.sendMessage
+
+    await platform.sendMessage(session, { id: '1:u' }, {
+      parts: [
+        { type: 'text', text: 'lead' },
+        { type: 'media', media: image('a.png') },
+        { type: 'text', text: 'tail' },
+        { type: 'media', media: image('b.png') },
+      ],
+    })
+    // The body spells out its own text and media instead of listing them apart.
+    expect(platform.client.sendMessage).toHaveBeenLastCalledWith(
+      expect.any(String),
+      [
+        { type: 'text', text: 'lead', entities: undefined },
+        { type: 'media', media: expect.objectContaining({ name: 'a.png', kind: 'image' }) },
+        { type: 'text', text: 'tail', entities: undefined },
+        { type: 'media', media: expect.objectContaining({ name: 'b.png', kind: 'image' }) },
+      ],
+      expect.any(Object),
+      { originRequestId: expect.any(String) },
+    )
+
+    // A plain mix travels the same way: the bridge picks the shape it can take.
+    await platform.sendMessage(session, { id: '1:u' }, {
+      parts: [
+        { type: 'text', text: 'caption' },
+        { type: 'media', media: image('a.png') },
+        { type: 'media', media: image('b.png') },
+      ],
+    })
+    const lastParts = (sendWire.mock.calls.at(-1) as unknown[] | undefined)?.[1] as unknown[]
+    expect(lastParts.map((part) => (part as { type: string }).type)).toEqual(['text', 'media', 'media'])
+  })
+
   it('maps recorded voice media with its OGG duration and rejects mixed voice messages', async () => {
     const platform = new QQNTPlatform()
     const locator = {
       messageId: 'voice-message', elementId: 'voice-element', chatType: 1 as const, peerUid: 'u',
       kind: 'voice' as const, fileName: 'voice.ogg', fileSize: '42', filePath: '/cache/voice.ogg',
     }
-    platform.client.sendMessage = vi.fn(async (_conversation, _text, media) => {
+    platform.client.sendMessage = vi.fn(async (_conversation, parts) => {
+      const media = parts.flatMap((part) => part.type === 'media' ? [part.media] : [])
       expect(media).toMatchObject([{ kind: 'file', voice: true, mimeType: 'audio/ogg', duration: 7 }])
       return {
         id: 'voice-message', conversationId: '1:u', senderId: 'self', timestamp: 10, outgoing: true,
@@ -3832,8 +4329,9 @@ describe('QQNTPlatform mapping', () => {
       type: 'media', media: { kind: 'image', name: 'two.png', source: source(2) },
     }] })
 
-    const media = (platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![2]
-    expect(media).toMatchObject([{ name: 'one.png' }, { name: 'two.png' }])
+    const parts = (platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![1] as
+      Array<{ type: string, media?: { name: string } }>
+    expect(parts.map((part) => part.media?.name)).toEqual(['one.png', 'two.png'])
     expect(platform.capabilities.send?.maxMedia).toBe(9)
   })
 
@@ -3846,29 +4344,30 @@ describe('QQNTPlatform mapping', () => {
       originRequestId?: string
     }> = []
     let sequence = 0
-    platform.client.sendMessage = vi.fn(async (
-      _conversation, text, media, options, originRequestId, _sticker, textParts, replyToId,
-    ) => {
+    platform.client.sendMessage = vi.fn(async (_conversation, parts, options, transfer) => {
       const id = `physical-${++sequence}`
+      const sentParts = parts ?? []
+      const sentMedia = sentParts.flatMap((part) => part.type === 'media' ? [part.media] : [])
+      const sentText = sentParts.flatMap((part) => part.type === 'text' ? [part] : [])
       calls.push({
-        text,
-        names: media?.map((item) => item.name) ?? [],
-        replyToId,
-        originRequestId,
+        text: sentText.length ? sentText.map((part) => part.text).join('\n') : undefined,
+        names: sentMedia.map((item) => item.name),
+        replyToId: transfer?.replyToId,
+        originRequestId: transfer?.originRequestId,
       })
-      for (const [mediaIndex, item] of media?.entries() ?? []) {
-        await options.onProgress?.({
+      for (const [mediaIndex, item] of sentMedia.entries()) {
+        await options?.onProgress?.({
           phase: 'upload', mediaIndex, transferredBytes: item.source.size ?? 0,
           totalBytes: item.source.size,
         })
       }
       return {
         id, conversationId: '1:u', senderId: 'self', timestamp: 10 + sequence, outgoing: true,
-        originRequestId,
-        replyToId,
+        originRequestId: transfer?.originRequestId,
+        replyToId: transfer?.replyToId,
         parts: [
-          ...(textParts ?? []),
-          ...(media ?? []).map((item, index) => ({
+          ...sentText,
+          ...sentMedia.map((item, index) => ({
             type: 'media' as const,
             media: {
               id: `${id}-${index}`, kind: item.kind, name: item.name, mimeType: item.mimeType,
@@ -3965,8 +4464,10 @@ describe('QQNTPlatform mapping', () => {
       parts: [{ type: 'text', text: 'saved' }],
     })).resolves.toMatchObject({ id: 'sent-saved', conversationId: 'self' })
     expect(platform.client.sendMessage).toHaveBeenCalledWith(
-      physicalId, 'saved', undefined, expect.any(Object), expect.any(String), undefined,
-      [{ type: 'text', text: 'saved', entities: undefined }], undefined, undefined,
+      physicalId,
+      [{ type: 'text', text: 'saved', entities: undefined }],
+      expect.any(Object),
+      { originRequestId: expect.any(String) },
     )
     await expect(platform.prepareMediaUpload!(session, { id: 'self' }, {
       kind: 'image', name: 'saved.png', mimeType: 'image/png',
@@ -4277,9 +4778,10 @@ describe('QQNTPlatform dialogs polling', () => {
     vi.useFakeTimers()
     const platform = new QQNTPlatform()
     mockSubscribe(platform)
-    platform.client.sendMessage = vi.fn(async (_conversation, text, _media, _options, originRequestId) => ({
+    platform.client.sendMessage = vi.fn(async (_conversation, parts, _options, transfer) => ({
       id: 'sent', conversationId: 'new-group', senderId: 'self', timestamp: 1, outgoing: true,
-      originRequestId, parts: [{ type: 'text' as const, text: text! }],
+      originRequestId: transfer?.originRequestId,
+      parts: parts.map((part) => part.type === 'text' ? part : { type: 'text' as const, text: '' }),
     }))
     let includeNewConversation = false
     let originRequestId: string | undefined
@@ -4294,7 +4796,7 @@ describe('QQNTPlatform dialogs polling', () => {
     const unsubscribe = await platform.subscribe(session, (event) => { events.push(event) })
     await vi.advanceTimersByTimeAsync(0)
     await platform.sendMessage(session, { id: 'new-group' }, { parts: [{ type: 'text', text: 'echo' }] })
-    originRequestId = (platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![4]
+    originRequestId = (platform.client.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![3]?.originRequestId
     includeNewConversation = true
     await vi.advanceTimersByTimeAsync(15_000)
 

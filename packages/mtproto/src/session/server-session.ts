@@ -24,12 +24,10 @@ import {
 } from '../rpc/api-layer.js'
 import type { MtprotoDebugEvent, MtprotoDebugListener } from '../debug.js'
 
-// TL constructor IDs for MTProto service messages
 const RPC_RESULT_ID = 0xF35C6D01
 const BOOL_TRUE_ID = 0x997275B5
 const BOOL_FALSE_ID = 0xBC799737
 const GZIP_PACKED_ID = 0x3072CFA1
-// Bare Vector<X> prefix (https://core.telegram.org/type/Vector%20X)
 const VECTOR_ID = 0x1CB5C415
 const MAX_GZIP_NESTING = 4
 const MAX_SHARED_COMPLETED_MESSAGE_IDS = 16_384
@@ -77,9 +75,8 @@ class RpcConnectionClosedError extends Error {
 }
 
 /**
- * Tracks invokeAfterMsg dependencies across TCP connections that share the
- * same permanent auth key. Telegram Android may create a request on one
- * connection and resend it through another after reconnecting.
+ * 跨共享同一永久 auth key 的多条连接追踪 `invokeAfterMsg` 依赖与 RPC 重放缓存
+ *（客户端可能在重连后通过新连接重发先前的请求）。
  */
 export class RpcDependencyRegistry {
   private readonly _processing = new Map<string, Promise<void>>()
@@ -114,10 +111,7 @@ export class RpcDependencyRegistry {
 
   completed(authKeyId: Uint8Array, msgId: Long): boolean {
     if (this._completed.has(this._key(authKeyId, msgId))) return true
-    // No request from before this process started can still be running here.
-    // Android keeps invokeAfterMsg wrappers in its resend queue across relay
-    // restarts, so treating those historical dependencies as satisfied lets
-    // the actual request resume without weakening checks for current ids.
+    // 进程启动前生成的 msgId 不可能仍在执行，直接视为已完成以放行客户端跨重启重发的 invokeAfterMsg 请求
     return (msgId.high >>> 0) < this._startedAtSeconds
   }
 
@@ -132,11 +126,7 @@ export class RpcDependencyRegistry {
     this._inFlight = 0
   }
 
-  /**
-   * Coalesce the same RPC across reconnecting sockets and retain a bounded
-   * serialized reply so a later retransmission can be answered without
-   * executing the handler again.
-   */
+  /** 合并断线重连后的重复 RPC 请求，并短期缓存序列化后的响应体 */
   execute(
     authKeyId: Uint8Array,
     msgId: Long,
@@ -197,15 +187,13 @@ export class RpcDependencyRegistry {
     return promise
   }
 
-  /** Auth scopes with handlers still running, including on disconnected sockets. */
+  /** 存在运行中 RPC 的 auth key 集合（含已断开的连接） */
   get inFlightAuthKeyIds(): Iterable<string> {
     return this._inFlightByAuth.keys()
   }
 
-  /** Also called during idle periods so completed replies do not live forever. */
   prune(now = Date.now()): void {
-    // Hits reorder the map. Track the earliest expiry rather than assuming LRU
-    // order is time order, without scanning thousands of replies on every RPC.
+    // 缓存命中会重排 Map 顺序，不能假设遍历顺序即过期顺序；通过 _nextReplayExpiry 避免每次 RPC 全表扫描
     if (now < this._nextReplayExpiry
       && this._replays.size <= MAX_RPC_REPLAY_ENTRIES
       && this._replayBytes <= MAX_RPC_REPLAY_BYTES) return
@@ -257,17 +245,10 @@ class UnknownStoredAuthKey extends Error {
   }
 }
 
-// A client may be authorized before its first invokeWithLayer request arrives.
-// Keep this bounded because updates are only queued during that short handshake
-// window and must not become an unbounded memory sink if a client disappears.
+// 客户端协商出 API layer 前暂存推送更新的上限
 const MAX_PENDING_UPDATES = 256
-// invokeAfterMsg references very recent request ids (Telegram Android only
-// considers the previous five seconds). Keep a wider bounded history so a
-// dependency that completed just before its wrapper was decoded is recognized.
 const MAX_COMPLETED_MESSAGE_IDS = 4096
-// These RPCs establish the platform identity stored behind an MTProto auth key.
-// Calls received after one of them must not observe the old authorization
-// state, but unrelated API calls may execute concurrently.
+// 会改变 auth key 关联身份的方法需按收包顺序串行执行，后续普通 RPC 需等待前置身份切换完成
 const AUTHORIZATION_TRANSITION_METHODS = new Set([
   'auth.bindTempAuthKey',
   'auth.signIn',
@@ -278,7 +259,6 @@ const AUTHORIZATION_TRANSITION_METHODS = new Set([
   'auth.importLoginToken',
 ])
 
-/** Serialize a Long to 8 little-endian bytes (matches an 8-byte auth key id). */
 function longToBytesLE(v: Long): Uint8Array {
   const b = new Uint8Array(8)
   const dv = new DataView(b.buffer)
@@ -287,7 +267,6 @@ function longToBytesLE(v: Long): Uint8Array {
   return b
 }
 
-/** Serialize a bare Bool result (4-byte constructor id, little-endian). */
 function boolBytes(value: boolean): Uint8Array {
   const b = new Uint8Array(4)
   new DataView(b.buffer).setUint32(0, value ? BOOL_TRUE_ID : BOOL_FALSE_ID, true)
@@ -295,24 +274,10 @@ function boolBytes(value: boolean): Uint8Array {
 }
 
 
-/**
- * Server-side MTProto session — one per client connection.
- *
- * Lifecycle:
- * 1. On connect: run the DH handshake (unencrypted messages)
- * 2. After handshake: send `new_session_created`
- * 3. For each incoming encrypted message: decrypt → handle (container/rpc/service) → respond
- * 4. RPC calls are dispatched through the Cordis RPC event pipeline; responses are sent as `rpc_result`
- * 5. Updates can be pushed to the client at any time (after handshake)
- */
+/** 单个客户端连接对应的服务端 MTProto 会话 */
 export class ServerSession {
-  /** Permanent auth key, established by the first DH handshake. */
   private _permAuthKey: ServerAuthKey
-  /**
-   * Temporary (PFS) auth key, established by a second DH handshake on the same
-   * connection and bound to the perm key via auth.bindTempAuthKey. Once present,
-   * the client uses it for all encrypted traffic. Null until negotiated.
-   */
+  /** PFS 临时 auth key（通过 auth.bindTempAuthKey 绑定到永久 key 后用于加解密） */
   private _tempAuthKey: ServerAuthKey | null = null
   private _tempAuthKeyExpiresAt: number | null = null
   private _msgIdGen: ServerMessageIdGenerator
@@ -329,20 +294,12 @@ export class ServerSession {
   private _responseAdapter: ApiLayerResponseAdapter = { schemaLayer: null, adapt: value => value }
   private _pendingUpdates: Array<{ update: tl.TypeUpdates, clientSessionId?: Long }> = []
   private _acceptsUpdates = false
-  /** Session that last established an updates stream on this connection. */
   private _updateSessionId: Long | null = null
   private _queuedAcks = new Map<string, { sessionId: Long, msgIds: Long[], ids: Set<string> }>()
   private _scheduledAckFlushes = new Set<string>()
   private _futureSalts: { validSince: number, validUntil: number, salt: Long }[] = []
   private _msgHandler: ((data: Uint8Array) => void) | null = null
-  /**
-   * Handshake frames normally bypass the Cordis packet pipeline after the
-   * first plaintext packet replaces the connection handler. Keep an ingress
-   * reservation before entering that async pipeline as well: a fast client can
-   * otherwise deliver another plaintext frame while the first packet is still
-   * crossing middleware, causing two authorization state machines to own the
-   * same socket and emit stale nonces indefinitely.
-   */
+  /** 握手阶段预留入口，确保首包通过异步中间件期间到达的后续明文握手帧不会启动第二个握手状态机 */
   private _handshakeIngress: {
     pending: Uint8Array[]
     handler: ((data: Uint8Array) => void) | null
@@ -359,9 +316,6 @@ export class ServerSession {
   private _rpcWaiters: Array<(release: (() => void) | null) => void> = []
   private _rpcReadPaused = false
   private _disposed = false
-  // Only authorization transitions form a barrier. Serializing every API RPC
-  // lets one slow history/download request stall all later calls while pings
-  // still succeed, leaving Telegram with a deceptively half-alive connection.
   private _authorizationTransitionProcessing: Promise<void> = Promise.resolve()
 
   constructor(
@@ -386,17 +340,12 @@ export class ServerSession {
     this._permAuthKey = new ServerAuthKey(_crypto, _log, _readerMap)
     this._msgIdGen = new ServerMessageIdGenerator()
     this._responseWriterMap = _writerMap
-    // Session ID is set from the client's first encrypted message (MTProto convention)
   }
 
-  /** The auth key used to encrypt server→client messages: temp once bound, else perm. */
   private get _sendKey(): ServerAuthKey {
     return this._tempAuthKey?.ready ? this._tempAuthKey : this._permAuthKey
   }
 
-  /**
-   * Start the session: begin handshake when data arrives.
-   */
   start(): void {
     if (this._msgHandler) return
     const onMsg = (data: Uint8Array) => {
@@ -418,12 +367,7 @@ export class ServerSession {
     }, 'mtproto.session.frames')
   }
 
-  /**
-   * Push a server-initiated update. RPC-local updates supply their originating
-   * session explicitly; external pushes target the session that activated the
-   * updates stream. Before that activation, retain the legacy latest-session
-   * fallback so early post-login updates remain deliverable.
-   */
+  /** 向客户端推送 Update（尚未协商出 API layer 时先入队暂存） */
   sendUpdate(update: tl.TypeUpdates, clientSessionId?: Long): void {
     this._clearExpiredLoginToken()
     if (!this._authorized || this._loginTokenPending) return
@@ -462,12 +406,11 @@ export class ServerSession {
     }
   }
 
-  /** Clear a QR token superseded by an export on another connection. */
   supersedeLoginToken(token: Uint8Array): void {
     if (this._loginToken && !typed.equal(this._loginToken, token)) this._clearLoginToken()
   }
 
-  /** Send the sole pre-authorization update required by the QR-login protocol. */
+  /** 推送二维码登录确认所需的 `updateLoginToken` */
   sendLoginTokenUpdate(token: Uint8Array): boolean {
     this._clearExpiredLoginToken()
     if (
@@ -504,21 +447,13 @@ export class ServerSession {
     return this._connection
   }
 
-  /** Apply an API layer learned by another connection using the same auth key. */
   applyApiLayer(layer: number): void {
     this._setApiLayer(layer, false)
   }
 
-  // ── Internal: data handling ──
-
   private _enqueueRawFrame(data: Uint8Array): void {
     if (this._disposed || this._connection.closed) return
-    // A handshake owns the socket until DH authorization finishes. The normal
-    // frame drain is deliberately single-file and is currently awaiting that
-    // handshake, so queueing the next plaintext frame behind it deadlocks the
-    // handshake's recvPlain() waiter. Route follow-up frames straight to the
-    // handshake ingress instead; frames that arrive before its temporary
-    // handler is installed remain buffered on the ingress reservation.
+    // 握手期间后续帧直接交由 _handshakeIngress 处理，避免进入单线程 _frameQueue 阻塞 recvPlain()
     const activeHandshake = this._handshakeIngress
     if (activeHandshake) {
       const owned = new Uint8Array(data)
@@ -631,12 +566,10 @@ export class ServerSession {
 
   private async _processRawData(data: Uint8Array, packetCtx: Context): Promise<void> {
     if (!this._authorized) {
-      // Returning API and media connections may present either a permanent key
-      // or a temporary PFS key before any plaintext handshake.
       const firstKeyId = data.subarray(0, 8)
       if (!firstKeyId.every(b => b === 0)) {
         if (await this._resumeStoredAuthKey(firstKeyId)) {
-          await this._processRawData(data, packetCtx) // re-process this frame, now authorized
+          await this._processRawData(data, packetCtx)
           return
         }
         this._sendAuthKeyNotFound(firstKeyId)
@@ -648,9 +581,7 @@ export class ServerSession {
 
     const keyId = data.subarray(0, 8)
 
-    // A zero auth_key_id after the first handshake means the client is opening a
-    // second plaintext handshake on the same connection to negotiate a PFS
-    // temporary auth key (Telegram Desktop / TDLib always do this).
+    // 已授权连接上再次收到 auth_key_id = 0，表示客户端发起第二次明文握手以协商 PFS 临时密钥
     if (keyId.every(b => b === 0)) {
       const object = new TlBinaryReader(this._readerMap, data, 20).object() as mtp.TlObject
       if (object._ === 'mt_msgs_ack') {
@@ -674,14 +605,9 @@ export class ServerSession {
       return
     }
 
-    // Accept messages on any session the client uses (a connection may carry
-    // more than one, e.g. the PFS bind session vs the API session). We echo each
-    // response on the session of the request it answers, so we never validate
-    // against a single pinned session — just track the latest.
+    // 同一连接可能携带多个客户端 sessionId（如 PFS 绑定会话与 API 会话），按请求自身的 sessionId 原路回包
     key.decryptMessage(data, null, (msgId, seqNo, reader, clientSessionId) => {
       if (!this._sessionIdSet) this._sessionIdSet = true
-      // Service frames must not wait behind slow RPC dispatches. The RPC path
-      // retains this value and restores it immediately before dispatching.
       this._sessionId = clientSessionId
       this._handleDecryptedMessage(msgId, seqNo, reader, clientSessionId, packetCtx).catch((err) => {
         this._log.error('error handling message %s: %s', msgId.toString(16), err)
@@ -712,13 +638,7 @@ export class ServerSession {
     return promise
   }
 
-  /**
-   * Run one DH handshake to completion over unencrypted messages.
-   *
-   * @param data    The first unencrypted frame that triggered the handshake.
-   * @param isTemp  Whether this is a second handshake on an authorized socket.
-   *                The key kind itself comes from p_q_inner_data(_temp)_dc.
-   */
+  /** 执行单次明文 DH 握手（`isTemp` 标识是否为已授权连接上的第二次 PFS 握手） */
   private async _runHandshake(data: Uint8Array, isTemp: boolean): Promise<void> {
     this._log.verbose('%s handshake starting (%d bytes)', isTemp ? 'temp-key' : 'perm-key', data.length)
 
@@ -746,9 +666,7 @@ export class ServerSession {
     }
 
     const tempHandler = (msg: Uint8Array) => {
-      // Telegram Desktop probes a media connection with req_pq, then reuses its
-      // cached permanent or temporary key on that same socket. Pause the probe
-      // handshake and resume only after the key store confirms the key id.
+      // 桌面端建立媒体连接时可能先发 req_pq 探测，随后在同一连接上直接复用缓存的加密 key
       const keyId = msg.subarray(0, 8)
       const encrypted = !keyId.every(b => b === 0)
       if (encrypted && !isTemp) {
@@ -771,12 +689,9 @@ export class ServerSession {
         return
       }
 
-      // A single intermediate frame may contain multiple unencrypted messages.
-      // Each unencrypted message: auth_key_id(8)=0 + msg_id(8) + length(4) + body.
+      // 单个传输帧可能拼接多条明文消息：auth_key_id(8)=0 + msg_id(8) + length(4) + body
       let offset = 0
       while (offset + 20 <= msg.length) {
-        // Encrypted traffic during a PFS handshake cannot replace its already
-        // established permanent key, so retain the previous strict behavior.
         let zeroKeyId = true
         for (let i = 0; i < 8; i++) {
           if (msg[offset + i] !== 0) { zeroKeyId = false; break }
@@ -804,8 +719,6 @@ export class ServerSession {
 
     let resumed: ResumeStoredAuthKey | null = null
     try {
-      // Capture frames that reached the normal handler before this handshake
-      // crossed the async packet middleware, then route all later frames here.
       ingress.handler = tempHandler
       for (const pending of ingress.pending.splice(0)) tempHandler(pending)
 
@@ -858,9 +771,7 @@ export class ServerSession {
       }
 
       if (result.temporary) {
-        // Desktop shares the PFS key across its API, upload, and download TCP
-        // connections. A fresh media socket may create this key directly; its
-        // permanent identity is loaded later from auth.bindTempAuthKey.
+        // 媒体连接可能直接创建 PFS 临时 key，其对应的永久身份稍后通过 auth.bindTempAuthKey 加载
         this._tempAuthKey = new ServerAuthKey(this._crypto, this._log, this._readerMap)
         this._tempAuthKey.setup(result.authKey)
         this._tempAuthKeyExpiresAt = result.expiresAt ?? null
@@ -872,7 +783,6 @@ export class ServerSession {
         this._serverSalt = result.serverSalt
         this._authorized = true
         this._log.info('handshake complete, auth key id = %h', this._permAuthKey.id)
-        // Persist the perm key so a returning client can resume without re-handshaking.
         try {
           await this._keyStore?.save(this._permAuthKey.id, { key: result.authKey })
         } catch (err) {
@@ -880,14 +790,9 @@ export class ServerSession {
         }
       }
 
-      // Generate initial future salts once, before the first encrypted message.
       if (this._futureSalts.length === 0) {
         this._generateFutureSalts()
       }
-
-      // Note: new_session_created is sent after the first encrypted message
-      // is received, because we need the client's session ID (captured from
-      // the first message) to encrypt it correctly.
     } catch (err) {
       if (err instanceof ResumeStoredAuthKey) {
         resumed = err
@@ -918,8 +823,6 @@ export class ServerSession {
       if (!temporary || !temporary.permanentKeyId || !typed.equal(temporary.permanentKeyId, record.permanentKeyId)) {
         return false
       }
-      // This is the final await before adopting either key. A durable tombstone
-      // makes this lookup fail, so no revoked record can be installed afterward.
       const permanent = await this._keyStore?.get(temporary.permanentKeyId)
       if (!permanent || permanent.permanentKeyId) return false
       this._permAuthKey.setup(permanent.key)
@@ -937,7 +840,6 @@ export class ServerSession {
       return true
     }
 
-    // This final lookup closes the race with durable revocation for a permanent key.
     const permanent = await this._keyStore?.get(keyId)
     if (!permanent || permanent.permanentKeyId || !typed.equal(permanent.key, record.key)) return false
     this._permAuthKey.setup(permanent.key)
@@ -999,15 +901,12 @@ export class ServerSession {
     let obj: { _: string }
     let gzipNesting = 0
 
-    // Both gzip_packed and msg_container are transport envelopes. TDLib can
-    // place compressed requests inside a container and can nest gzip_packed,
-    // so unwrap envelopes until an ordinary API/service object is reached.
+    // 逐层解包 gzip_packed 与 msg_container 传输信封
     for (;;) {
       const savedPos = reader.pos
       const constructorId = reader.uint()
 
       if (constructorId === 0x73f1f8dc) {
-        // msg_container: vector of { msg_id, seqno, length, body }
         const count = reader.uint()
         this._capture('client->server', 'message', { _: 'msg_container', count }, {
           messageId: msgId,
@@ -1027,10 +926,7 @@ export class ServerSession {
               }),
           )
         }
-        // A container is a transport batch, not an execution queue. Android
-        // groups independent upload.getFile calls in one container; awaiting
-        // each handler in wire order lets one slow or wedged asset prevent all
-        // following media and reaction resources from receiving a response.
+        // 容器内的多条子请求并发执行，避免单个慢请求（如 upload.getFile）阻塞同批其他请求
         await Promise.all(processing)
         return
       }
@@ -1046,7 +942,6 @@ export class ServerSession {
         continue
       }
 
-      // Not a transport envelope — restore position and read normally.
       reader.pos = savedPos
       break
     }
@@ -1152,11 +1047,7 @@ export class ServerSession {
     return obj
   }
 
-  /**
-   * A msg_container is only a transport batch. One malformed or unsupported
-   * inner RPC must not discard its siblings (Telegram Android commonly batches
-   * background probes together with user-visible requests such as sendMessage).
-   */
+  /** 容器内单条子消息解析或处理失败时仅对该子消息返回错误，不影响同容器内其他消息 */
   private _handleContainerMessageError(
     msgId: Long,
     seqNo: number,
@@ -1230,7 +1121,6 @@ export class ServerSession {
     req: mtp.RawMt_get_future_salts,
     clientSessionId: Long,
   ): void {
-    // Ensure future salts are generated
     if (this._futureSalts.length === 0) {
       this._generateFutureSalts()
     }
@@ -1259,16 +1149,13 @@ export class ServerSession {
     }
 
     try {
-      // Manually serialize mt_future_salts — the generated writer has a bug
-      // with bare vectors that makes TlSerializationCounter crash.
-      // Format: constructor_id(4) + req_msg_id(8) + now(4) + count(4) + salts[]
-      // Each salt: valid_since(4) + valid_until(4) + salt(8) = 16 bytes (bare, no constructor id)
+      // mt_future_salts 中的 salts 是裸 vector（无 0x1CB5C415 前缀且元素无 constructor id），需手动序列化
       const size = 4 + 8 + 4 + 4 + salts.length * 16
       const writer = TlBinaryWriter.manual(size)
-      writer.uint(0xAE500895) // mt_future_salts constructor id
+      writer.uint(0xAE500895)
       writer.long(msgId)
       writer.uint(now)
-      writer.uint(salts.length) // bare vector: just count, no 0x1CB5C415 prefix
+      writer.uint(salts.length)
       for (const s of salts) {
         writer.uint(s.validSince)
         writer.uint(s.validUntil)
@@ -1320,11 +1207,8 @@ export class ServerSession {
   }
 
   /**
-   * Handle auth.bindTempAuthKey — binds the temporary (PFS) key to the permanent
-   * key. The request arrives encrypted with the temp key; its `encryptedMessage`
-   * is a `bind_auth_key_inner` sealed with the *permanent* key using the old
-   * MTProto message encryption. Verify the requested permanent key before making
-   * it this session's identity or persisting the temporary-key association.
+   * 处理 `auth.bindTempAuthKey`：将临时 PFS key 绑定到永久 key。
+   * 必须先用永久 key 校验内部 `bind_auth_key_inner` 签名，通过后才切换当前会话身份并持久化绑定关系。
    */
   private async _handleBindTempAuthKey(
     _msgId: Long,
@@ -1381,9 +1265,7 @@ export class ServerSession {
     }
 
     if (candidate !== this._permAuthKey) {
-      // The temp-key save may yield long enough for another connection to
-      // tombstone this permanent identity. Make this the final await before
-      // installing the stored key on the PFS session.
+      // 保存临时 key 期间永久 key 可能被并发吊销，安装前再次核对存储状态
       const revalidated = await this._keyStore?.get(permanentId)
       if (!revalidated || revalidated.permanentKeyId || !typed.equal(revalidated.key, candidate.key)) {
         this._connection.close()
@@ -1402,7 +1284,7 @@ export class ServerSession {
     return { _: 'boolTrue' }
   }
 
-  /** Decrypt and verify the `encrypted_message` from auth.bindTempAuthKey. */
+  /** 用永久 key 解密并校验 `auth.bindTempAuthKey` 内部的 `bind_auth_key_inner`（使用 MTProto v1 消息加密方案） */
   private _verifyBindInner(req: tl.auth.RawBindTempAuthKeyRequest, permanent: ServerAuthKey): boolean {
     try {
       if (!permanent.ready || !this._tempAuthKey?.ready) return false
@@ -1418,18 +1300,16 @@ export class ServerSession {
 
       const msgKey = enc.subarray(8, 24)
       const encData = enc.subarray(24)
-      // The client encrypts with the OLD MTProto message scheme, client=true.
       const ige = createAesIgeForMessageOld(this._crypto, permanent.key, msgKey, true)
       const dec = ige.decrypt(encData)
       if (dec.length < 32) return false
 
-      // Layout: random(16) + msg_id(8) + seq_no(4) + length(4) + bind_auth_key_inner + padding
+      // 布局：random(16) + msg_id(8) + seq_no(4) + length(4) + bind_auth_key_inner + padding
       const dv = typed.toDataView(dec)
       const innerLen = dv.getUint32(28, true)
       const msgEnd = 32 + innerLen
       if (msgEnd > dec.length) return false
 
-      // msg_key = SHA1(message without padding)[4:20]
       const expectedMsgKey = this._crypto.sha1(dec.subarray(0, msgEnd)).subarray(4, 20)
       if (!typed.equal(msgKey, expectedMsgKey)) {
         this._log.warn('bindTempAuthKey: inner msg_key mismatch')
@@ -1465,13 +1345,6 @@ export class ServerSession {
     }
   }
 
-  // ── RPC call handling ──
-
-  /**
-   * Commit authorization transitions in wire order. Ordinary RPCs wait for the
-   * transitions that arrived before them, then execute independently; explicit
-   * invokeAfterMsg dependencies are enforced by _waitForRpcDependencies.
-   */
   private async _enqueueRpcCall(
     msgId: Long,
     request: tl.RpcMethod,
@@ -1562,8 +1435,6 @@ export class ServerSession {
     let reply: RpcReply
     try {
       const authKeyId = this._permAuthKey.ready ? this._permAuthKey.id : null
-      // Binding a fresh temporary key mutates this connection's crypto state and
-      // therefore cannot be replayed from another socket's execution.
       reply = authKeyId && method !== 'auth.bindTempAuthKey' && this._dependencyRegistry
         ? await this._dependencyRegistry.execute(authKeyId, msgId, this._rpcFingerprint(request), execute)
         : await execute()
@@ -1622,9 +1493,7 @@ export class ServerSession {
     afterResponseSettled: Array<() => void | Promise<void>>,
   ): Promise<RpcResult> {
 
-    // A wrapped bind must prove the requested permanent identity before its
-    // invokeWithLayer value can affect this session. The bare form is handled
-    // in _processDecryptedMessage; wrapped binds arrive here after unwrapping.
+    // 被 invokeWithLayer 包裹的 auth.bindTempAuthKey 必须先验证永久 key，再应用其声明的 apiLayer
     if (unwrapped.request._ === 'auth.bindTempAuthKey') {
       return this._handleBindTempAuthKey(
         msgId,
@@ -1634,13 +1503,8 @@ export class ServerSession {
       )
     }
 
-    // invokeWithLayer is the one authoritative source of the client's API layer.
-    // Capture it on the MTProto session before constructing the handler context
-    // or serializing this request's response. Later unwrapped requests reuse it.
     if (this._apiLayer === null) {
-      // The API layer is not part of the DH handshake and cannot be inferred
-      // from a bare RPC. Telegram clients retry this request after receiving
-      // CONNECTION_NOT_INITED with invokeWithLayer(initConnection(...)).
+      // 未通过 invokeWithLayer(initConnection(...)) 声明 API layer 时返回 CONNECTION_NOT_INITED 触发客户端重发初始化
       return {
         _: 'mt_rpc_error',
         errorCode: 400,
@@ -1655,10 +1519,6 @@ export class ServerSession {
         errorMessage: 'MSG_WAIT_FAILED',
       } as mtp.RawMt_rpc_error
     }
-    // The connection fiber is disposed as soon as its socket closes. Requests
-    // released from an authorization/dependency queue after that point cannot
-    // deliver a result and must not try to create an RPC child fiber from the
-    // now-inactive packet context.
     if (this._connection.closed) {
       throw new RpcConnectionClosedError()
     }
@@ -1888,17 +1748,13 @@ export class ServerSession {
 
     let resultBytes: Uint8Array
     if (kind === 'boolTrue' || kind === 'boolFalse') {
-      // Bare Bool results aren't in mtcute's writer map (Bool is modeled as a JS
-      // boolean), so serialize their constructor id directly.
       resultBytes = boolBytes(kind === 'boolTrue')
     } else if (isBareVector(result)) {
-      // Bare Vector<X>: 0x1cb5c415 + count + items (no wrapping object).
       resultBytes = this._serializeBareVector(result)
     } else {
       resultBytes = TlBinaryWriter.serializeObject(this._responseWriterMap, result)
     }
 
-    // Build rpc_result: id(4) + req_msg_id(8) + result
     const writer = TlBinaryWriter.manual(4 + 8 + resultBytes.length)
     writer.uint(RPC_RESULT_ID)
     writer.long(reqMsgId)
@@ -1945,10 +1801,10 @@ export class ServerSession {
     return settled ?? Promise.resolve()
   }
 
-  /** Serialize a bare `Vector<X>`: `0x1cb5c415` + count + each item. */
+  /** 序列化裸 `Vector<X>`：`0x1cb5c415` + count + 元素列表 */
   private _serializeBareVector(vec: BareVector): Uint8Array {
     const serialized: Uint8Array[] = []
-    let size = 8 // constructor id + count
+    let size = 8
     for (const item of vec.items) {
       const b = TlBinaryWriter.serializeObject(this._responseWriterMap, item)
       serialized.push(b)
@@ -1961,11 +1817,7 @@ export class ServerSession {
     return writer.result()
   }
 
-  /**
-   * Encrypt and send a message.
-   * The message body should NOT include the msg_id/seq_no/length header —
-   * we add it here.
-   */
+  /** 封装 `msg_id + seq_no + length` 头部后加密发送 */
   private _sendEncryptedMessage(
     body: Uint8Array,
     isContentRelated: boolean,

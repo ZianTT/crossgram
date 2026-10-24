@@ -2,11 +2,7 @@ import type { Database } from '@cordisjs/plugin-database'
 
 const GROUP_ALIAS_KEY = 'qqGroupAlias'
 
-/**
- * Repairs user rows written before QQ group cards became conversation-scoped
- * member tags. The old adapter kept the global QQ nickname in `qqName`, so the
- * migration does not need a network lookup and is safe to run repeatedly.
- */
+/** 将旧版被群名片覆盖的 `mtproto_im_user` 名称恢复为 `metadata.qqName` 中的全局 QQ 昵称。 */
 export async function migrateLegacyQQGroupAliasUsers(
   database: Database,
   platformId: string,

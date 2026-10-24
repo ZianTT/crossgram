@@ -7,30 +7,12 @@ import { getHistoricalApiLayerReaderMap } from './api-layer.js'
 
 let _serverReaderMap: TlReaderMap | null = null
 
-/**
- * Constructors that mtcute's *client* MTProto schema (`mtp-schema.json`) omits
- * because a client never needs to *read* them — but a server does.
- *
- * The notable one is the legacy `req_pq` (#60469778): modern mtcute clients send
- * `req_pq_multi`, but Telegram Desktop / TDLib-based clients still open the
- * handshake with `req_pq`. Definitions are canonical MTProto and stable; they go
- * through the same codegen pipeline as every other reader (no hand-written
- * reader functions), with the `mt_` prefix so names match mtcute's (`mt_req_pq`).
- */
+// mtcute 客户端 schema 省略了服务端才需要解码的握手构造器（如 TDLib/Desktop 仍在使用的旧版 req_pq#60469778）。
 const EXTRA_MTP_SCHEMA = `
 req_pq#60469778 nonce:int128 = ResPQ;
 `
 
-/**
- * Telegram Android still emits these legacy/private requests while declaring
- * the current public API layer. They are present in the official Android
- * sources but absent from both mtcute's current schema and the public TDLib
- * layer history mirrored by this project.
- *
- * Keep them as an explicit server compatibility surface: constructor IDs are
- * the wire identity, while the shared method names let the normal RPC route pipeline
- * route them to the canonical handlers after decoding.
- */
+// Telegram Android 在声明最新 layer 时仍会发送这些不在公开 TDLib 历史 schema 中的旧构造器。
 const TELEGRAM_ANDROID_COMPAT_SCHEMA = `
 gzip_packed#3072cfa1 packed_data:bytes = Object;
 
@@ -40,7 +22,7 @@ langpack.getLanguages#800fd57d = Vector<LangPackLanguage>;
 account.registerDevice#637ea878 token_type:int token:string = Bool;
 `
 
-/** Crossgram client extensions. Constructor ids are a stable wire contract. */
+/** Crossgram 客户端扩展 TL 定义 */
 export const CROSSGRAM_API_SCHEMA = `
 ---functions---
 crossgram.getFileUrl#7520f6ea location:InputFileLocation = DataJSON;
@@ -52,21 +34,12 @@ crossgram.sendPoke#9a2d47f0 peer:InputPeer user_id:InputUser count:int = Bool;
 `
 
 /**
- * Build a TL reader map that includes RPC method requests, by merging
- * mtcute's built-in `__tlReaderMap` with method readers generated at
- * runtime via `@mtcute/tl-utils`.
- *
- * mtcute's `__tlReaderMap` deliberately excludes method requests — a client
- * only reads responses. On the server side, we need to read the client's
- * RPC requests, so we generate the missing method readers and merge them.
- *
- * The result is cached after first call.
+ * 构建服务端 TL reader map。
+ * mtcute 内置的 `__tlReaderMap` 仅含响应类型；服务端需合并当前与历史 layer 的 RPC 请求方法解码器。
  */
 export function getServerReaderMap(): TlReaderMap {
   if (_serverReaderMap) return _serverReaderMap
 
-  // mtcute publishes schemas as generated JSON. The JSON module declaration
-  // cannot express its TL entry shape, so verify it at this boundary.
   const apiSchema = parseFullTlSchema((apiSchemaRaw.e ?? apiSchemaRaw) as unknown as TlEntry[])
   const mtpSchema = parseFullTlSchema(mtpSchemaRaw as unknown as TlEntry[])
 
@@ -76,9 +49,6 @@ export function getServerReaderMap(): TlReaderMap {
     ...compatApiEntries.filter(e => !apiSchema.entries.some(x => x.id === e.id)),
   ]
 
-  // Merge mtcute's MTProto entries with the server-only constructors it omits.
-  // Keep mtcute's entries authoritative (so field shapes match its generated
-  // TS types), only adding definitions whose ctor id isn't already present.
   const extraMtpEntries = parseTlToEntries(EXTRA_MTP_SCHEMA, { prefix: 'mt_' })
   const mtpEntries = [
     ...mtpSchema.entries,
@@ -88,14 +58,12 @@ export function getServerReaderMap(): TlReaderMap {
   const removeInternal = (entries: typeof apiSchema.entries) =>
     entries.filter(it => !it.name.startsWith('mtcute.') || it.name === 'mtcute.customMethod')
 
-  // Generate reader code with methods included
   let code = generateReaderCodeForTlEntries(removeInternal(apiEntries), {
     variableName: 'm',
     includeMethods: true,
     includeMethodResults: true,
   })
 
-  // Append MTP service message readers
   const mtpCode = generateReaderCodeForTlEntries(mtpEntries, { variableName: 'm' })
   code = code.substring(0, code.length - 1) + mtpCode.substring(8)
   code += '\nreturn m;'
@@ -103,7 +71,6 @@ export function getServerReaderMap(): TlReaderMap {
   // eslint-disable-next-line no-new-func
   const generated = new Function(code)() as TlReaderMap
 
-  // Merge: start with mtcute's built-in map, then add generated method readers
   _serverReaderMap = Object.assign(
     Object.create(null),
     __tlReaderMap,

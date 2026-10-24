@@ -5,7 +5,6 @@ import type {
 } from './platform.js'
 
 export interface MessageProjectionPartPlan {
-  /** Source content part containing the media represented by this Telegram message. */
   mediaPartIndex?: number
 }
 
@@ -39,18 +38,12 @@ export interface MessageProjectionInput {
   session: PlatformSession
   target: {
     peer: tl.TypePeer
-    /** Present only for an ordinary platform conversation. */
     conversation?: IMConversation
     title?: string
   }
   tlMessageId: number
   ordinal: number
-  /**
-   * Durable `mtproto_im_message` row that holds the source, when it is
-   * stored.  Features that derive virtual peers from message content encode
-   * it in their addresses so a restart can find the content again without
-   * any process-local registry.
-   */
+  /** 源消息在 `mtproto_im_message` 中的主键（由消息内容派生的虚拟会话将其编码在地址中，以便重启后重新定位源消息）。 */
   storedMessageId?: number
   draft: MessageProjectionDraft
 }
@@ -60,7 +53,6 @@ export interface MessageProjectionResult {
   chats: tl.TypeChat[]
 }
 
-/** Cordis projection waterfall plus a bounded non-durable media registry. */
 export class MessageProjectionPipeline {
   private readonly _media = new Map<string, { media: IMMedia, timestamp: number }>()
 
@@ -90,7 +82,6 @@ export class MessageProjectionPipeline {
     ))
   }
 
-  /** Register non-durable media owned by a virtual projection. */
   rememberMedia(
     session: PlatformSession,
     id: number,

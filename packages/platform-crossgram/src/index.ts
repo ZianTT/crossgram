@@ -12,11 +12,14 @@ import {
   type IMDirectDownload, type IMDownloadOptions, type IMEvent, type IMHistoryPage, type IMHistoryQuery, type IMMedia, type IMMessage, type IMMessageInput, type IMMessageTarget,
   type IMMediaInput, type IMMediaUploadPreparation, type IMMediaUploadProbe,
   type IMMessageBundle, type IMMessageSnapshot, type JsonObject, type JsonValue,
-  type IMMessageSearchPage, type IMMessageSearchQuery, type IMPageQuery, type IMPlatform, type IMReactionActorPage, type IMReactionActorPageRequest, type IMReactionContext, type IMReactionResource, type IMReactionTarget, type IMReadTarget, type IMRequest, type IMRequestAction, type IMRequestPage, type IMRequestQuery, type IMSticker, type IMTransferOptions,
+  type IMPageQuery, type IMPlatform, type IMReactionActorPage, type IMReactionActorPageRequest, type IMReactionContext, type IMReactionResource, type IMReactionTarget, type IMReadTarget, type IMRequest, type IMRequestAction, type IMRequestPage, type IMRequestQuery, type IMSticker, type IMTextEntity, type IMTransferOptions,
   type IMUser, type IMUserPage, type PlatformCapabilities, type PlatformSession, type Unsubscribe,
   type VoiceCallMediaProvider, type VoiceWorkerCall, type VoiceWorkerMediaEndpoint,
 } from '@mtproto-relay/bridge'
-import { QQNTClient, QQNTMessageSendRejectedError, qqAvatarUrl, type QQNTClientOptions } from './client.js'
+import {
+  QQNTClient, QQNTMessageSendRejectedError, qqAvatarUrl,
+  type QQNTClientOptions, type QQOutboundMedia, type QQSendPart,
+} from './client.js'
 import { defineQQNTEventCheckpointModel } from './event-checkpoint.js'
 import { QQStickerProvider } from './sticker-provider.js'
 import { QQVoiceMedia } from './voice-media.js'
@@ -26,27 +29,28 @@ import { defineQQMediaPreviewModel, mediaPreviewKey, QQMediaPreviewer } from './
 import { extractRemoteVideoFrame, type RemoteVideoFrameExtractor } from './video-frame.js'
 import { migrateLegacyQQMessageMedia } from './raw-media-migration.js'
 import { migrateLegacyQQGroupAliasUsers } from './user-name-migration.js'
+import {
+  sanitizeWireConversation, sanitizeWireEvent, sanitizeWireMessage, sanitizeWireRequest, sanitizeWireUser,
+} from './sanitize.js'
 import type {
-  QQMediaLocator, QQStickerReference, WireCallSignalEvent, WireConversation, WireEvent, WireGroupFilePage, WireMedia, WireMessage,
+  QQMediaLocator, QQStickerReference, WireCallSignalEvent, WireCard, WireConversation, WireEvent, WireGroupFilePage, WireMedia, WireMessage,
   WireMultiForwardLocator, WireNativeAvsdkEvent, WireReactionState, WireRequest, WireTextPart,
 } from './protocol.js'
 
-type QQOutboundMedia = NonNullable<Parameters<QQNTClient['sendMessage']>[2]>[number]
 
-
+/** 支持的最低 qqnt-bridge 协议版本；更高版本的增量能力在各自调用处按需检查。 */
 const MIN_PROTOCOL_VERSION = 19
-// Keep the lower bound stable while accepting additive bridge revisions so account provisioning does
-// not fail closed before Telegram QR approval can complete.
-const MAX_PROTOCOL_VERSION = 34
-/** Poke bursts a single request may send; QQ treats longer bursts as flooding. */
+/** /history 支持 beforeSeq 与 sequenceRange 的最低 bridge 协议版本。 */
+export const SEQUENCE_HISTORY_PROTOCOL_VERSION = 36
+const PROTOCOL_PROBE_TTL_MS = 5 * 60_000
+/** 单次戳一戳请求的最大连击数。 */
 const QQ_POKE_MAX_COUNT = 10
 
 export interface Config extends QQNTClientOptions {
-  /** Hide QQ gray-tip service messages whose text contains any configured entry. */
+  /** 隐藏包含任一配置关键词的 QQ 灰条提示。 */
   grayTipFilters?: string[]
-  /** Generate tiny photoStrippedSize payloads after delivering the original message. */
+  /** 在消息投递后异步生成 `photoStrippedSize` 内联缩略图。 */
   generatePreviews?: boolean
-  /** Maximum number of concurrent inline preview generation jobs. */
   previewConcurrency?: number
 }
 
@@ -68,15 +72,16 @@ export const name = 'im-platform-qqnt'
 export const inject = ['imPlatform', 'imSticker', 'database', 'model']
 
 const DIALOGS_POLL_INTERVAL_MS = 15_000
+/** 补已读边界时读取的未读窗口大小：够覆盖首条未读前后即可。 */
+const READ_MARKER_WINDOW = 4
+/** 同时补多少个会话的已读边界。 */
+const READ_MARKER_CONCURRENCY = 3
 const REACTION_CATALOG_GRACE_MS = 10
 const REACTION_CATALOG_RPC_GRACE_MS = 250
 const REACTION_CATALOG_RETRY_DELAY_MS = 60_000
 const REACTION_RESOURCE_SIZE_TIMEOUT_MS = 5_000
-/** How long a resolved reaction asset size/version stays authoritative. */
 const REACTION_RESOURCE_META_TTL_MS = 10 * 60_000
 const STICKER_ASSET_META_TTL_MS = 10 * 60_000
-// qlogo avatar URLs are unsigned, so the TTL only bounds how long a consumer
-// keeps a picture the user may since have changed.
 const AVATAR_DIRECT_URL_TTL_MS = 10 * 60_000
 const WEBSOCKET_RECONNECT_BASE_DELAY_MS = 1_000
 const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 60_000
@@ -167,7 +172,8 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   readonly capabilities: PlatformCapabilities = {
     history: true,
     readState: { markRead: true, events: false },
-    search: true,
+    // 群聊 msgSeq 连续；协议 36 起 /history 支持 beforeSeq 并返回原始 sequenceRange。
+    sequenceHistory: 'group',
     send: {
       text: true,
       images: true,
@@ -228,6 +234,11 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   private readonly conversations = new Map<string, IMConversation<QQMediaLocator>>()
   private readonly savedMessagesConversationIds = new Map<string, string>()
   private readonly firstUnreadSeq = new Map<string, string>()
+  /** 已读边界（首条未读之前的一条消息），按「会话 + 首条未读游标」缓存：QQ 只在按需拉取未读窗口时才给出它。 */
+  private readonly readMarkers = new Map<string, { seq: string, message?: IMMessage<QQMediaLocator> }>()
+  private readonly readMarkerLoads = new Map<string, Promise<void>>()
+  private readMarkerInFlight = 0
+  private readonly readMarkerWaiters: Array<() => void> = []
   private reactionCatalog?: IMReactionContext
   private reactionCatalogPromise?: Promise<IMReactionContext>
   private reactionCatalogRetryAt = 0
@@ -249,7 +260,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   >()
   private readonly inlinePreviewMessageJobs = new Map<string, Promise<void>>()
   private readonly inlinePreviewPublished = new Set<string>()
-  /** Reads a video's first frame from its direct URL; replaceable in tests. */
   videoFrameReader: RemoteVideoFrameExtractor = (url, signal) => extractRemoteVideoFrame(url, signal)
 
   constructor(
@@ -294,7 +304,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         token: lease.token,
       })
     } finally {
-      // The media service consumes the token; this also covers invalid transport setup.
       lease.token.fill(0)
     }
   }
@@ -304,12 +313,12 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     const userId = status.selfUid ?? status.selfUin
     if (!status.ready || !userId) throw new Error('QQNT account is not ready')
     if (!Number.isInteger(status.protocolVersion)
-      || status.protocolVersion < MIN_PROTOCOL_VERSION
-      || status.protocolVersion > MAX_PROTOCOL_VERSION) {
-      throw new Error(`QQNT bridge protocol ${status.protocolVersion} is unsupported; supported range is ${MIN_PROTOCOL_VERSION}-${MAX_PROTOCOL_VERSION}`)
+      || status.protocolVersion < MIN_PROTOCOL_VERSION) {
+      throw new Error(`QQNT bridge protocol ${status.protocolVersion} is unsupported; protocol ${MIN_PROTOCOL_VERSION} or newer is required`)
     }
-    const user = await this.client.getUser(userId)
-    if (!user) throw new Error(`QQNT current user is unavailable: ${userId}`)
+    const profile = await this.client.getUser(userId)
+    if (!profile) throw new Error(`QQNT current user is unavailable: ${userId}`)
+    const user = sanitizeWireUser(profile)
     const qq = typeof status.selfUin === 'string' && /^\d+$/.test(status.selfUin)
       ? status.selfUin
       : typeof user.numericId === 'string' && /^\d+$/.test(user.numericId)
@@ -334,12 +343,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     handler: (event: IMEvent<QQMediaLocator>) => void | Promise<void>,
   ): Promise<Unsubscribe> {
     await this.cleanupLegacyDialogs(session)
-    // Reaction events only carry native reaction keys/counts.  The bridge
-    // needs the catalog definitions while mapping the event; starting the
-    // WebSocket before the catalog finishes creates an event with an empty
-    // `available` list, which is then persisted as an apparent reaction
-    // removal.  Warm the catalog before consuming any events so the first
-    // snapshot is renderable and actor hydration can resolve its keys.
+    // 启动 WebSocket 前先预热回应表情目录，避免首帧回应事件因 `available` 为空被误判为清空回应。
     await this.ensureReactionCatalog().catch((error) => {
       this.logger?.warn(
         'QQ reaction catalog warmup failed before subscription error=%s',
@@ -362,9 +366,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         await running
       })(),
     }
-    // Install the replacement before stopping its predecessor. A third
-    // concurrent subscribe then supersedes this lease instead of starting a
-    // second WebSocket after both callers observed the same predecessor.
+    // 先占位再停止旧租约，防止并发 `subscribe` 看到同一个旧租约而重复建连。
     leases.set(leaseKey, lease)
     if (predecessor) {
       await predecessor.stop().catch((error) => this.logger?.error(
@@ -424,10 +426,11 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         platformSessionId, attempt, this.client.webSocketEndpoint, lastEventId ?? '<none>',
       )
       try {
-        await this.client.subscribe(async (event, eventId) => {
-          // Receiving any frame proves that the transport is healthy. Future
-          // connection failures start a fresh backoff sequence instead of
-          // inheriting an outage that has already recovered.
+        await this.client.subscribe(async (rawEvent, eventId) => {
+          // Cleaned before any step of the stream reads the event: the
+          // checkpoint persists the event only after the handler commits, so
+          // one string PostgreSQL cannot store would stall every later event.
+          const event = sanitizeWireEvent(rawEvent)
           consecutiveStreamFailures = 0
           try {
             if (event.type === 'native-avsdk') {
@@ -499,9 +502,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         }, signal, {
           lastEventId,
           onEventId: async (eventId) => {
-            // The client invokes this only after the event handler commits.
-            // Persist before advancing memory so a crash or reconnect can
-            // replay the event, but can never skip an uncommitted event.
+            // 先落库再推进内存游标，保证崩溃重连宁可重放也不会漏事件。
             if (this.database) {
               await this.database.upsert('mtproto_qqnt_event_checkpoint', [{
                 platformSessionId,
@@ -593,9 +594,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     while (!signal.aborted) {
       try {
         if (!hasBaseline) {
-          // The baseline must include every page. Otherwise a conversation
-          // outside the first page is misclassified as newly received when it
-          // later moves to the top after a message arrives.
+          // 基线必须扫描全部会话页，否则首页之外的旧会话后续升到顶部时会被误判为新消息。
           let cursor: string | undefined
           const seenCursors = new Set<string>()
           do {
@@ -612,8 +611,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
           } while (cursor && !signal.aborted)
           hasBaseline = true
         } else {
-          // Recent changes move to the first page, so subsequent polling only
-          // needs that page rather than scanning hundreds of dialogs each time.
+          // 新消息会把会话顶到第一页，后续轮询只需拉取首页。
           const query = { limit: 100 }
           const page = await this.prepareDialogPage(
             session, await this.fetchDialogsPage(session, query, signal),
@@ -752,12 +750,82 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
             : undefined,
           readInboxMaxMessage: conversation.readInboxMaxMessage
             ? this.mapMessage(conversation.readInboxMaxMessage, mappedConversation.id)
-            : undefined,
+            : this.ensureReadMarker(session, conversation, mappedConversation.id),
         }
       }),
       nextCursor: response.nextCursor,
       total: response.total,
     }
+  }
+
+  /**
+   * QQ 的会话只给「首条未读」游标，已读边界要额外拉一次未读窗口才知道。缺边界时会话会被当成
+   * 「一条都没读」（`read_inbox_max_id = 0`），客户端的分隔线与打开会话时的定位都会错乱，
+   * 因此这里补出边界并缓存：游标不变就不再重复拉取。
+   */
+  private ensureReadMarker(
+    session: PlatformSession,
+    conversation: WireConversation,
+    conversationId: string,
+  ): IMMessage<QQMediaLocator> | undefined {
+    const seq = conversation.firstUnread?.msgSeq
+    if (!seq || !(conversation.unreadCount ?? 0)) return undefined
+    const cached = this.readMarkers.get(conversationId)
+    if (cached?.seq === seq) return cached.message
+    if (cached?.seq !== seq) this.readMarkers.set(conversationId, { seq })
+    if (!this.readMarkerLoads.has(conversationId)) {
+      const load = this.queueReadMarker(() =>
+        this.loadReadMarker(session, conversation.id, conversationId, seq))
+        .then(() => undefined, () => undefined)
+        .finally(() => {
+          if (this.readMarkerLoads.get(conversationId) === load) this.readMarkerLoads.delete(conversationId)
+        })
+      this.readMarkerLoads.set(conversationId, load)
+    }
+    return undefined
+  }
+
+  /** 一页对话可能带上几十个未读会话，补边界要限流，避免同时打满 relay。 */
+  private async queueReadMarker<T>(run: () => Promise<T>): Promise<T> {
+    while (this.readMarkerInFlight >= READ_MARKER_CONCURRENCY) {
+      await new Promise<void>((resolve) => this.readMarkerWaiters.push(resolve))
+    }
+    this.readMarkerInFlight++
+    try {
+      return await run()
+    } finally {
+      this.readMarkerInFlight--
+      this.readMarkerWaiters.shift()?.()
+    }
+  }
+
+  private async loadReadMarker(
+    session: PlatformSession,
+    wireConversationId: string,
+    conversationId: string,
+    seq: string,
+  ): Promise<void> {
+    const firstUnread = numericSequence(seq)
+    if (firstUnread === undefined) return
+    const response = await this.client.getHistory(
+      await this.wireConversationId(session, wireConversationId),
+      { aroundUnreadSeq: seq, limit: READ_MARKER_WINDOW },
+    )
+    let boundary: WireMessage | undefined
+    let boundarySequence: bigint | undefined
+    for (const message of response.messages) {
+      const sequence = numericSequence(message.msgSeq)
+      if (sequence === undefined || sequence >= firstUnread) continue
+      if (boundarySequence !== undefined && sequence <= boundarySequence) continue
+      boundary = message
+      boundarySequence = sequence
+    }
+    if (this.readMarkers.get(conversationId)?.seq !== seq) return
+    if (!boundary) return
+    this.readMarkers.set(conversationId, {
+      seq,
+      message: this.mapMessage(boundary, conversationId),
+    })
   }
 
   private async prepareDialogPage(
@@ -781,14 +849,17 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   async getContacts(_session: PlatformSession, query: IMPageQuery = {}): Promise<IMUserPage<QQMediaLocator>> {
     const page = await this.client.getContacts({ cursor: query.cursor, limit: query.limit })
     return {
-      users: page.users.map((user) => ({
-        id: user.id,
-        firstName: user.name,
-        username: user.numericId,
-        about: typeof user.signature === 'string' ? user.signature : undefined,
-        avatar: user.avatar ? mapMedia(user.avatar) : undefined,
-        metadata: qqUserMetadata(user),
-      })),
+      users: page.users.map((wireUser) => {
+        const user = sanitizeWireUser(wireUser)
+        return {
+          id: user.id,
+          firstName: user.name,
+          username: user.numericId,
+          about: typeof user.signature === 'string' ? user.signature : undefined,
+          avatar: user.avatar ? mapMedia(user.avatar) : undefined,
+          metadata: qqUserMetadata(user),
+        }
+      }),
       nextCursor: page.nextCursor,
     }
   }
@@ -821,6 +892,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     conversation: IMConversationRef,
     query: IMHistoryQuery = {},
   ): Promise<IMHistoryPage<QQMediaLocator>> {
+    if (query.beforeSequence !== undefined) return this.getHistoryBySequence(session, conversation, query)
     const reactionWarmup = this.ensureReactionCatalog().catch(() => undefined)
     if (isFilteredConversationId(conversation.id)) return { messages: [] }
     const response = await this.client.getHistory(
@@ -846,70 +918,52 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     }
   }
 
-  async searchMessages(
+  private protocolProbe?: { version: number, checkedAt: number }
+
+  /** 读取并短暂缓存 bridge 协议版本，用于按版本启用新增的历史接口。 */
+  async bridgeProtocolVersion(): Promise<number> {
+    const cached = this.protocolProbe
+    if (cached && Date.now() - cached.checkedAt < PROTOCOL_PROBE_TTL_MS) return cached.version
+    const status = await this.client.status()
+    const version = Number.isInteger(status.protocolVersion) ? status.protocolVersion : 0
+    this.protocolProbe = { version, checkedAt: Date.now() }
+    return version
+  }
+
+  /**
+   * 按 msgSeq 向更早方向读取一页，供服务端回填历史空洞。
+   * 旧版 bridge 会忽略 beforeSeq 并返回最新一页，因此先校验协议版本，不满足时直接报错而不是返回错误的数据。
+   */
+  private async getHistoryBySequence(
     session: PlatformSession,
     conversation: IMConversationRef,
-    query: IMMessageSearchQuery,
-  ): Promise<IMMessageSearchPage<QQMediaLocator>> {
+    query: IMHistoryQuery,
+  ): Promise<IMHistoryPage<QQMediaLocator>> {
+    if (!/^\d+$/.test(query.beforeSequence ?? '') || query.beforeSequence === '0') {
+      throw new Error(`invalid beforeSequence: ${query.beforeSequence}`)
+    }
     if (isFilteredConversationId(conversation.id)) return { messages: [] }
-    if (isFilteredConversationId(conversation.id)) return { messages: [] }
-    if (query.mediaKind === 'file' && this.isGroupConversation(conversation.id)) {
-      const page = await this.listGroupFiles(session, conversation, {
-        cursor: query.cursor,
-        limit: query.limit,
-      })
-      const normalized = query.query.trim().toLocaleLowerCase()
-      const files = page.items.filter((item) => item.type === 'file').filter((file) => {
-        if (normalized && !file.name.toLocaleLowerCase().includes(normalized)) return false
-        if (query.fromUserId && file.uploaderId !== query.fromUserId) return false
-        if (query.minTimestamp && file.uploadTime <= query.minTimestamp) return false
-        if (query.maxTimestamp && file.uploadTime >= query.maxTimestamp) return false
-        return true
-      })
-      return {
-        messages: files.map((file) => ({
-          id: `qq-group-file:${file.id}`,
-          conversationId: conversation.id,
-          senderId: file.uploaderId || session.userId,
-          sender: {
-            id: file.uploaderId || session.userId,
-            firstName: file.uploaderName || file.uploaderId || 'QQ',
-            username: file.uploaderId || undefined,
-          },
-          timestamp: file.uploadTime,
-          outgoing: false,
-          metadata: { qqGroupFileId: file.id, qqGroupFileParentId: file.parentId },
-          content: {
-            parts: [
-              { type: 'text' as const, text: file.name },
-              { type: 'media' as const, media: file.media },
-            ],
-          },
-        })),
-        nextCursor: page.nextCursor,
-        total: page.total,
-      }
+    const version = await this.bridgeProtocolVersion()
+    if (version < SEQUENCE_HISTORY_PROTOCOL_VERSION) {
+      throw new Error(`QQNT bridge protocol ${version} does not support sequence history; protocol ${SEQUENCE_HISTORY_PROTOCOL_VERSION} is required`)
     }
     const reactionWarmup = this.ensureReactionCatalog().catch(() => undefined)
-    const response = await this.client.searchMessages(
-      await this.wireConversationId(session, conversation.id), {
-      q: query.query,
-      cursor: query.cursor,
+    const response = await this.client.getHistory(await this.wireConversationId(session, conversation.id), {
+      beforeSeq: query.beforeSequence,
       limit: query.limit,
-      fromUserId: query.fromUserId,
-      minTimestamp: query.minTimestamp,
-      maxTimestamp: query.maxTimestamp,
-      mediaKind: query.mediaKind,
     })
     await waitAtMost(reactionWarmup, REACTION_CATALOG_GRACE_MS)
     if (response.messages.some(wireMessageHasQQFace)) await reactionWarmup
+    const range = response.sequenceRange
     return {
       messages: await Promise.all(this.collapseSplitOutgoingMessages(response.messages)
         .filter((message) => !this.isFilteredGrayTip(message)).map((message) =>
-        this.prepareRequestedMessage(
-          session, this.conversationFor(conversation.id), this.mapMessage(message, conversation.id),
-        ))),
-      nextCursor: response.nextCursor,
+          this.prepareRequestedMessage(
+            session, this.conversationFor(conversation.id), this.mapMessage(message, conversation.id),
+          ))),
+      ...(range && /^\d+$/.test(range.min) && /^\d+$/.test(range.max)
+        ? { coverage: { minSequence: range.min, maxSequence: range.max } }
+        : {}),
     }
   }
 
@@ -941,8 +995,9 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   }
 
   async getUser(_session: PlatformSession, userId: string): Promise<IMUser<QQMediaLocator> | null> {
-    const user = await this.client.getUser(userId)
-    if (!user) return null
+    const wireUser = await this.client.getUser(userId)
+    if (!wireUser) return null
+    const user = sanitizeWireUser(wireUser)
     return {
       id: user.id,
       firstName: user.name,
@@ -959,10 +1014,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     messageId: string,
   ): Promise<IMMessage<QQMediaLocator> | null> {
     if (isFilteredConversationId(conversation.id)) return null
-    // A message opened directly from a Telegram link bypasses getHistory().
-    // Ensure the QQ face catalog is ready before mapping its entities, or the
-    // message is permanently projected with a plain-text fallback and no
-    // custom-emoji document for this request.
+    // 链接直开消息不会经过 `getHistory()`，需先确保 QQ 表情目录就绪，否则自定义表情会退化为纯文本。
     const reactionWarmup = this.ensureReactionCatalog().catch(() => undefined)
     const message = await this.client.getMessage(
       await this.wireConversationId(session, conversation.id), messageId,
@@ -979,7 +1031,18 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     _session: PlatformSession,
     target: { conversationId: string, messageId: string, nativeSequence?: string },
     button: Extract<import('@mtproto-relay/bridge').IMInlineKeyboardButton, { type: 'callback' }>,
-  ): Promise<{ message?: string, alert?: boolean, url?: string }> {
+  ): Promise<{ message?: string, alert?: boolean, url?: string, refresh?: true }> {
+    if (button.data.startsWith('group-invite:')) {
+      const [, groupCode, msgSeq] = button.data.split(':')
+      if (groupCode && msgSeq) {
+        try {
+          await this.client.acceptGroupInvite({ groupCode, msgSeq })
+          return { message: '已接受邀请；若群开启了入群审核，还需管理员通过', refresh: true as const }
+        } catch {
+          return { message: '同意失败，请稍后重试或在 QQ 客户端处理该邀请', alert: true }
+        }
+      }
+    }
     const metadata = button.metadata?.qqnt
     if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
       throw new Error('QQNT callback button metadata is missing')
@@ -1012,8 +1075,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     const conversation = this.conversations.get(conversationId)
     if (!conversation) return
     const chatType = conversation.metadata?.chatType
-    // The QQNT bridge notification-mask route is keyed by chatType + peerUin
-    // (the numeric group code), stored on the conversation metadata as `qq`.
     const peerUin = conversation.metadata?.qq
     if (typeof chatType !== 'number' || typeof peerUin !== 'string' || !peerUin) return
     await this.client.setNotificationMask(chatType, peerUin, mask)
@@ -1027,27 +1088,26 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     if (isFilteredConversationId(conversation.id)) return { members: [], total: 0 }
     const page = await this.client.getMembers(conversation.id, { cursor: query.cursor, limit: query.limit })
     return {
-      members: page.members.map((member): IMConversationMember<QQMediaLocator> => ({
-        user: {
-          id: member.user.id,
-          firstName: member.user.name,
-          username: member.user.numericId,
-          avatar: member.user.avatar ? mapMedia(member.user.avatar) : undefined,
-          metadata: { ...qqUserMetadata(member.user), qqName: member.user.name },
-        },
-        role: member.role,
-        permissions: permissions(member.role),
-        title: member.user.alias?.trim() || undefined,
-      })),
+      members: page.members.map((member): IMConversationMember<QQMediaLocator> => {
+        const user = sanitizeWireUser(member.user)
+        return {
+          user: {
+            id: user.id,
+            firstName: user.name,
+            username: user.numericId,
+            avatar: user.avatar ? mapMedia(user.avatar) : undefined,
+            metadata: { ...qqUserMetadata(user), qqName: user.name },
+          },
+          role: member.role,
+          permissions: permissions(member.role),
+          title: user.alias?.trim() || undefined,
+        }
+      }),
       total: page.total,
       nextCursor: page.nextCursor,
     }
   }
 
-  /**
-   * Send QQ poke (nudge) notices. QQ records a notice message for each poke, so
-   * the newest confirmed notice travels back with the request.
-   */
   async sendPoke(
     session: PlatformSession,
     conversation: IMConversationRef,
@@ -1103,14 +1163,12 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       const user = await this.getUser(session, userId)
       if (user) return { user, role: selfRole, permissions: permissions(selfRole) }
     }
-    // Opening a Telegram megagroup commonly probes inputPeerSelf. Never turn a
-    // temporarily missing group profile into a full QQ member-list scan.
+    // 客户端打开超级群时会探测 `inputPeerSelf`；群资料暂缺时直接返回 null，避免触发全量群成员扫描。
     if (userId === session.userId) return null
     let cursor: string | undefined
     do {
       const page = await this.getConversationMembers(session, conversation, { cursor, limit: 500 })
-      // Match the numeric QQ account (username) too: Satori clients address
-      // members by QQ number after the exporter switched event IDs to it.
+      // Satori 侧以 QQ 号（`username`）寻址成员，因此同时匹配 UID 与 QQ 号。
       const found = page.members.find((member) => member.user.id === userId || member.user.username === userId)
       if (found) return found
       cursor = page.nextCursor
@@ -1155,7 +1213,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       }
       textParts.push({ type: 'text', text: part.text, entities: entities.length ? entities : undefined })
     }
-    const text = textParts.map((part) => part.text).join('\n') || undefined
     const mediaParts = content.parts.filter((part) => part.type === 'media')
     const stickerParts = content.parts.filter((part) => part.type === 'sticker')
     if (stickerParts.length > 1 || stickerParts.length && mediaParts.length) {
@@ -1170,6 +1227,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       sticker = stickerPart.sticker.reference as unknown as QQStickerReference
     }
     if (mediaParts.length > 9) throw new Error('QQNT supports at most nine media items per message')
+    const text = textParts.map((part) => part.text).join('\n') || undefined
     const voiceParts = mediaParts.filter((part) => part.media.voice)
     if (voiceParts.length && (voiceParts.length !== 1 || mediaParts.length !== 1 || text || sticker || content.replyToNativeSequence)) {
       throw new Error('QQNT voice messages must contain exactly one voice item')
@@ -1184,14 +1242,19 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       voice: part.media.voice,
       source: part.media.source,
     }))
+    let textCursor = 0
+    let mediaCursor = 0
+    const parts: QQSendPart[] = content.parts.flatMap((part): QQSendPart[] => part.type === 'text'
+      ? [textParts[textCursor++]!]
+      : part.type === 'media' ? [{ type: 'media', media: media[mediaCursor++]! }] : [])
     const originRequestId = randomUUID()
     this.originSessions.set(originRequestId, session.platformSessionId)
     try {
       let sent: WireMessage
       try {
         sent = await this.sendWireMessage(
-          await this.wireConversationId(session, conversation.id), text, media,
-          options, originRequestId, sticker, textParts,
+          await this.wireConversationId(session, conversation.id), parts,
+          options, originRequestId, sticker,
           content.replyToId, content.replyToNativeSequence,
         )
       } catch (error) {
@@ -1218,20 +1281,20 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
 
   private async sendWireMessage(
     conversationId: string,
-    text: string | undefined,
-    media: QQOutboundMedia[],
+    parts: QQSendPart[],
     options: IMTransferOptions,
     originRequestId: string,
     sticker: QQStickerReference | undefined,
-    textParts: WireTextPart[],
     replyToId: string | undefined,
     replyToSequence: string | undefined,
   ): Promise<WireMessage> {
+    const textParts = parts.flatMap((part) => part.type === 'text' ? [part] : [])
+    const media = parts.flatMap((part) => part.type === 'media' ? [part.media] : [])
+    const text = textParts.length ? textParts.map((part) => part.text).join('\n') : undefined
     if (!media.some(isOrdinaryQQFile)) {
-      return this.client.sendMessage(
-        conversationId, text, media.length ? media : undefined, options,
-        originRequestId, sticker, textParts, replyToId, replyToSequence,
-      )
+      return this.client.sendMessage(conversationId, parts, options, {
+        originRequestId, sticker, replyToId, replyToSequence,
+      })
     }
 
     type SendPlan = {
@@ -1282,17 +1345,14 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
             },
           }
         : options
-      const sent = await this.client.sendMessage(
-        conversationId,
-        plan.includeText ? text : undefined,
-        plan.media.length ? plan.media.map(({ item }) => item) : undefined,
-        planOptions,
+      const planParts = parts.filter((part) => part.type === 'text'
+        ? plan.includeText
+        : plan.media.some(({ item }) => item === part.media))
+      const sent = await this.client.sendMessage(conversationId, planParts, planOptions, {
         originRequestId,
-        undefined,
-        plan.includeText ? textParts : undefined,
-        plan.includeReply ? replyToId : undefined,
-        plan.includeReply ? replyToSequence : undefined,
-      )
+        replyToId: plan.includeReply ? replyToId : undefined,
+        replyToSequence: plan.includeReply ? replyToSequence : undefined,
+      })
       sentMessages.push(sent)
       const outputMedia = sent.parts.filter((part) => part.type === 'media')
       if (outputMedia.length !== plan.media.length) {
@@ -1314,15 +1374,13 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       if (!id) throw new Error('QQNT omitted a physical message ID from a split send')
       return id
     })
+    let sentMediaCursor = 0
     const logicalMessage: WireMessage = {
       ...primary,
       sourceIds: orderedSourceIds,
       originRequestId,
       replyToId: primary.replyToId ?? replyToId,
-      parts: [
-        ...textParts,
-        ...orderedMedia,
-      ],
+      parts: parts.map((part) => part.type === 'text' ? part : orderedMedia[sentMediaCursor++]!),
     }
     for (const sent of sentMessages) this.splitOutgoingMessages.set(sent.id, logicalMessage)
     while (this.splitOutgoingMessages.size > SPLIT_OUTGOING_MESSAGE_CACHE_LIMIT) {
@@ -1463,8 +1521,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         yield chunk
       }
     } catch (error) {
-      // Telegram probes the next chunk to learn EOF. QQNT reports this normal
-      // ranged-read terminator as HTTP 400 instead of an empty response.
+      // Telegram 会继续请求下一分片以探测 EOF；QQNT 对越界 Range 返回 HTTP 400 而非空响应。
       if ((options.offset ?? 0) > 0 && isQQNTDownloadPastEnd(error)) return
       if (isQQNTMediaUnavailable(error)) {
         throw new IMMediaUnavailableError(error instanceof Error ? error.message : String(error), {
@@ -1482,8 +1539,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     let locator = media.locator
     if (!locator || locator.deferred) return
     if (media.id.startsWith('avatar:')) {
-      // Avatars carry no rich-media file identity; their public URL comes from
-      // the QQ number or the face URL QQ archived with the author.
       if (needsUserAvatarRefresh(media, locator)) {
         const refreshed = await this.client.getUser(locator.peerUid).catch(() => null)
         locator = refreshed?.avatar?.locator ?? locator
@@ -1662,11 +1717,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
 
   private async withReactionCatalog(state: WireReactionState): Promise<IMReactionContext> {
     const loading = this.ensureReactionCatalog()
-    // A reaction count without its definition cannot be represented in TL:
-    // ReactionRpc will omit it and therefore never register the custom emoji
-    // document requested by Telegram clients. Keep reaction-free message paths
-    // non-blocking, but wait for the shared catalog whenever the response
-    // actually contains reactions that need projecting.
+    // 含有回应计数时必须等待目录加载完成，否则 `ReactionRpc` 会丢弃未知定义且不会注册对应的自定义表情文档。
     const catalog = state.reactions.length
       ? await loading
       : this.reactionCatalog ?? EMPTY_GROUP_REACTION_CATALOG
@@ -1694,34 +1745,18 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     message: IMMessage<QQMediaLocator>,
   ): Promise<IMMessage<QQMediaLocator>> {
     const handler = this.eventHandlers.get(session.platformSessionId)
-    // History refreshes rewrite the stored message, so they must carry the
-    // same merged-forward preview the live event resolved; otherwise every
-    // re-fetch replaces it with QQ's content-free card footer.
+    // 历史刷新会覆写落库消息，需同样补齐合并转发预览，避免被 QQ 空摘要覆盖。
     const withFaceSizes = await this.hydrateReactionResourceSizes(
       session, await this.prepareInitialMessage(message),
     )
     const prepared = await this.hydrateStickerAssetSizes(session, withFaceSizes)
     this.scheduleInlinePreview(session, conversation, prepared, handler)
-    // Keep history metadata-only. The patched client asks getFileUrl for the
-    // original and downloads it from QQ's CDN. Inline preview work is queued
-    // after this return and can only publish a later message-edit event.
     return prepared
   }
 
   /**
-   * Publishes the exact byte length and content identity of the QQ face assets
-   * a message references.
-   *
-   * Telegram schedules custom-emoji downloads from `Document.size` and caches
-   * them by document id, which is derived from the resource version, so both
-   * have to describe the bytes the relay will actually serve. The bridge reads
-   * them from the bundle's central directory (or the local file) instead of the
-   * payload, and re-resolves after a TTL so remote changes re-key the document
-   * instead of silently serving new bytes under an old identity.
-   *
-   * Inline custom emoji and the reactions attached to the message both reach
-   * clients as custom-emoji documents, so both definition sources are hydrated
-   * here instead of only the message text.
+   * 补齐消息内联表情与回应表情的精确字节大小和版本。
+   * 客户端依赖 `Document.size` 调度下载并按版本派生的文档 ID 缓存，两者必须与实际返回的字节一致。
    */
   private async hydrateReactionResourceSizes(
     session: PlatformSession,
@@ -1748,8 +1783,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         collect(definition.presentation.resource)
       }
     }
-    // The shared catalog is warmed in the background; messages only need the
-    // assets they reference, but those must always be resolved.
     this.scheduleReactionResourceWarmup(session)
     if (!targets.size) return message
     const resolved = await this.resolveReactionResourceMetas(session, targets)
@@ -1803,11 +1836,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     return changed ? { ...context, available } : context
   }
 
-  /**
-   * Resolves the referenced assets, preferring the bridge's directory-based
-   * metadata over streaming a face. Downloads stay as a fallback when the
-   * metadata endpoint is unavailable.
-   */
   private async resolveReactionResourceMetas(
     session: PlatformSession,
     targets: ReadonlyMap<string, IMReactionResource>,
@@ -1827,8 +1855,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   ): Promise<ResolvedReactionResourceMeta | undefined> {
     const cached = this.reactionResourceMeta.get(reactionKey)
     if (cached && Date.now() - cached.resolvedAt <= REACTION_RESOURCE_META_TTL_MS) return cached
-    // Message hydration and the catalog warmup may ask for the same face at the
-    // same time; share one lookup instead of querying the bridge twice.
     const pending = this.reactionResourceMetaPending.get(reactionKey)
     if (pending) return pending
     let lookup!: Promise<ResolvedReactionResourceMeta | undefined>
@@ -1861,8 +1887,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         return entry
       }
     } catch {
-      // Fall through to measuring the payload; the bridge may be restarted or
-      // the bridge may not expose metadata for this key yet.
+      // bridge 元数据接口不可用时回退为流式测量字节数。
     }
     const measured = await this.measureReactionResourceSize(session, resource)
     if (!measured) return undefined
@@ -1884,30 +1909,13 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       }
       return size > 0 ? size : undefined
     } catch {
-      // Keep the original metadata when the CDN is temporarily unavailable;
-      // a later message refresh can retry the size hydration.
       return undefined
     } finally {
       clearTimeout(timer)
     }
   }
 
-  /**
-   * Resolves the published catalog once per process so reaction pickers and the
-   * emoji sticker set describe their documents correctly without waiting for a
-   * message to reference each face. Definitions are patched in place because
-   * the catalog object is shared with every consumer.
-   */
-  /**
-   * Publishes the exact byte length and content identity of the QQ face image a
-   * relayed sticker serves.
-   *
-   * Telegram schedules sticker downloads from `Document.size` and caches the
-   * bytes by document identity, so a message must describe the image the relay
-   * will serve. QQ hands system faces out as ZIP bundles and only lists its
-   * newest faces in the runtime panel catalog, which is why the bridge resolves
-   * the wrapped image and reports its length, version, and MIME type here.
-   */
+  /** 补齐 QQ 系统大表情（ZIP 打包图片）解包后的精确字节大小、版本与 MIME 类型。 */
   private async hydrateStickerAssetSizes(
     _session: PlatformSession,
     message: IMMessage<QQMediaLocator>,
@@ -1951,7 +1959,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   ): Promise<ResolvedStickerAssetMeta | undefined> {
     const cached = this.stickerAssetMeta.get(stickerId)
     if (cached && Date.now() - cached.resolvedAt <= STICKER_ASSET_META_TTL_MS) return cached
-    // One message can repeat the same face; share a single lookup per sticker.
     const pending = this.stickerAssetMetaPending.get(stickerId)
     if (pending) return pending
     let lookup!: Promise<ResolvedStickerAssetMeta | undefined>
@@ -1964,12 +1971,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     return lookup
   }
 
-  /**
-   * Asks the bridge for the size of the image a face sticker serves. A bridge
-   * without the metadata endpoint reports nothing and the sticker keeps the
-   * metadata the message already carried; bytes are never opened during
-   * projection, because the patched client downloads them itself.
-   */
   private async lookupStickerAssetMeta(sticker: IMSticker): Promise<ResolvedStickerAssetMeta | undefined> {
     try {
       const meta = await this.client.resolveStickerAssetMeta(sticker.locator as QQStickerReference)
@@ -1987,8 +1988,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         return entry
       }
     } catch {
-      // The bridge may be restarting or older than this endpoint; a failed
-      // lookup must not hide or delay the sticker itself.
+      // bridge 重启或旧版本不支持该接口时保留消息自带元数据。
     }
     return undefined
   }
@@ -1996,8 +1996,6 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   private scheduleReactionResourceWarmup(session: PlatformSession): void {
     const catalog = this.reactionCatalog
     if (!catalog || this.reactionResourceWarmup) return
-    // Local faces already carry their on-disk size; only the CDN-backed ones
-    // need a lookup, and each process starts from the published catalog again.
     const targets = catalog.available.filter((definition) => definition.presentation.type === 'custom'
       && definition.presentation.resource.size === undefined
       && reactionResourceLocatorKey(definition.presentation.resource))
@@ -2014,8 +2012,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
         if (meta.width !== undefined && resource.width !== meta.width) resource.width = meta.width
         if (meta.height !== undefined && resource.height !== meta.height) resource.height = meta.height
       } catch {
-        // The published catalog keeps its previous values; per-message
-        // hydration retries once the bridge answers again.
+        // 忽略单次预热失败，后续消息按需重试。
       }
     }).then(() => undefined)
     void this.reactionResourceWarmup.catch(() => undefined)
@@ -2072,9 +2069,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       try {
         if (part.media.kind === 'file' && !part.media.preview) {
           if (!isVideoFramePreviewCandidate(part.media)) return part
-          // No native thumbnail reached the bridge (QQ file transfers never
-          // carry one). Decode the first frame from QQ's CDN instead so the
-          // bubble shows the video rather than a black loading square.
+          // 文件形式的视频没有原生缩略图，直接从 QQ CDN 解码首帧。
           const locator = rawQQMediaLocator(part.media.locator)
           const media = await this.mediaPreviews.prepareVideoFrame(
             part.media,
@@ -2206,7 +2201,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
       ?? conversationId
   }
 
-  /** Select a real QQ C2C/group target for CDN negotiation without sending it a message. */
+  /** 挑选一个真实好友或群会话供闪传借道申请 CDN 上传参数（不会实际发消息）。 */
   private async flashTransferUploadConversationId(): Promise<string> {
     const known = [...this.conversations.values()].filter((conversation) => {
       const chatType = conversation.metadata?.chatType
@@ -2245,6 +2240,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   }
 
   private mapConversation(input: WireConversation, session?: PlatformSession): IMConversation<QQMediaLocator> {
+    input = sanitizeWireConversation(input)
     const id = session && this.savedMessagesConversationIds.get(session.platformSessionId) === input.id
       ? session.userId
       : input.id
@@ -2344,7 +2340,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
   }
 
   private mapMessage(input: WireMessage, conversationId?: string): IMMessage<QQMediaLocator> {
-    input = this.splitOutgoingMessages.get(input.id) ?? input
+    input = sanitizeWireMessage(this.splitOutgoingMessages.get(input.id) ?? input)
     const message = mapMessage(
       conversationId ? { ...input, conversationId } : input,
       this.reactionCatalog, this.stickerProviderId,
@@ -2436,14 +2432,7 @@ export class QQNTPlatform implements IMPlatform<QQMediaLocator> {
     return pending
   }
 
-  /**
-   * Avatar of the chat a merged forward was archived from.
-   *
-   * QQ keeps multi-forward records without sender identities, so the only
-   * avatar the relay can offer for such a transcript is the peer photo of the
-   * conversation the bundle belongs to: the group a group history came from,
-   * or the contact of a private-chat history.
-   */
+  /** 读取合并转发归属会话（群或私聊联系人）的头像。 */
   private async loadMessageBundleAvatar(
     session: PlatformSession,
     locator: WireMultiForwardLocator,
@@ -2611,6 +2600,7 @@ function mapConversation(input: WireConversation): IMConversation<QQMediaLocator
 }
 
 function mapRequest(input: WireRequest): IMRequest<QQMediaLocator> {
+  input = sanitizeWireRequest(input)
   return {
     id: input.id,
     kind: input.kind,
@@ -2635,7 +2625,6 @@ function mapRequest(input: WireRequest): IMRequest<QQMediaLocator> {
   }
 }
 
-/** Shared user metadata; `bot` is the bridge-wide robot flag read by MTProto and Satori. */
 function qqUserMetadata(user: { numericId?: string, bot?: true }): JsonObject {
   return {
     ...(user.numericId ? { qq: user.numericId } : {}),
@@ -2664,7 +2653,6 @@ function isVideoMime(mimeType: string | undefined): boolean {
   return mimeType?.toLowerCase().startsWith('video/') === true
 }
 
-/** Videos without a native thumbnail whose first frame QQ's CDN can serve. */
 function isVideoFramePreviewCandidate(media: IMMedia<QQMediaLocator>): boolean {
   return media.kind === 'file' && !media.preview && !media.voice && isVideoMime(media.mimeType)
     && Boolean(media.locator?.fileUuid) && !media.locator?.deferred
@@ -2735,16 +2723,56 @@ function mapMessage(
       serviceAction: input.serviceAction,
       parts: mapParts(input, stickerProviderId, reactionCatalog, projectMedia),
       inlineKeyboard: mapInlineKeyboard(input),
+      richMarkdown: qqRichMarkdown(input),
     },
   }
 }
 
 
+/**
+ * QQ bot frameworks open a markdown body with an empty-label link carrying
+ * template metadata such as `[](%7B%22version%22%3A2%7D)`; QQ draws nothing for
+ * it, and neither may the rich message the body becomes.
+ */
+const QQ_TEMPLATE_LINK = /\[\]\([^)\s]*\)/gu
+
+/**
+ * The markdown body of a QQ bot message, which the relay renders into a
+ * Telegram rich message.
+ *
+ * Only a `markdown` part is markdown; a plain-text message has none, so it is
+ * neither parsed nor upgraded. The text parts stay the message text.
+ */
+function qqRichMarkdown(input: WireMessage): string | undefined {
+  const markdown = input.parts
+    .flatMap((part) => part.type === 'markdown' ? [part.content] : [])
+    .join('\n')
+    .replace(QQ_TEMPLATE_LINK, '')
+    .trim()
+  return markdown || undefined
+}
+
 function mapInlineKeyboard(
   input: WireMessage,
 ): import('@mtproto-relay/bridge').IMInlineKeyboard | undefined {
   const keyboard = input.parts.find((part) => part.type === 'inline-keyboard')
-  if (!keyboard || keyboard.type !== 'inline-keyboard') return
+  if (!keyboard || keyboard.type !== 'inline-keyboard') {
+    // Official group invites carry no bot keyboard; render an accept button
+    // whose data the adapter routes back to the bridge on click.
+    const invite = input.parts.find((part): part is { type: 'card', card: WireCard } => part.type === 'card')
+      ?.card.groupInvite
+    if (!invite) return
+    return {
+      rows: [{
+        buttons: [{
+          type: 'callback',
+          text: '同意加群',
+          data: `group-invite:${invite.groupCode}:${invite.msgSeq}`,
+          style: 'success',
+        }],
+      }],
+    }
+  }
   const rows = keyboard.keyboard.rows.map((row) => {
     const buttons: import('@mtproto-relay/bridge').IMInlineKeyboardButton[] = []
     for (const button of row.buttons) {
@@ -2774,14 +2802,13 @@ function mapParts(
   projectMedia?: (media: IMMedia<QQMediaLocator>) => IMMedia<QQMediaLocator>,
 ): IMMessage<QQMediaLocator>['content']['parts'] {
   const parts: IMMessage<QQMediaLocator>['content']['parts'] = []
-  // QQ bot messages carry a plain-text fallback beside the markdown body for
-  // clients without markdown support; QQ itself only renders the markdown.
-  const markdownText = input.parts
-    .flatMap((part) => part.type === 'markdown' ? [compactText(parseQQMarkdown(part.content).text)] : [])
+  // QQ 机器人消息常在 Markdown 旁附带纯文本回退段；通过 renditionKey 归一化比对后跳过重复的回退文本
+  const markdownKey = input.parts
+    .flatMap((part) => part.type === 'markdown' ? [renditionKey(parseQQMarkdown(part.content).text)] : [])
     .join('')
   for (const part of input.parts) {
     if (part.type === 'text') {
-      if (markdownText && !part.entities?.length && markdownText.includes(compactText(part.text))) continue
+      if (markdownKey && !part.entities?.length && markdownKey.includes(renditionKey(part.text))) continue
       const normalized = normalizeTextPart(part, reactionCatalog)
       const previous = parts.at(-1)
       if (previous?.type === 'text') {
@@ -2805,8 +2832,6 @@ function mapParts(
         bundle: {
           id: multiForwardBundleId(part.locator),
           title: part.title || '聊天记录',
-          // QQ's card footer names no content; leave the preview empty so it is
-          // built from the archived records instead.
           preview: part.preview && isDetailedMultiForwardPreview(part.preview) ? part.preview : undefined,
           locator: { ...part.locator },
         },
@@ -2838,63 +2863,306 @@ function mapParts(
   return parts
 }
 
-function compactText(value: string): string {
-  return value.replace(/\s+/g, '')
+/** The marker opening a QQ markdown blockquote line, with its optional space. */
+const QQ_BLOCKQUOTE_LINE = /^[ \t]{0,3}>[ \t]?/
+
+/** The marker of an unordered list item, which Telegram has no entity for. */
+const QQ_BULLET_LINE = /^([ \t]*)[-*+][ \t]+/
+
+/** A fence line: no quote, list item or table opens inside code. */
+const QQ_FENCE_LINE = /^[ \t]{0,3}(?:```|~~~)/
+
+/** The bullet an unordered list item gets, since Telegram has no list entity. */
+const QQ_BULLET = '•'
+
+/**
+ * Everything QQ's markdown writes as layout: `> ` quote markers, `- ` / `1. `
+ * list markers (the bullet above included) and table pipes.
+ *
+ * QQ attaches the body's plain-text rendition beside the markdown body for
+ * clients without markdown support, and which of these its rendition keeps is
+ * its business. Comparing the two with all of them dropped recognizes that
+ * duplicate either way, so a relayed message never carries the body twice.
+ */
+const QQ_RENDITION_MARKERS = /^[ \t]*(?:>[ \t]*)?(?:[-*+]|\d{1,3}[.)]|•)[ \t]+|^[ \t]{0,3}>[ \t]?|\|/gm
+
+/**
+ * A body reduced to what the parsed markdown and QQ's rendition have in common:
+ * the text with the layout markers and all whitespace gone. Only ever used to
+ * compare the two, never as message text.
+ *
+ * QQ's rendition is a rendering, not a copy — the template link of a recorded
+ * production menu message is gone from its fallback (`bot-markdown.e2e.test.ts`)
+ * — so the inline markup needs no handling here; only the layout markers differ.
+ */
+function renditionKey(value: string): string {
+  return value.replace(QQ_RENDITION_MARKERS, '').replace(/\s+/g, '')
 }
 
+/**
+ * QQ bot markdown inline markup, one alternative per construct the platform
+ * documents (`bot.q.qq.com` → Markdown 消息): escapes, fenced and inline code,
+ * images, links, autolinks, bold italic, bold, italic, strikethrough and
+ * headings. Order matters: `***x***` before `**x**`, a fence before a backtick.
+ */
+const QQ_INLINE_TOKEN = /\\([\\`*_{}[\]()#+\-.!>~|])|```([^\n`]*)\n([\s\S]*?)```|`([^`\n]+)`|!\[([^\]\n]*)\]\(([^)\s]*)\)|\[([^\]\n]*)\]\(([^)\s]*)\)|<(https?:\/\/[^\s>]+)>|\*\*\*([^*\n]+)\*\*\*|\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|_([^_\n]+)_|~~([^~\n]+)~~|^#{1,6}[ \t]+([^\n]+)$/gm
+
+/** QQ markdown inline markup, rendered into text and the entities Telegram draws. */
+function parseQQInline(source: string): { text: string, entities: IMTextEntity[] } {
+  const chunks: string[] = []
+  const entities: IMTextEntity[] = []
+  const push = (value: string) => {
+    const offset = chunks.join('').length
+    chunks.push(value)
+    return offset
+  }
+  /**
+   * A label with its target. An empty label renders nothing unless `fallback`
+   * says what to show instead: QQ's own template links carry their metadata in
+   * the target and draw nothing at all, while an image without alt text still
+   * points somewhere worth reaching.
+   */
+  const pushLink = (label: string, target: string, fallback?: string) => {
+    const text = label || fallback || ''
+    if (!text) return
+    const offset = push(text)
+    if (/^https?:\/\//i.test(target)) {
+      entities.push({ type: 'text-link', offset, length: text.length, url: target })
+    }
+  }
+  let cursor = 0
+  for (const match of source.matchAll(QQ_INLINE_TOKEN)) {
+    const index = match.index
+    push(source.slice(cursor, index))
+    if (match[1] !== undefined) {
+      push(match[1])
+    } else if (match[3] !== undefined) {
+      const offset = push(match[3])
+      entities.push({ type: 'pre', offset, length: match[3].length, language: match[2] || undefined })
+    } else if (match[4] !== undefined) {
+      const offset = push(match[4])
+      entities.push({ type: 'code', offset, length: match[4].length })
+    } else if (match[5] !== undefined) {
+      // An image cannot ride a Telegram message body, so its target becomes a
+      // link on the alt text, with QQ's `#618px #249px` size hints stripped.
+      const target = match[6]!
+      pushLink(
+        match[5].replace(/(?:\s*#\d+px)+\s*$/u, ''),
+        target,
+        /^https?:\/\//i.test(target) ? target : undefined,
+      )
+    } else if (match[7] !== undefined) {
+      // QQ bot frameworks prepend an empty-label link carrying template
+      // metadata such as `[](%7B%22version%22%3A2%7D)`; QQ renders nothing.
+      pushLink(match[7], match[8]!)
+    } else if (match[9] !== undefined) {
+      // `<https://…>` is QQ's autolink: the target is also what it reads as.
+      pushLink(match[9], match[9])
+    } else if (match[10] !== undefined) {
+      // `***x***` is bold italic: Telegram represents it as both entities.
+      const offset = push(match[10])
+      entities.push({ type: 'bold', offset, length: match[10].length })
+      entities.push({ type: 'italic', offset, length: match[10].length })
+    } else if (match[11] !== undefined || match[12] !== undefined) {
+      const value = match[11] ?? match[12]
+      const offset = push(value)
+      entities.push({ type: 'bold', offset, length: value.length })
+      // QQ documents `__x__` as underlined bold and draws it that way.
+      if (match[12] !== undefined) entities.push({ type: 'underline', offset, length: value.length })
+    } else if (match[13] !== undefined || match[14] !== undefined) {
+      const value = match[13] ?? match[14]
+      const offset = push(value)
+      entities.push({ type: 'italic', offset, length: value.length })
+    } else if (match[15] !== undefined) {
+      const offset = push(match[15])
+      entities.push({ type: 'strikethrough', offset, length: match[15].length })
+    } else if (match[16] !== undefined) {
+      // Telegram messages have no heading entity; QQ's headings read as bold.
+      const value = match[16].trim()
+      const offset = push(value)
+      if (value) entities.push({ type: 'bold', offset, length: value.length })
+    }
+    cursor = index + match[0].length
+  }
+  push(source.slice(cursor))
+  return { text: chunks.join(''), entities }
+}
+
+/** One line of a body, with QQ's quote marker taken off when it has one. */
+function qqBodyLine(line: string): { quoted: boolean, text: string } {
+  const marker = QQ_BLOCKQUOTE_LINE.exec(line)
+  return { quoted: Boolean(marker), text: marker ? line.slice(marker[0].length) : line }
+}
+
+/** One row of a QQ markdown table, or nothing when the line is not one. */
+function qqTableRow(line: string): string[] | undefined {
+  const trimmed = line.trim()
+  if (!trimmed.includes('|')) return undefined
+  const cells = trimmed.replace(/^\|/u, '').replace(/\|$/u, '').split('|').map((cell) => cell.trim())
+  return cells.length > 1 ? cells : undefined
+}
+
+/**
+ * A table: a header row, a `--- | ---` delimiter row, then body rows — all of
+ * them quoted or all of them bare, since a `>` line and a plain one are not the
+ * same block.
+ */
+function matchQQTable(
+  lines: readonly string[],
+  start: number,
+  quoted: boolean,
+): { rows: string[][], end: number } | undefined {
+  const row = (index: number) => {
+    const line = qqBodyLine(lines[index] ?? '')
+    return line.quoted === quoted ? qqTableRow(line.text) : undefined
+  }
+  const header = row(start)
+  const delimiter = row(start + 1)
+  if (!header || !delimiter || header.length !== delimiter.length) return undefined
+  if (!delimiter.every((cell) => /^:?-+:?$/.test(cell))) return undefined
+  const rows = [header]
+  let end = start + 2
+  while (end < lines.length) {
+    const next = row(end)
+    if (!next) break
+    rows.push(next)
+    end += 1
+  }
+  return { rows, end }
+}
+
+/** How many columns a person counts in a monospace line: wide glyphs take two. */
+function qqDisplayWidth(value: string): number {
+  let width = 0
+  for (const char of value) {
+    const code = char.codePointAt(0)!
+    width += code >= 0x1100 && (
+      code <= 0x115f
+      || (code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f)
+      || (code >= 0xac00 && code <= 0xd7a3)
+      || (code >= 0xf900 && code <= 0xfaff)
+      || (code >= 0xfe30 && code <= 0xfe6f)
+      || (code >= 0xff00 && code <= 0xff60)
+      || (code >= 0xffe0 && code <= 0xffe6)
+      || (code >= 0x1f300 && code <= 0x1faff)
+    ) ? 2 : 1
+  }
+  return width
+}
+
+/**
+ * A table as the monospace block Telegram can show.
+ *
+ * Telegram message entities have no table, and a table left as text keeps its
+ * pipes and its `--- | ---` delimiter row, which reads as markdown source. The
+ * rows therefore lose the delimiter, keep ` | ` between cells and are padded to
+ * equal column widths for a monospace client, inside one `pre` entity. Inline
+ * markup in a cell is rendered away rather than kept: inside code the reader
+ * must not see `**` either.
+ */
+function renderQQTable(rows: readonly string[][]): string {
+  const columns = Math.max(...rows.map((row) => row.length))
+  const cells = rows.map((row) => Array.from(
+    { length: columns },
+    (_cell, column) => parseQQInline(row[column] ?? '').text,
+  ))
+  const widths = cells[0]!.map((_cell, column) => Math.max(...cells.map((row) => qqDisplayWidth(row[column]!))))
+  return cells.map((row) => row
+    // The last cell needs no padding: nothing follows it on the line.
+    .map((cell, column) => column + 1 === columns
+      ? cell
+      : cell + ' '.repeat(Math.max(0, widths[column]! - qqDisplayWidth(cell))))
+    .join(' | ')).join('\n')
+}
+
+/** One run of a QQ markdown body: quoted lines, other lines, or a table. */
+type QQMarkdownBlock =
+  | { kind: 'text', quoted: boolean, text: string }
+  | { kind: 'table', quoted: boolean, rows: string[][] }
+
+/**
+ * QQ bot frameworks write QQ's reply box as a markdown blockquote, one line
+ * `> 名字：被引用的那句话`, because a native `message_reference` on a markdown
+ * message makes QQ attach the body twice. QQ's markdown renderer draws those
+ * lines as one quoted block, and Telegram carries the same thing as a
+ * `blockquote` entity — a client handed the markers instead draws the markdown
+ * source (`> 名字：…`), which is what the group reported.
+ *
+ * The body is therefore split into runs: quoted lines (markers dropped, inner
+ * newlines kept) and everything else, tables kept apart because Telegram can
+ * only show them as monospace. Unordered list items lose their marker for the
+ * same reason — Telegram has no list entity, QQ draws a bullet. A `>` or a
+ * marker inside a fence is code and stays as it is.
+ */
+function splitQQMarkdown(content: string): QQMarkdownBlock[] {
+  const blocks: QQMarkdownBlock[] = []
+  const lines = content.split('\n')
+  const push = (quoted: boolean, text: string) => {
+    const previous = blocks.at(-1)
+    // The newline belongs to the line before it, so a run keeps its inner ones.
+    if (previous?.kind === 'text' && previous.quoted === quoted) previous.text += `\n${text}`
+    else blocks.push({ kind: 'text', quoted, text })
+  }
+  const pushLine = (quoted: boolean, line: string) => {
+    const bullet = QQ_BULLET_LINE.exec(line)
+    push(quoted, bullet ? `${bullet[1]}${QQ_BULLET} ${line.slice(bullet[0].length)}` : line)
+  }
+  let fence = false
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!
+    // A fence line only toggles code state; its own text stays as it is.
+    if (QQ_FENCE_LINE.test(line)) fence = !fence
+    const body = fence ? { quoted: false, text: line } : qqBodyLine(line)
+    if (!fence) {
+      const table = matchQQTable(lines, index, body.quoted)
+      if (table) {
+        blocks.push({ kind: 'table', quoted: body.quoted, rows: table.rows })
+        index = table.end - 1
+        continue
+      }
+    }
+    pushLine(body.quoted, body.text)
+  }
+  return blocks
+}
+
+/**
+ * QQ bot markdown, rendered into the text and entities Telegram draws.
+ *
+ * Everything a markdown part carries is converted here in one pass: the whole
+ * body is markdown, so every construct in it — quote, lists, table, headings,
+ * inline markup — is rendered, rather than the parts the relay happens to know.
+ */
 export function parseQQMarkdown(content: string): Extract<
   IMMessage<QQMediaLocator>['content']['parts'][number],
   { type: 'text' }
 > {
   const text: string[] = []
-  const entities: import('@mtproto-relay/bridge').IMTextEntity[] = []
+  const entities: IMTextEntity[] = []
   const append = (value: string) => {
     const offset = text.join('').length
     text.push(value)
     return offset
   }
-  const token = /\\([\\`*_{}[\]()#+\-.!>~|])|```([^\n`]*)\n([\s\S]*?)```|`([^`\n]+)`|\[([^\]\n]*)\]\(([^)\s]*)\)|\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|_([^_\n]+)_|~~([^~\n]+)~~|^#{1,6}[ \t]+([^\n]+)$/gm
-  let cursor = 0
-  for (const match of content.matchAll(token)) {
-    const index = match.index
-    append(content.slice(cursor, index))
-    if (match[1] !== undefined) {
-      append(match[1])
-    } else if (match[3] !== undefined) {
-      const offset = append(match[3])
-      entities.push({ type: 'pre', offset, length: match[3].length, language: match[2] || undefined })
-    } else if (match[4] !== undefined) {
-      const offset = append(match[4])
-      entities.push({ type: 'code', offset, length: match[4].length })
-    } else if (match[5] !== undefined) {
-      // QQ bot frameworks prepend an empty-label link carrying template
-      // metadata such as `[](%7B%22version%22%3A2%7D)`; QQ renders nothing.
-      const label = match[5]
-      if (label) {
-        const offset = append(label)
-        if (/^https?:\/\//i.test(match[6])) {
-          entities.push({ type: 'text-link', offset, length: label.length, url: match[6] })
-        }
+  for (const [index, block] of splitQQMarkdown(content).entries()) {
+    if (index) append('\n')
+    if (block.kind === 'table') {
+      const rendered = renderQQTable(block.rows)
+      const start = append(rendered)
+      if (!rendered) continue
+      if (block.quoted) {
+        entities.push({ type: 'blockquote', offset: start, length: rendered.length })
       }
-    } else if (match[7] !== undefined || match[8] !== undefined) {
-      const value = match[7] ?? match[8]
-      const offset = append(value)
-      entities.push({ type: 'bold', offset, length: value.length })
-    } else if (match[9] !== undefined || match[10] !== undefined) {
-      const value = match[9] ?? match[10]
-      const offset = append(value)
-      entities.push({ type: 'italic', offset, length: value.length })
-    } else if (match[11] !== undefined) {
-      const offset = append(match[11])
-      entities.push({ type: 'strikethrough', offset, length: match[11].length })
-    } else if (match[12] !== undefined) {
-      const value = match[12].trim()
-      const offset = append(value)
-      if (value) entities.push({ type: 'bold', offset, length: value.length })
+      entities.push({ type: 'pre', offset: start, length: rendered.length })
+      continue
     }
-    cursor = index + match[0].length
+    const inline = parseQQInline(block.text)
+    const start = append(inline.text)
+    if (block.quoted) {
+      entities.push({ type: 'blockquote', offset: start, length: inline.text.length })
+    }
+    for (const entity of inline.entities) entities.push({ ...entity, offset: entity.offset + start })
   }
-  append(content.slice(cursor))
   const joined = text.join('')
   const rendered = joined.trim()
   const lead = joined.length - joined.trimStart().length
@@ -2941,7 +3209,6 @@ function isReactionResourceLocator(value: unknown): value is { reactionKey: stri
     && typeof (value as { reactionKey?: unknown }).reactionKey === 'string')
 }
 
-/** Size and content identity the bridge reported for one reaction asset. */
 interface ResolvedStickerAssetMeta {
   size: number
   version?: number
@@ -2952,16 +3219,11 @@ interface ResolvedStickerAssetMeta {
   resolvedAt: number
 }
 
-/** True for the QQ system-face stickers whose bytes the bridge has to resolve. */
 function isQQFaceSticker(sticker: IMSticker): boolean {
   const locator = sticker.locator as { kind?: unknown } | undefined
   return Boolean(locator && typeof locator === 'object' && locator.kind === 'sysface')
 }
 
-/**
- * Rewrites a sticker with the metadata of the image it will serve, or returns
- * undefined when the message already describes those bytes.
- */
 function applyStickerAssetMeta(
   sticker: IMSticker,
   meta: ResolvedStickerAssetMeta,
@@ -3003,23 +3265,15 @@ interface ResolvedReactionResourceMeta {
   resolvedAt: number
 }
 
-/** Reaction key of a resource the bridge can resolve metadata for. */
 function reactionResourceLocatorKey(resource: IMReactionResource): string | undefined {
   const locator = resource.locator
   return isReactionResourceLocator(locator) ? locator.reactionKey : undefined
 }
 
-/** Keeps a reported image dimension, dropping the zeroes a bridge may send. */
 function positiveDimension(value: number | undefined): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.trunc(value) : undefined
 }
 
-/**
- * Returns a resource copy when the resolved metadata differs from what the
- * definition advertises. Stale sizes (for example one measured while the bridge
- * still relayed archives) and remote-side changes are corrected here instead of
- * being trusted forever.
- */
 function applyReactionResourceMeta(
   resource: IMReactionResource,
   resolved: ReadonlyMap<string, ResolvedReactionResourceMeta>,
@@ -3031,8 +3285,6 @@ function applyReactionResourceMeta(
   const meta = resolved.get(key) ?? cache.get(key)
   if (!meta) return undefined
   const version = meta.version ?? resource.version
-  // The bytes decide the geometry too: a wide face resolves its canvas entry
-  // while an inline one resolves the square icon of the same bundle.
   const width = meta.width ?? resource.width
   const height = meta.height ?? resource.height
   if (resource.size === meta.size && resource.version === version
@@ -3079,6 +3331,12 @@ function isFilteredConversationId(value: string): boolean {
   return isInvalidZeroPeerConversationId(value)
 }
 
+/** QQ 的 `msgSeq` 是十进制字符串，可能超出 Number 的安全范围，比较时才用 BigInt。 */
+function numericSequence(value: string | undefined): bigint | undefined {
+  if (!value || !/^\d+$/.test(value)) return undefined
+  return BigInt(value)
+}
+
 function normalizeTextPart(
   part: Extract<WireMessage['parts'][number], { type: 'text' }>,
   reactionCatalog?: IMReactionContext,
@@ -3092,9 +3350,7 @@ function normalizeTextPart(
     }
   }
 
-  // QQ embeds faces in the text as placeholders (for example, `[微笑]` or
-  // `/续标识`). Replace every known placeholder, including faces occurring
-  // inline with regular text, and translate offsets to the rendered string.
+  // 将文本中的 QQ 表情占位符（如 `[微笑]`、`/续标识`）替换为 emoji 或自定义表情，并重算后续实体的偏移。
   const faces = [...sourceFaces].sort((a, b) => a.offset - b.offset)
   const replacements: Array<{ sourceOffset: number, sourceLength: number, outputOffset: number, outputLength: number }> = []
   const customEmojiEntities: import('@mtproto-relay/bridge').IMTextEntity[] = []
@@ -3112,10 +3368,7 @@ function normalizeTextPart(
       replacement = definition.presentation.alt
       customEmojiEntities.push({ type: 'custom-emoji', offset: outputOffset, length: replacement.length, definition })
     } else if (sourceText.startsWith('/')) {
-      // QQ can send newer system-face labels before its local resource pack
-      // contains the corresponding asset. Keep those labels from leaking into
-      // Telegram as literal slash commands; use the same fallback emoji as
-      // catalog-backed QQ system faces until the asset becomes available.
+      // 本地资源包尚未收录的新系统表情以 `/xxx` 占位，替换为默认 emoji 以免被客户端当成斜杠命令。
       replacement = '🙂'
     }
     output += replacement
@@ -3207,8 +3460,6 @@ function isQQNTMediaUnavailable(error: unknown): boolean {
 function needsUserAvatarRefresh(media: IMMedia<QQMediaLocator>, locator: QQMediaLocator): boolean {
   return media.id.startsWith('avatar:')
     && locator.chatType === 1
-    // An archived merged-forward author carries the avatar URL itself; asking
-    // the bridge for the placeholder peer would only waste a round trip.
     && !locator.avatarUrl
     && !locator.filePath
     && !locator.fileUuid

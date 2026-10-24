@@ -1,11 +1,7 @@
 const COMPACT_PATH_CHARACTERS
   = 'AACAAAAHAAALMAAAQASTAVAAAZaacaaaahaaalmaaaqastava.az0123456789-,'
 
-// Clients do not run a general SVG engine over a `photoPathSize` thumbnail.
-// Telegram Desktop's `Images::PathFromInlineBytes` implements M/L/H/V/C/S/Z
-// only and throws the whole path away as soon as it meets any other command,
-// which silently removes the loading frame. Everything we encode therefore has
-// to stay inside that subset.
+// Telegram Desktop 的 `Images::PathFromInlineBytes` 仅支持 M/L/H/V/C/S/Z 指令，遇到其余 SVG 指令会丢弃整个路径。
 const CUBIC_CORNER_RATIO = 0.5522847498307936
 
 interface Point {
@@ -19,16 +15,7 @@ export type TelegramStickerPathCommand =
   | { _: 'cubic', x1: number, y1: number, x2: number, y2: number, x: number, y: number }
   | { _: 'close', x: number, y: number }
 
-/**
- * Builds Telegram's compact SVG-path placeholder for an uncached sticker.
- *
- * The frame spans the whole document box. Clients scale it with
- * `documentAttributeImageSize` — Telegram Desktop through
- * `DocumentData::dimensions`, Android through the attribute lookup in
- * `DocumentObject.getSvgThumb` — and Desktop additionally clips it to the
- * rounded sticker rect, so a rounded rectangle here matches what a real
- * silhouette looks like before either thumbnail or asset arrives.
- */
+/** 生成圆角矩形的紧凑 SVG 路径，用作未缓存贴纸加载时的微光占位轮廓。 */
 export function telegramStickerPlaceholder(width: number, height: number): Uint8Array {
   const w = positiveDimension(width)
   const h = positiveDimension(height)
@@ -48,25 +35,16 @@ export function telegramStickerPlaceholder(width: number, height: number): Uint8
 }
 
 /**
- * Encodes an SVG path into Telegram's compact sticker-path bytes.
- *
- * Clients prepend the implicit leading move-to and append the closing command
- * themselves, so the text must start with the first coordinate pair and must
- * not carry a trailing `z`.
+ * 将 SVG 路径编码为 Telegram 紧凑贴纸路径字节。
+ * 客户端会自动补上前导 `M` 和末尾 `z`，传入字符串须以首对坐标开头且不带末尾 `z`。
  */
 export function encodeTelegramStickerPath(path: string): Uint8Array {
   return compactPath(path)
 }
 
 /**
- * Decodes compact sticker-path bytes exactly the way clients do: they prepend
- * the implicit move-to, append the closing command, and then run a reduced SVG
- * parser that only knows the commands Telegram's own sticker encoder emits.
- *
- * Returns `undefined` when a client would drop the whole path, which happens
- * for unknown commands, malformed numbers, unclosed subpaths, and paths that
- * carry no drawing segment at all. Callers fall back to a drawable placeholder
- * so a sticker never stays blank instead of showing a loading frame.
+ * 按客户端解析规则解码紧凑贴纸路径字节（自动补 `M` 与末尾 `z`）。
+ * 遇到未知指令、非法数值、未闭合子路径或无绘制线段时返回 `undefined`，由调用方回退到占位轮廓。
  */
 export function decodeTelegramStickerPath(bytes: Uint8Array): TelegramStickerPathCommand[] | undefined {
   const source = `${expandCompactPath(bytes)}z\0`
@@ -109,9 +87,7 @@ export function decodeTelegramStickerPath(bytes: Uint8Array): TelegramStickerPat
     skipCommas()
     if (current() === '\0') break
 
-    // The encoder drops the leading move-to and clients add it back, so every
-    // path starts with one. Consecutive move-tos keep the last coordinate pair,
-    // matching how the client parser consumes them.
+    // 连续的 move-to 仅保留最后一对坐标，与客户端解析器行为一致。
     while (current() === 'm' || current() === 'M') {
       const relative = current() === 'm'
       position++
@@ -134,7 +110,6 @@ export function decodeTelegramStickerPath(bytes: Uint8Array): TelegramStickerPat
     let lastControl: Point | undefined
     while (!closed) {
       skipCommas()
-      // The client logs "Receive unclosed path" and drops the path.
       if (current() === '\0') return undefined
       if (isAlpha(current())) {
         command = current()
@@ -200,8 +175,7 @@ export function decodeTelegramStickerPath(bytes: Uint8Array): TelegramStickerPat
         case 'M':
         case 'z':
         case 'Z': {
-          // The client parser rewinds over a move-to so its outer loop reads it
-          // as a new subpath; only `z`/`Z` close the current one.
+          // 遇到新的 move-to 时回退一字节，交给外层循环按新子路径处理；仅 `z`/`Z` 闭合当前子路径。
           if (command === 'z' || command === 'Z') {
             commands.push({ _: 'close', x: start.x, y: start.y })
             x = start.x
@@ -213,7 +187,6 @@ export function decodeTelegramStickerPath(bytes: Uint8Array): TelegramStickerPat
           break
         }
         default:
-          // Clients discard the entire path on an unsupported command.
           return undefined
       }
     }
@@ -222,11 +195,7 @@ export function decodeTelegramStickerPath(bytes: Uint8Array): TelegramStickerPat
   return draws ? commands : undefined
 }
 
-/**
- * Approximates the visible outside edge of an RGBA alpha channel as a compact
- * Telegram sticker path. Empty masks return undefined so callers can use the
- * deterministic rounded placeholder instead.
- */
+/** 从 RGBA alpha 通道提取外轮廓并编码为紧凑贴纸路径；全透明时返回 `undefined`。 */
 export function traceTelegramStickerOutline(
   alpha: Uint8Array,
   width: number,

@@ -80,4 +80,50 @@ describe('DialogFolderStore', () => {
     ])).resolves.toEqual(new Set(['group-b']))
     await expect(store.archivedPeerIds('session')).resolves.toEqual(new Set(['group-a']))
   })
+
+  it('pins peers newest-first, reorders them, and keeps folder rows independent', async () => {
+    const { ctx, store } = await createStore()
+    await expect(store.pinnedPeerIds('session')).resolves.toEqual([])
+    await expect(store.setPeerPinned('session', 'group-a', true)).resolves.toBe(true)
+    await expect(store.setPeerPinned('session', 'group-b', true)).resolves.toBe(true)
+    await expect(store.setPeerPinned('session', 'group-a', true)).resolves.toBe(false)
+    await expect(store.pinnedPeerIds('session')).resolves.toEqual(['group-b', 'group-a'])
+    await expect(store.pinnedPeerIds('other-session')).resolves.toEqual([])
+
+    await expect(store.reorderPinnedPeers('session', ['group-a', 'group-c', 'group-a'], ['group-b', 'group-a'], false))
+      .resolves.toEqual(['group-a', 'group-c', 'group-b'])
+    const resumed = new DialogFolderStore(ctx.database)
+    await expect(resumed.pinnedPeerIds('session')).resolves.toEqual(['group-a', 'group-c', 'group-b'])
+
+    await expect(resumed.reorderPinnedPeers('session', ['group-b'], ['group-a', 'group-c', 'group-b'], true))
+      .resolves.toEqual(['group-b'])
+    await expect(resumed.pinnedPeerIds('session')).resolves.toEqual(['group-b'])
+    await expect(resumed.setPeerPinned('session', 'group-b', false)).resolves.toBe(true)
+    await expect(resumed.setPeerPinned('session', 'group-b', false)).resolves.toBe(false)
+    await expect(resumed.pinnedPeerIds('session')).resolves.toEqual([])
+    // Unpinned rows outside an archive carry no state and are removed.
+    await expect(ctx.database.get('mtproto_dialog_folder_peer', { platformSessionId: 'session' }))
+      .resolves.toEqual([])
+  })
+
+  it('keeps archived pins in the archive and drops a pin when its peer changes folder', async () => {
+    const { ctx, store } = await createStore()
+    await store.setPeerFolders('session', [{ peerId: 'group-a', folderId: 1 }])
+    await store.setPeerPinned('session', 'group-a', true)
+    await expect(store.archivedPeerIds('session')).resolves.toEqual(new Set(['group-a']))
+    await expect(store.pinnedPeerIds('session')).resolves.toEqual(['group-a'])
+
+    await store.setPeerPinned('session', 'group-a', false)
+    await expect(store.archivedPeerIds('session')).resolves.toEqual(new Set(['group-a']))
+
+    await store.setPeerPinned('session', 'group-a', true)
+    await store.setPeerPinned('session', 'group-b', true)
+    await expect(store.setPeerFolders('session', [
+      { peerId: 'group-a', folderId: 0 },
+      { peerId: 'group-b', folderId: 0 },
+    ])).resolves.toEqual(new Set(['group-a']))
+    await expect(store.pinnedPeerIds('session')).resolves.toEqual(['group-b'])
+    await expect(ctx.database.get('mtproto_dialog_folder_peer', { platformSessionId: 'session' }))
+      .resolves.toMatchObject([{ platformConversationId: 'group-b', folderId: 0, pinnedOrder: expect.any(Number) }])
+  })
 })

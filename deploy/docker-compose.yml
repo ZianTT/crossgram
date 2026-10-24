@@ -1,0 +1,94 @@
+name: crossgram
+
+# 部署输入来自 deploy/.env；其余是字面量。内存上限按需开启：各服务的 deploy: 块已注释，参考值见 deploy/README.md。
+x-crossgram-environment: &crossgram-environment
+  NODE_ENV: production
+  MALLOC_ARENA_MAX: "2"
+  CROSSGRAM_PUBLIC_HOST: "${CROSSGRAM_PUBLIC_HOST:?required}"
+  CROSSGRAM_PORT: "${CROSSGRAM_PORT:-4430}"
+  CROSSGRAM_POSTGRES_HOST: postgres
+  CROSSGRAM_POSTGRES_PORT: "5432"
+  CROSSGRAM_POSTGRES_USER: crossgram
+  CROSSGRAM_POSTGRES_DATABASE: crossgram
+  CROSSGRAM_POSTGRES_PASSWORD: "${CROSSGRAM_POSTGRES_PASSWORD:?required}"
+  CROSSGRAM_WEBUI_HOST: 0.0.0.0
+  CROSSGRAM_WEBUI_PORT: "${CROSSGRAM_WEBUI_PORT:-3140}"
+  CROSSGRAM_QQNT_ENDPOINT: "${CROSSGRAM_QQNT_ENDPOINT:-http://qqnt-bridge:18767/v1}"
+  CROSSGRAM_QQNT_WS_ENDPOINT: "${CROSSGRAM_QQNT_WS_ENDPOINT:-ws://qqnt-bridge:18767/v1/events/ws}"
+  QQNT_BRIDGE_TOKEN: "${QQNT_BRIDGE_TOKEN:-}"
+  TELEGRAM_BOT_TOKEN_VERIFIER_SECRET: "${TELEGRAM_BOT_TOKEN_VERIFIER_SECRET:?required}"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: crossgram
+      POSTGRES_DB: crossgram
+      POSTGRES_PASSWORD: "${CROSSGRAM_POSTGRES_PASSWORD:?required}"
+    volumes:
+      - crossgram-postgres:/var/lib/postgresql/data
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 768m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  crossgram:
+    # 只拉取镜像；需要从检出构建时叠加 docker-compose.build.yml 并加 --build。
+    image: "${CROSSGRAM_IMAGE:-ghcr.io/std-microblock/crossgram:latest}"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *crossgram-environment
+    volumes:
+      - crossgram-state:/var/lib/crossgram
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2g
+    ports:
+      - "${CROSSGRAM_BIND:-0.0.0.0}:${CROSSGRAM_PORT:-4430}:${CROSSGRAM_PORT:-4430}"
+      - "127.0.0.1:${CROSSGRAM_WEBUI_PORT:-3140}:${CROSSGRAM_WEBUI_PORT:-3140}"
+    healthcheck:
+      test: ["CMD-SHELL", "node /opt/crossgram/deploy/docker/healthcheck.mjs"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  qqnt-bridge:
+    # 镜像由 bridge 自己的仓库构建发布。
+    image: "${CROSSGRAM_QQNT_IMAGE:-ghcr.io/xuuuuan/crossgram-qqnt:latest}"
+    profiles:
+      - qqnt
+    restart: unless-stopped
+    environment:
+      QQNT_BRIDGE_HOST: 0.0.0.0
+      QQNT_BRIDGE_PORT: "18767"
+      QQNT_BRIDGE_TOKEN: "${QQNT_BRIDGE_TOKEN:-}"
+      QQNT_BRIDGE_STATE_DIR: /var/lib/qqnt-bridge
+      QQNT_BRIDGE_HEADLESS: "1"
+      QQNT_BRIDGE_CLOSE_MAIN_WINDOW: "1"
+      QQNT_BRIDGE_AUTO_LOGIN: "1"
+      QQNT_BRIDGE_MANAGE_LOGIN: "1"
+      QQNT_BRIDGE_QQ_FLAGS: "${CROSSGRAM_QQNT_QQ_FLAGS:-}"
+    volumes:
+      - crossgram-qqnt:/var/lib/qqnt-bridge
+    # QQ 带 --disable-dev-shm-usage，/dev/shm 用不到；健康检查由镜像自带，`up --wait` 依据它。
+    shm_size: 256m
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2g
+
+volumes:
+  crossgram-state:
+  crossgram-postgres:
+  crossgram-qqnt:

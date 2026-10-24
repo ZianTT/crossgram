@@ -10,7 +10,6 @@ export interface AuthSessionRow {
   totpSecret: string
   platformId: string
   platformSessionId: string
-  /** SRP verifier for the optional two-step verification password. */
   passwordSrp?: SrpVerifier | null
 }
 
@@ -65,6 +64,8 @@ export interface IMConversationRow {
   avatar: JsonValue | null
   metadata: JsonObject
   unreadCount: number
+  /** 上游报告的已读边界消息（本地消息行 ID）。缺少上游数据时保留旧值，避免把「已读到哪」退化成「一条都没读」。 */
+  readInboxMaxMessageId: number | null
   updatedAt: Date
 }
 
@@ -93,11 +94,14 @@ export interface IMMessageRow {
   deleted: boolean
   platformGroupId: string | null
   metadata: JsonObject
+  /** 归一化后的可搜索文本（正文、卡片、文件名、链接），无文本索引，按会话扫描时做子串匹配。 */
+  searchText: string
+  /** 媒体类别位掩码（见 `SEARCH_KIND`）；`null` 表示旧数据尚未建立搜索字段。 */
+  searchKinds: number | null
   createdAt: Date
   updatedAt: Date
 }
 
-/** Canonical platform request, deliberately independent from its inbox projection message. */
 export interface IMRequestRow {
   id: number
   platformSessionId: string
@@ -118,7 +122,6 @@ export interface IMMessageAliasRow {
   ordinal: number
 }
 
-/** Bridge-owned Telegram unread-mention state for one logical platform message. */
 export interface MessageMentionRow {
   messageId: number
   platformSessionId: string
@@ -241,7 +244,7 @@ export interface StickerSetInstallRow {
   installedAt: Date
   sortOrder: number
   archived: boolean
-  /** Persisted tombstone for provider packs removed from Telegram's installed catalog. */
+  /** 标记已被用户从 Telegram 已安装列表中移除的贴纸包。 */
   uninstalled: boolean
 }
 
@@ -278,11 +281,40 @@ export interface DialogFilterRow {
   updatedAt: Date
 }
 
+
+export interface ScheduledMessageRow {
+  id: number
+  platformSessionId: string
+  platformConversationId: string
+  conversationKind: IMConversationKind
+  tlMessageId: number
+  text: string
+  entities: JsonValue[] | null
+  replyToMsgId: number | null
+  createdAt: Date
+}
+
+export interface ScheduledMessageStateRow {
+  messageId: number
+  dueAt: number
+  status: 'pending' | 'sending' | 'sent' | 'failed' | 'cancelled'
+  attempts: number
+  nextAttemptAt: number
+  leaseOwner: string | null
+  leaseUntil: number | null
+  randomId: string
+  sentTlMessageId: number | null
+  lastError: string | null
+  updatedAt: Date
+}
+
 export interface DialogFolderPeerRow {
   id: string
   platformSessionId: string
   platformConversationId: string
   folderId: number
+  /** 置顶顺序（升序），未置顶时为 null */
+  pinnedOrder: number | null
   updatedAt: Date
 }
 
@@ -315,10 +347,11 @@ declare module '@cordisjs/plugin-database' {
     mtproto_blocked_peer: BlockedPeerRow
     mtproto_dialog_filter: DialogFilterRow
     mtproto_dialog_folder_peer: DialogFolderPeerRow
+    mtproto_scheduled_message: ScheduledMessageRow
+    mtproto_scheduled_state: ScheduledMessageStateRow
   }
 }
 
-/** Register all bridge models. The project is pre-release, so these are the canonical schemas. */
 export function defineModels(ctx: Context): void {
   ctx.model.extend('mtproto_auth_session', {
     id: 'string', virtualPhone: 'string', totpSecret: 'string', platformId: 'string',
@@ -351,6 +384,7 @@ export function defineModels(ctx: Context): void {
     spacePlatformId: { type: 'text', nullable: true }, avatar: { type: 'json', nullable: true },
     metadata: 'json', updatedAt: 'timestamp',
     unreadCount: 'unsigned',
+    readInboxMaxMessageId: { type: 'unsigned', nullable: true },
   }, {
     primary: 'id', autoInc: true,
     unique: [['platformSessionId', 'platformConversationId']],
@@ -371,11 +405,17 @@ export function defineModels(ctx: Context): void {
     id: 'unsigned', platformSessionId: 'string', conversationId: 'unsigned',
     primaryPlatformMessageId: 'text', senderUserId: 'unsigned', text: 'text', content: 'json', timestamp: 'integer',
     outgoing: 'boolean', deleted: 'boolean', platformGroupId: { type: 'text', nullable: true }, metadata: 'json',
+    searchText: 'text', searchKinds: { type: 'unsigned', nullable: true },
     createdAt: 'timestamp', updatedAt: 'timestamp',
   }, {
     primary: 'id', autoInc: true,
-    unique: [['platformSessionId', 'conversationId', 'primaryPlatformMessageId']],
-    indexes: [['conversationId', 'timestamp'], 'senderUserId'],
+    // conversationId 是本表的全局唯一自增行号，已隐含 platformSessionId；
+    // 判重键不再重复携带 32 字节的会话 id，索引键从 55 字节降到 23 字节。
+    unique: [['conversationId', 'primaryPlatformMessageId']],
+    // senderUserId 只在会话扫描中作为附加过滤条件（from: 搜索），不单独建索引。
+    // 搜索不建文本索引：会话内搜索沿 (conversationId, timestamp) 倒序扫描，
+    // 全局搜索沿 (platformSessionId, timestamp) 倒序扫描，searchText 子串匹配，凑够一页即停。
+    indexes: [['conversationId', 'timestamp'], ['platformSessionId', 'timestamp']],
   })
 
   ctx.model.extend('mtproto_im_request', {
@@ -392,7 +432,8 @@ export function defineModels(ctx: Context): void {
     messageId: 'unsigned', ordinal: 'unsigned',
   }, {
     primary: 'id', autoInc: true,
-    unique: [['platformSessionId', 'conversationId', 'platformMessageId']],
+    // 同上：conversationId 已隐含 platformSessionId，平台消息 id 只需在会话内唯一。
+    unique: [['conversationId', 'platformMessageId']],
     indexes: ['messageId'],
   })
 
@@ -408,9 +449,7 @@ export function defineModels(ctx: Context): void {
   ctx.model.extend('mtproto_im_media', {
     id: 'unsigned', messageId: 'unsigned', ordinal: 'unsigned', partIndex: 'unsigned', platformMediaId: 'text',
     kind: 'string', name: { type: 'text', nullable: true }, mimeType: { type: 'text', nullable: true },
-    // QQNT file sizes can exceed PostgreSQL int4 (for example a 2.77 GB zip).
-    // Keep the value lossless as a scale-zero numeric while retaining the
-    // number-shaped API exposed by IMMediaRow and Telegram projections.
+    // QQNT 文件大小可能超过 PostgreSQL int4 上限（如 >2GB 压缩包），使用 scale=0 的 decimal 存储。
     size: { type: 'decimal', precision: 20, scale: 0, nullable: true }, width: { type: 'unsigned', nullable: true },
     height: { type: 'unsigned', nullable: true }, duration: { type: 'unsigned', nullable: true }, voice: 'boolean',
     preview: { type: 'json', nullable: true },
@@ -418,7 +457,7 @@ export function defineModels(ctx: Context): void {
   }, {
     primary: 'id', autoInc: true,
     unique: [['messageId', 'ordinal', 'platformMediaId']],
-    indexes: ['messageId'],
+    // 媒体查询一律是 messageId = / IN (...)，unique 的左前缀已经覆盖，无需单列索引。
   })
 
   ctx.model.extend('mtproto_tl_message_part', {
@@ -430,13 +469,14 @@ export function defineModels(ctx: Context): void {
     groupedId: { type: 'string', nullable: true }, ordinal: 'unsigned',
   }, {
     primary: 'id', autoInc: true,
-    unique: [['scope', 'tlMessageId'], ['messageId', 'ordinal']],
+    // 唯一性的语义是 (scope, tlMessageId) 这一对值；把 tlMessageId 放到首位不改变判重结果，
+    // 但投影按 tlMessageId 递增写入，这样可以近似追加写，叶子页填充率从约 60% 回到 90%。
+    unique: [['tlMessageId', 'scope'], ['messageId', 'ordinal']],
     indexes: [
-      'messageId',
+      // 话题 id 的取法已改为按 messageId 取回首条分片后在内存比较，
+      // 因此不再需要 (platformSessionId, conversationId, tlMessageId)。
       ['platformSessionId', 'tlMessageId'],
-      ['platformSessionId', 'conversationId', 'tlMessageId'],
-      // conversationId is globally unique; this also keeps the generated index
-      // name below PostgreSQL's 63-byte limit (the longer prefix collides).
+      // conversationId 全局唯一，省略前缀可避免生成的索引名超出 PostgreSQL 63 字节上限导致冲突。
       ['conversationId', 'nativeSequence'],
       ['scope', 'nativeOrderKey'],
     ],
@@ -495,7 +535,7 @@ export function defineModels(ctx: Context): void {
   }, {
     primary: 'id', autoInc: true,
     unique: [['messageId', 'nativeReactionKey']],
-    indexes: ['messageId'],
+    // 回应查询只按 messageId 过滤，unique 的左前缀已经覆盖。
   })
 
   ctx.model.extend('mtproto_sticker_set_install', {
@@ -543,10 +583,35 @@ export function defineModels(ctx: Context): void {
 
   ctx.model.extend('mtproto_dialog_folder_peer', {
     id: 'string', platformSessionId: 'string', platformConversationId: 'text',
-    folderId: 'unsigned', updatedAt: 'timestamp',
+    folderId: 'unsigned', pinnedOrder: { type: 'integer', nullable: true }, updatedAt: 'timestamp',
   }, {
     primary: 'id',
     unique: [['platformSessionId', 'platformConversationId']],
-    indexes: [['platformSessionId', 'folderId']],
+    indexes: [['platformSessionId', 'folderId'], ['platformSessionId', 'pinnedOrder']],
   })
+
+  ctx.model.extend('mtproto_scheduled_message', {
+    id: 'unsigned', platformSessionId: 'string', platformConversationId: 'text',
+    conversationKind: 'string', tlMessageId: 'unsigned', text: 'text',
+    entities: { type: 'json', nullable: true },
+    replyToMsgId: { type: 'unsigned', nullable: true },
+    createdAt: 'timestamp',
+  }, {
+    primary: 'id', autoInc: true,
+    unique: [['platformSessionId', 'platformConversationId', 'tlMessageId']],
+    indexes: [['platformSessionId', 'platformConversationId']],
+  })
+
+  ctx.model.extend('mtproto_scheduled_state', {
+    messageId: 'unsigned', dueAt: 'integer', status: 'string', attempts: 'unsigned',
+    nextAttemptAt: 'integer', leaseOwner: { type: 'text', nullable: true },
+    leaseUntil: { type: 'integer', nullable: true }, randomId: 'text',
+    sentTlMessageId: { type: 'unsigned', nullable: true },
+    lastError: { type: 'text', nullable: true }, updatedAt: 'timestamp',
+  }, {
+    primary: 'messageId',
+    unique: [['randomId']],
+    indexes: [['status', 'nextAttemptAt'], ['status', 'leaseUntil']],
+    })
 }
+

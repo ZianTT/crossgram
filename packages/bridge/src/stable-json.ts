@@ -1,15 +1,8 @@
 /**
- * Key-order-insensitive JSON helpers for values that round-trip through a
- * durable JSON column.
- *
- * PostgreSQL jsonb does not preserve the key order of the payload it stores:
- * it returns keys ordered by length and then bytewise. Comparing
- * JSON.stringify() output against a freshly built payload therefore reports a
- * difference for every persisted row, which makes ingestion rewrite unchanged
- * messages and conversations on every read. Canonicalize both sides instead.
+ * 忽略键顺序的 JSON 序列化与结构对比。
+ * PostgreSQL jsonb 不保留原始键顺序，直接对比 `JSON.stringify()` 会导致每次读取都把未变更的记录误判为已修改。
  */
 
-/** Serialize a JSON value with a stable, sorted key order. */
 export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
   if (Array.isArray(value)) return '[' + value.map((item) => canonicalJson(item)).join(',') + ']'
@@ -23,7 +16,6 @@ export function canonicalJson(value: unknown): string {
     .join(',') + '}'
 }
 
-/** Structural equality that ignores JSON key order. */
 export function jsonEquals(left: unknown, right: unknown): boolean {
   if (left === right) return true
   if (left === null || right === null) return false
@@ -31,13 +23,7 @@ export function jsonEquals(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right)
 }
 
-/**
- * True when every field of the expected payload matches the stored payload.
- *
- * Durable rows also carry state that the ingestion path does not own, such as
- * reaction selections or relay-only display fields. Those extra fields must not
- * make an otherwise unchanged payload look modified.
- */
+/** 判断 `expected` 中的所有字段是否都与 `container` 一致（忽略 `container` 中由存储层额外维护的字段）。 */
 export function jsonContains(container: unknown, expected: unknown): boolean {
   if (jsonEquals(container, expected)) return true
   if (Array.isArray(container) && Array.isArray(expected)) {

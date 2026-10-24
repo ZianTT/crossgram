@@ -1,81 +1,46 @@
-# Cordis-native MTProto and message pipelines
+# Cordis 管线与生命周期
 
-The relay treats protocol and message work as scoped Cordis lifetimes instead
-of a collection of global callback maps.
+CrossGram 将连接、请求与平台事件建模为 Cordis 树状作用域（Fiber），不维护全局回调表，连接断开或插件卸载时自动回收关联资源。
 
-## MTProto lifetime tree
+## MTProto 生命周期树
 
 ```text
 Mtproto service fiber
-└─ connectionFiber (one per TCP socket)
-   ├─ derived connection context: ctx.mtprotoConnection
-   ├─ derived packet context: ctx.mtprotoPacket
-   └─ rpcInvocationFiber (one per decoded RPC)
-      └─ derived RPC context: ctx.mtprotoRpc + ServerRpcContext fields
+└─ connectionFiber (每个 TCP/WS 连接一个)
+   ├─ ctx.mtprotoConnection
+   ├─ ctx.mtprotoPacket
+   └─ rpcInvocationFiber (每个解码后的 RPC 一个)
+      └─ ctx.mtprotoRpc + ServerRpcContext
 ```
 
-- Closing a socket disposes its `connectionFiber`. Session listeners and all
-  in-flight or nested effects below that connection are therefore reclaimed by
-  Cordis rather than by a second, manual lifecycle system.
-- `mtproto/packet` is a waterfall around raw decoded-frame processing. It is
-  suitable for tracing, validation, rate limits, and fault injection. An
-  observer must call `next()` unless it intentionally rejects the packet.
-- `mtproto/rpc` is a waterfall around RPC routing. Cross-cutting policies can
-  wrap the method handler without modifying the MTProto session implementation.
-- `mtproto/rpc/method` is the serial route event. `ctx.mtproto.register()` is a
-  lifecycle-safe facade over this event: the route disappears automatically
-  when the registering fiber unloads. Newer registrations run first, preserving
-  the old route-replacement behavior while allowing the previous route to
-  become visible again if an overriding fiber unloads.
-- There is no parallel RPC registry or handler map. Direct decoded
-  RPC tests use the same `registerRpcRoute()` / `invokeRpc()` Cordis event path
-  as live socket traffic.
-- `mtproto/connection` and `mtproto/debug` are observation events dispatched
-  with the connection's derived context as `this`.
+- 关闭底层连接会自动销毁 `connectionFiber` 及其下属所有进行中的子任务与监听器。
+- `mtproto/packet`：原始帧处理拦截链（Waterfall），用于追踪、校验或限流。观察者若不拒绝数据包，必须调用 `next()`。
+- `mtproto/rpc`：RPC 路由拦截链（Waterfall），用于挂载跨切面策略。
+- `mtproto/rpc/method`：串行路由事件。`ctx.mtproto.register()` 基于此事件注册处理函数，后注册的路由优先生效，所属插件卸载后自动恢复旧路由。
+- `mtproto/connection` 与 `mtproto/debug`：连接与调试观测事件。
 
-## Platform message lifetime tree
+## 平台事件生命周期树
 
 ```text
 bridge plugin fiber
-└─ platformSessionFiber (one per active durable platform session)
-   ├─ derived session context: ctx.bridgeSession
-   └─ platformEventFiber (one per message/edit/delete/read/reaction/call event)
-      └─ derived event context: ctx.bridgeEvent
+└─ platformSessionFiber (每个在线平台会话一个)
+   ├─ ctx.bridgeSession
+   └─ platformEventFiber (每个消息/编辑/撤回/已读/回应/通话事件一个)
+      └─ ctx.bridgeEvent
 ```
 
-Each session fiber owns the adapter subscription and its ordered event tail.
-Events for different sessions can run concurrently; events within one session
-remain in source order. Stopping an adapter or unloading the bridge disposes the
-session fibers and waits for their current tails before unsubscribing.
+每个会话 Fiber 独立持有平台订阅和保序事件队列：不同会话可并发处理，同一会话内部严格按上游顺序串行处理。停止适配器或卸载 Bridge 时，会先等待当前事件处理完毕再取消订阅。
 
-The event processing stages are:
+事件处理分为四步：
 
-1. `bridge/platform-event` waterfall wraps canonical persistence.
-2. `MessageStore` commits the platform event and produces a typed
-   `CommittedPlatformEvent`.
-3. `bridge/platform-event/publish` waterfall wraps MTProto update projection
-   and delivery.
-4. `im-platform/event-committed` fans out observers after the publish stage.
+1. `bridge/platform-event`（Waterfall）：平台事件入库前置拦截。
+2. `MessageStore`：事务写入数据库并生成 `CommittedPlatformEvent`。
+3. `bridge/platform-event/publish`（Waterfall）：投影为 MTProto 更新并推送给客户端。
+4. `im-platform/event-committed`：入库并发布完成后的广播通知。
 
-Registry and active-session changes are also Cordis events:
+## 作用域规则
 
-- `im-platform/change`
-- `im-platform/session`
-- `im-platform/event-committed`
-
-The existing `IMPlatformService.onChange()`, `onSessionChange()`, and
-`onCommittedEvent()` methods remain as small event-backed convenience APIs, so
-their listeners are now owned by the calling fiber.
-
-## Scope rules
-
-- Process-wide mutable state belongs to a Service.
-- Connection/session mutable state belongs to its long-lived child fiber.
-- Packet/RPC/platform-event metadata belongs to a derived context.
-- Registrations and external resources must be Cordis effects.
-- Cross-cutting behavior uses waterfall events and calls `next()`.
-- Observation uses `emit`/`parallel`; routing uses `serial`.
-
-This split keeps transport mechanics, business routing, canonical persistence,
-and update delivery independently interceptable while preserving their explicit
-ordering and cleanup boundaries.
+- 进程级状态放在 Cordis `Service`。
+- 连接级与会话级状态放在对应的长生命周期子 Fiber。
+- 单次数据包、RPC、平台事件的上下文放在派生 `Context`。
+- 所有路由注册与外部资源监听都必须绑定为 `ctx.effect`。

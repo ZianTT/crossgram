@@ -1,4 +1,5 @@
 import type { Database } from '@cordisjs/plugin-database'
+import { $, type Query } from '@cordisjs/plugin-database'
 import type { UpdateJson, UpdateStoreBackend } from '@mtproto-relay/update-store'
 import { MemoryUpdateStoreBackend } from '@mtproto-relay/update-store-memory'
 import type {
@@ -21,6 +22,49 @@ import {
 } from './request-inbox.js'
 import type { MessageProjectionPipeline, MessageProjectionPlan } from './message-projection.js'
 import { jsonContains, jsonEquals } from './stable-json.js'
+import {
+  escapeRegExpLiteral, messageSearchKinds, messageSearchText, partMatchesSearchKinds, SEARCH_KIND,
+  type MessageSearchContext,
+} from './message-search.js'
+
+export interface MessageSearchQuery {
+  /** 限定会话（平台会话 ID）；缺省时在整个账号内搜索。 */
+  platformConversationIds?: readonly string[]
+  /** 已归一化的查询词，全部需命中。 */
+  terms: readonly string[]
+  /** 发送者在 `mtproto_im_user` 中的行号。 */
+  senderUserId?: number
+  /** 不含端点的时间下界（Unix 秒）。 */
+  minTimestamp?: number
+  /** 不含端点的时间上界（Unix 秒）。 */
+  maxTimestamp?: number
+  /** `SEARCH_KIND` 位掩码，任一位命中即可；0 或缺省表示不过滤。 */
+  kinds?: number
+  /** 翻页锚点：只返回严格早于该消息的结果。 */
+  before?: { timestamp: number, messageId: number }
+  limit: number
+}
+
+export interface SearchedMessage extends ProjectedMessage {
+  /** `mtproto_im_message` 行号，用作翻页锚点。 */
+  messageId: number
+  /** 该消息的 `SEARCH_KIND` 位掩码，供分片级精确过滤。 */
+  searchKinds: number
+}
+
+export interface MessageSearchResult {
+  messages: SearchedMessage[]
+  hasMore: boolean
+}
+
+export interface SearchPartIndexEntry {
+  tlMessageId: number
+  timestamp: number
+  /** `mtproto_im_message` 行号。 */
+  messageId: number
+}
+
+const SEARCH_INDEX_CHUNK = 500
 
 export interface IngestResult {
   message: IMMessageRow
@@ -38,7 +82,6 @@ export interface RequestUpsertResult {
   previous?: IMRequest
 }
 
-/** One atomic request persistence and inbox-message projection. */
 export interface RequestIngestResult extends RequestUpsertResult {
   message: IngestResult
 }
@@ -106,21 +149,20 @@ const TIMESTAMP_ALLOCATION_VERSION = 1
 export const UPDATE_DELIVERY_RETENTION = 1_000
 export const ACCOUNT_UPDATE_SCOPE = 'account'
 
-/**
- * How long a publisher may hold a payload-less reservation before readers treat
- * it as stuck. Unclaimed reservations are released immediately; this window
- * covers a publisher that hangs without ever finishing or unwinding.
- */
+// 发布方持有无 payload 预留记录的最大宽限期；超时后读取侧视为卡死并直接清理。
 const CLAIMED_DELIVERY_GRACE_SECONDS = 30
 const STORED_REPLY_TO_KEY = '__mtprotoRelayReplyToId'
+
+function storedReplyToId(metadata: JsonObject): string | undefined {
+  const value = metadata[STORED_REPLY_TO_KEY]
+  return typeof value === 'string' ? value : undefined
+}
 const STORED_SENDER_TITLE_KEY = '__mtprotoRelaySenderTitle'
 const STORED_RECALLED_KEY = '__mtprotoRelayRecalled'
 const STORED_CONVERSATION_SELF_ROLE_KEY = '__mtprotoRelaySelfRole'
 const STORED_CONVERSATION_SELF_PERMISSIONS_KEY = '__mtprotoRelaySelfPermissions'
 
-/** Durable canonical store shared by history sync, push ingestion, and sends. */
 export class MessageStore {
-  /** Serialize writes across every store facade sharing the same database. */
   private static readonly _writeTails = new WeakMap<Database, Promise<void>>()
   private _revision = 0
   private _peerRevision = 0
@@ -135,12 +177,11 @@ export class MessageStore {
     private readonly _messageProjection?: MessageProjectionPipeline,
   ) {}
 
-  /** Monotonic process-local version used to invalidate materialized read caches. */
   get revision(): number {
     return this._revision
   }
 
-  /** Monotonic version for conversation identity changes, excluding ordinary message traffic. */
+  /** 会话资料变更版本号（普通消息收发不递增）。 */
   get peerRevision(): number {
     return this._peerRevision
   }
@@ -156,11 +197,7 @@ export class MessageStore {
       this._upsertRequest(database, session, request, new Date())), 'request-upsert', true)
   }
 
-  /**
-   * Persist the canonical request and its bridge-owned inbox message together.
-   * A transaction makes a failed projection retryable without creating a
-   * request/message/unread split state.
-   */
+  /** 在同一事务中落库好友/入群申请及其收件箱投影消息。 */
   async ingestRequest(session: PlatformSession, request: IMRequest): Promise<RequestIngestResult> {
     return this._write(() => this._database.withTransaction(async (database) => {
       const now = new Date()
@@ -170,9 +207,7 @@ export class MessageStore {
       const message = await this._ingestMessage(
         database, session, conversationRow, requestInboxMessage(stored.request), {}, now, { epochs: new Map() },
       )
-      // The message row is the durable marker of a pending projection. It
-      // covers recovery from pre-transaction legacy rows while keeping every
-      // normal retry and terminal transition from increasing unread counts.
+      // 仅首次创建收件箱消息且状态为 pending 时递增未读数，防止后续重试或终态更新重复累加。
       if (message.created && stored.request.state === 'pending') {
         await database.set('mtproto_im_conversation', { id: conversationRow.id }, {
           unreadCount: conversationRow.unreadCount + 1,
@@ -328,26 +363,37 @@ export class MessageStore {
         const conversationRow = conversationRows.get(dialog.conversation.id)
           ?? existingConversations.get(dialog.conversation.id)
         if (!conversationRow) throw new Error('failed to persist conversation')
+        let latestMessageRow: IMMessageRow | undefined
         if (dialog.lastMessage) {
           const result = await this._ingestMessage(
             database, session, conversationRow, dialog.lastMessage, {}, now, allocationCache,
           )
+          latestMessageRow = result.message
           messages.push(result.message)
         }
-        if (
-          dialog.readInboxMaxMessage
-          && dialog.readInboxMaxMessage.id !== dialog.lastMessage?.id
-        ) {
-          const result = await this._ingestMessage(
-            database,
-            session,
-            conversationRow,
-            dialog.readInboxMaxMessage,
-            { allocation: 'history' },
-            now,
-            allocationCache,
-          )
-          messages.push(result.message)
+        // 上游（QQ）只在按需拉取未读窗口时才给出已读边界；没有新边界时沿用上次已知的边界，
+        // 否则会话会被报成「一条都没读」（`read_inbox_max_id = 0`），客户端的未读分隔线与定位都会失真。
+        let readInboxMaxMessageId = conversationRow.readInboxMaxMessageId ?? null
+        if (dialog.readInboxMaxMessage) {
+          if (dialog.readInboxMaxMessage.id === dialog.lastMessage?.id) {
+            readInboxMaxMessageId = latestMessageRow?.id ?? readInboxMaxMessageId
+          } else {
+            const result = await this._ingestMessage(
+              database,
+              session,
+              conversationRow,
+              dialog.readInboxMaxMessage,
+              { allocation: 'history' },
+              now,
+              allocationCache,
+            )
+            messages.push(result.message)
+            readInboxMaxMessageId = result.message.id
+          }
+        }
+        if ((conversationRow.readInboxMaxMessageId ?? null) !== readInboxMaxMessageId) {
+          await database.set('mtproto_im_conversation', { id: conversationRow.id }, { readInboxMaxMessageId })
+          conversationRow.readInboxMaxMessageId = readInboxMaxMessageId
         }
       }
       return messages
@@ -408,10 +454,9 @@ export class MessageStore {
 
     const created = !message
     const storedMetadata = messageMetadata(source)
+    const searchKinds = messageSearchKinds(source, await this._searchContext(database, session, conversationRow, source))
     const storedContent = persistMessageContent(source.content)
-    // Durable rows also carry store-owned fields the ingestion path never
-    // computes, such as the reaction selection a user made on this message.
-    // Compare and merge them instead of treating them as a modification.
+    // metadata 中还包含本表维护的附加字段（如 reactionMaxSelected），需用 jsonContains 判断并在更新时合并保留。
     const changed = !message || (!message.deleted && (
       message.senderUserId !== senderRow.id
       || message.text !== messageText(source)
@@ -422,9 +467,14 @@ export class MessageStore {
       || !jsonContains(message.metadata, storedMetadata)
     ))
     if (message && existingAlias && !message.deleted && !changed) {
-      // Reactions are separate durable state: the source may deliver a new
-      // summary even when the message payload itself is unchanged, and the
-      // reaction selection is stored on the message row.
+      if (message.searchKinds !== searchKinds) {
+        // 旧数据补齐搜索字段，或回复目标后到导致提及判定变化；都不视为消息变更。
+        const searchText = messageSearchText(source)
+        await database.set('mtproto_im_message', { id: message.id }, { searchText, searchKinds })
+        message = { ...message, searchText, searchKinds }
+        historyPrefetch?.messagesById.set(message.id, message)
+      }
+      // 即使消息正文未变，上游也可能附带最新的回应汇总，需单独同步回应表。
       await this._replaceReactions(database, message.id, source.reactionContext, now)
       const projection = historyPrefetch?.projectionsByMessageId.get(message.id)
         ?? await database.select('mtproto_tl_message_part', { messageId: message.id })
@@ -442,6 +492,8 @@ export class MessageStore {
         timestamp: source.timestamp,
         outgoing: source.outgoing ?? false,
         deleted: false,
+        searchText: messageSearchText(source),
+        searchKinds,
         platformGroupId: source.groupId ?? null,
         metadata: storedMetadata,
         createdAt: now,
@@ -456,6 +508,8 @@ export class MessageStore {
         outgoing: source.outgoing ?? false,
         platformGroupId: source.groupId ?? null,
         metadata: { ...message.metadata, ...storedMetadata },
+        searchText: messageSearchText(source),
+        searchKinds,
         updatedAt: now,
       })
       ;[message] = await database.get('mtproto_im_message', { id: message.id })
@@ -470,7 +524,7 @@ export class MessageStore {
       platformMessageId,
       messageId: message!.id,
       ordinal,
-    })), ['platformSessionId', 'conversationId', 'platformMessageId'])
+    })), ['conversationId', 'platformMessageId'])
 
     const media = source.content.parts.flatMap((part, partIndex) => part.type === 'media'
       ? [{ item: part.media, partIndex }]
@@ -576,10 +630,7 @@ export class MessageStore {
         conversationId: conversationRow.id,
         platformMessageId: target.targetId,
       })
-      // QQNT may emit reaction changes for messages outside the relay's stored
-      // history window. They are legitimate stream events and must not pin the
-      // durable WebSocket checkpoint forever. If that message is loaded later,
-      // its history projection carries the current reaction state.
+      // QQNT 可能推送本地未缓存的旧消息的回应变更，此时直接忽略，后续拉取历史时会带上最新回应状态。
       if (!alias) return
       const [row] = await database.get('mtproto_im_message', { id: alias.messageId })
       if (!row || row.deleted) return
@@ -748,11 +799,6 @@ export class MessageStore {
     return this._hydrateProjectedHistoryRows(rows, conversation)
   }
 
-  /**
-   * Request Inbox pagination/search runs against its complete local projection.
-   * The inbox is expected to stay small; add a composite cursor before using
-   * this path for a large request archive.
-   */
   async readAllProjectedHistory(
     platformSessionId: string,
     platformConversationId: string,
@@ -808,6 +854,227 @@ export class MessageStore {
     const rows = await this._database.select('mtproto_im_message', {
       platformSessionId, deleted: false,
     }).orderBy('timestamp', 'desc').execute()
+    return this._hydrateProjectedRows(rows)
+  }
+
+  /**
+   * 会话内已存的原生序号（QQ msgSeq），倒序去重，沿 `(conversationId, nativeSequence)` 索引读取。
+   * 被删除的消息也算「已取过」，同样计入。
+   */
+  async readNativeSequences(
+    platformSessionId: string,
+    platformConversationId: string,
+    options: { below?: number, limit: number },
+  ): Promise<number[]> {
+    const [conversation] = await this._database.get('mtproto_im_conversation', {
+      platformSessionId, platformConversationId,
+    }, ['id'])
+    if (!conversation) return []
+    const rows = await this._database.select('mtproto_tl_message_part', {
+      conversationId: conversation.id,
+      nativeSequence: options.below !== undefined ? { $lt: options.below, $gt: 0 } : { $gt: 0 },
+    }).orderBy('nativeSequence', 'desc')
+      .limit(Math.max(1, Math.min(Math.trunc(options.limit), 10_000))).execute()
+    const output: number[] = []
+    for (const row of rows) {
+      if (row.nativeSequence !== null && row.nativeSequence !== output.at(-1)) output.push(row.nativeSequence)
+    }
+    return output
+  }
+
+  /** 按 `mtproto_im_message` 行号读取投影消息（已删除的跳过），顺序与输入一致。 */
+  async readProjectedByMessageIds(
+    platformSessionId: string,
+    messageIds: readonly number[],
+  ): Promise<ProjectedMessage[]> {
+    const unique = [...new Set(messageIds)]
+    if (!unique.length) return []
+    const rows = await this._database.get('mtproto_im_message', {
+      id: { $in: unique }, platformSessionId, deleted: false,
+    })
+    const byId = new Map(rows.map((row) => [row.id, row]))
+    return this._hydrateProjectedRows(unique.flatMap((id) => {
+      const row = byId.get(id)
+      return row ? [row] : []
+    }))
+  }
+
+  /**
+   * 在本地投影过的消息中搜索，结果按 `(timestamp, id)` 倒序。
+   *
+   * 不依赖文本索引：沿 `(conversationId, timestamp)` 或 `(platformSessionId, timestamp)` 索引倒序扫描，
+   * 对 `searchText` 做字面量子串匹配，取满 `limit + 1` 行即停止，多取的一行只用于判断是否还有更多。
+   */
+  async searchMessages(platformSessionId: string, query: MessageSearchQuery): Promise<MessageSearchResult> {
+    const where = await this._searchPredicate(platformSessionId, query)
+    if (!where) return { messages: [], hasMore: false }
+    const limit = clampDatabaseLimit(query.limit)
+    const rows = await this._database.select('mtproto_im_message', where)
+      .orderBy('timestamp', 'desc').orderBy('id', 'desc').limit(limit + 1).execute()
+    const page = rows.slice(0, limit)
+    const hydrated = await this._hydrateProjectedRows(page)
+    return {
+      messages: hydrated.map((item, index) => ({
+        ...item, messageId: page[index].id, searchKinds: page[index].searchKinds ?? 0,
+      })),
+      hasMore: rows.length > limit,
+    }
+  }
+
+  /** 与 `searchMessages` 同条件的消息条数（按逻辑消息计）；需要扫完整个范围，只在首页调用。 */
+  async countSearchMessages(platformSessionId: string, query: Omit<MessageSearchQuery, 'limit'>): Promise<number> {
+    const where = await this._searchPredicate(platformSessionId, { ...query, limit: 0, before: undefined })
+    if (!where) return 0
+    return this._database.eval('mtproto_im_message', (row) => $.count(row.id), where)
+  }
+
+  /**
+   * 列出满足条件的全部 Telegram 分片（不含正文），按 Telegram 消息 ID 倒序。
+   * 用于共享媒体计数、日历与滚动条位置；按分片精确判定媒体类别。
+   */
+  async searchPartIndex(
+    platformSessionId: string,
+    query: Omit<MessageSearchQuery, 'limit' | 'before'>,
+  ): Promise<SearchPartIndexEntry[]> {
+    const where = await this._searchPredicate(platformSessionId, { ...query, limit: 0 })
+    if (!where) return []
+    const rows = await this._database.get('mtproto_im_message', where, ['id', 'timestamp', 'searchKinds'])
+    const output: SearchPartIndexEntry[] = []
+    for (let offset = 0; offset < rows.length; offset += SEARCH_INDEX_CHUNK) {
+      const chunk = rows.slice(offset, offset + SEARCH_INDEX_CHUNK)
+      const messageIds = chunk.map((row) => row.id)
+      const [parts, media] = await Promise.all([
+        this._database.get('mtproto_tl_message_part', { messageId: { $in: messageIds } },
+          ['messageId', 'mediaId', 'ordinal', 'tlMessageId']),
+        query.kinds
+          ? this._database.get('mtproto_im_media', { messageId: { $in: messageIds } },
+              ['id', 'kind', 'mimeType', 'voice'])
+          : Promise.resolve([] as Pick<IMMediaRow, 'id' | 'kind' | 'mimeType' | 'voice'>[]),
+      ])
+      const rowsById = new Map(chunk.map((row) => [row.id, row]))
+      const mediaById = new Map(media.map((item) => [item.id, item]))
+      for (const part of parts) {
+        const row = rowsById.get(part.messageId)
+        if (!row) continue
+        if (query.kinds) {
+          const partMedia = part.mediaId === null ? undefined : mediaById.get(part.mediaId)
+          if (!partMatchesSearchKinds(row.searchKinds ?? 0, { ordinal: part.ordinal, media: partMedia }, query.kinds)) {
+            continue
+          }
+        } else if (part.ordinal !== 0) {
+          continue
+        }
+        output.push({ tlMessageId: part.tlMessageId, timestamp: row.timestamp, messageId: row.id })
+      }
+    }
+    return output.sort((left, right) => right.tlMessageId - left.tlMessageId)
+  }
+
+  private async _searchPredicate(
+    platformSessionId: string,
+    query: MessageSearchQuery,
+  ): Promise<Query.Expr<IMMessageRow> | undefined> {
+    let conversationIds: number[] | undefined
+    if (query.platformConversationIds) {
+      if (!query.platformConversationIds.length) return
+      const conversations = await this._database.get('mtproto_im_conversation', {
+        platformSessionId,
+        platformConversationId: { $in: [...new Set(query.platformConversationIds)] },
+      }, ['id'])
+      if (!conversations.length) return
+      conversationIds = conversations.map((conversation) => conversation.id)
+    }
+    const and: Query.Expr<IMMessageRow>[] = query.terms.map((term) => ({
+      searchText: { $regex: escapeRegExpLiteral(term) },
+    }))
+    if (query.before) {
+      and.push({
+        $or: [
+          { timestamp: { $lt: query.before.timestamp } },
+          { timestamp: query.before.timestamp, id: { $lt: query.before.messageId } },
+        ],
+      })
+    }
+    const timestamp: Query.FieldExpr<number> = {}
+    if (query.minTimestamp !== undefined) timestamp.$gt = query.minTimestamp
+    if (query.maxTimestamp !== undefined) timestamp.$lt = query.maxTimestamp
+    // searchKinds 为空的旧行尚未建立搜索字段，统一排除；系统提示只在通话记录过滤中出现。
+    const kinds: Query.FieldExpr<number | null> = { $exists: true }
+    if (query.kinds) kinds.$bitsAnySet = query.kinds
+    if (!(query.kinds && query.kinds & SEARCH_KIND.PHONE_CALL)) kinds.$bitsAllClear = SEARCH_KIND.SERVICE
+    return {
+      platformSessionId,
+      deleted: false,
+      searchKinds: kinds,
+      ...(conversationIds
+        ? { conversationId: conversationIds.length === 1 ? conversationIds[0] : { $in: conversationIds } }
+        : {}),
+      ...(query.senderUserId !== undefined ? { senderUserId: query.senderUserId } : {}),
+      ...(Object.keys(timestamp).length ? { timestamp } : {}),
+      ...(and.length ? { $and: and } : {}),
+    } as Query.Expr<IMMessageRow>
+  }
+
+  /** 提及判定所需的上下文：账号自身 ID、会话类型、回复目标是否为自己发出的消息。 */
+  private async _searchContext(
+    database: Database,
+    session: Pick<PlatformSession, 'userId'>,
+    conversation: Pick<IMConversationRow, 'id' | 'kind'>,
+    source: Pick<IMMessage, 'replyToId' | 'outgoing'>,
+  ): Promise<MessageSearchContext> {
+    let repliesToSelf = false
+    if (source.replyToId && conversation.kind !== 'direct' && !source.outgoing) {
+      const [alias] = await database.get('mtproto_im_message_alias', {
+        conversationId: conversation.id, platformMessageId: source.replyToId,
+      }, ['messageId'])
+      if (alias) {
+        const [target] = await database.get('mtproto_im_message', { id: alias.messageId }, ['outgoing'])
+        repliesToSelf = target?.outgoing === true
+      }
+    }
+    return {
+      selfUserId: session.userId,
+      conversationKind: conversation.kind as IMConversation['kind'],
+      repliesToSelf,
+    }
+  }
+
+  /**
+   * 为旧数据补齐搜索字段，按行号升序每批处理 `batchSize` 行。
+   * 返回本批处理的行数，0 表示已全部完成。
+   */
+  async rebuildSearchFields(batchSize = 1000): Promise<number> {
+    const rows = await this._database.select('mtproto_im_message', { searchKinds: null })
+      .orderBy('id').limit(clampDatabaseLimit(batchSize)).execute()
+    if (!rows.length) return 0
+    const sessionIds = [...new Set(rows.map((row) => row.platformSessionId))]
+    const conversationIds = [...new Set(rows.map((row) => row.conversationId))]
+    const [sessions, conversations] = await Promise.all([
+      this._database.get('mtproto_platform_session', { id: { $in: sessionIds } }, ['id', 'userId']),
+      this._database.get('mtproto_im_conversation', { id: { $in: conversationIds } }, ['id', 'kind']),
+    ])
+    const selfIds = new Map(sessions.map((row) => [row.id, row.userId]))
+    const conversationsById = new Map(conversations.map((row) => [row.id, row]))
+    await this._write(() => this._database.withTransaction(async (database) => {
+      for (const row of rows) {
+        const message = {
+          content: hydrateMessageContent(row.content),
+          outgoing: row.outgoing,
+          replyToId: storedReplyToId(row.metadata),
+        } as IMMessage
+        const conversation = conversationsById.get(row.conversationId) ?? { id: row.conversationId, kind: 'direct' }
+        const context = await this._searchContext(
+          database, { userId: selfIds.get(row.platformSessionId) ?? '' }, conversation, message,
+        )
+        await database.set('mtproto_im_message', { id: row.id, searchKinds: null }, {
+          searchText: messageSearchText(message),
+          searchKinds: messageSearchKinds(message, context),
+        })
+      }
+    }), 'search-rebuild')
+    return rows.length
+  }
+  private async _hydrateProjectedRows(rows: readonly IMMessageRow[]): Promise<ProjectedMessage[]> {
     if (!rows.length) return []
     const messageIds = rows.map((row) => row.id)
     const senderUserIds = [...new Set(rows.map((row) => row.senderUserId))]
@@ -917,10 +1184,6 @@ export class MessageStore {
       .map((alias) => alias.platformMessageId)
   }
 
-  /**
-   * Stored source of one durable message row, scoped to its platform session.
-   * Deleted rows are gone for readers even though the tombstone row remains.
-   */
   async readMessageByRowId(platformSessionId: string, messageId: number): Promise<IMMessage | undefined> {
     if (!Number.isSafeInteger(messageId) || messageId <= 0) return
     const [row] = await this._database.get('mtproto_im_message', { id: messageId, platformSessionId })
@@ -990,11 +1253,7 @@ export class MessageStore {
       deleted: false,
     })
     const rowsById = new Map(rows.map((row) => [row.id, row]))
-    // QQ gray-tip/service sidecars can reuse the msgSeq of the ordinary
-    // message immediately before them. Replies to that sequence still target
-    // the ordinary message, so a service row must only be used when it is the
-    // sole surviving candidate. Keep the oldest projection as the stable
-    // tiebreaker for duplicate candidates of the same kind.
+    // QQ 灰条可能复用前一条普通消息的 msgSeq；存在普通消息时优先匹配普通消息，同类型候选按最早投影兜底。
     const candidates = parts.flatMap((part) => {
       const row = rowsById.get(part.messageId)
       return row ? [{ part, row }] : []
@@ -1041,15 +1300,8 @@ export class MessageStore {
   }
 
   /**
-   * Redirect a reply that QQ attributed to a gray-tip sidecar to its content message.
-   *
-   * QQ keeps gray tips (`你戳了戳…`, essence notices, call records, revoke
-   * notices) on the `msgSeq` of the content message they accompany and reports a
-   * reply to such a tip with the tip's own id. The reply belongs to the content
-   * message: the tip is a rendering of that message's slot, and QQ resolves both
-   * replies and deletes of the slot through the same sequence. Sidecars without
-   * a content sibling, and service notices that own their sequence, stay as they
-   * are because the tip is then the only message QQ can mean.
+   * 将指向 QQ 灰条的回复重定向到同 msgSeq 的正文消息。
+   * QQ 灰条（戳一戳、精华提示、撤回提示等）会复用所附着正文的 msgSeq，回复该位置时可能上报灰条自身的 ID。
    */
   async preferContentReplyTarget(
     platformSessionId: string,
@@ -1090,7 +1342,7 @@ export class MessageStore {
     }
   }
 
-  /** Persist the Telegram `mentioned` classification without re-unreading an acknowledged row. */
+  /** 更新消息的 Telegram 提及标记；已存在记录时不重置已读状态。 */
   async setMessageMentioned(
     platformSessionId: string,
     platformConversationId: string,
@@ -1280,37 +1532,19 @@ export class MessageStore {
     const messages = await this._database.get('mtproto_im_message', {
       conversationId: conversation.id, deleted: false, timestamp: oldest.timestamp,
     })
-    const [part] = await this._database.select('mtproto_tl_message_part', {
+    // 同一秒内可能有多条消息，先按 messageId 取回首条分片再比较 tlMessageId，
+    // 这样不必维护「会话维度 + tlMessageId 有序」的索引。
+    const parts = await this._database.get('mtproto_tl_message_part', {
       platformSessionId,
-      conversationId: conversation.id,
       messageId: { $in: messages.map((message) => message.id) },
       ordinal: 0,
-    }).orderBy('tlMessageId').limit(1).execute()
-    return part?.tlMessageId
-  }
-
-  async getNewestTlMessageId(
-    platformSessionId: string,
-    platformConversationId: string,
-  ): Promise<number | undefined> {
-    const [conversation] = await this._database.get('mtproto_im_conversation', {
-      platformSessionId, platformConversationId,
     })
-    if (!conversation) return
-    const [newest] = await this._database.select('mtproto_im_message', {
-      conversationId: conversation.id, deleted: false,
-    }).orderBy('timestamp', 'desc').limit(1).execute()
-    if (!newest) return
-    const messages = await this._database.get('mtproto_im_message', {
-      conversationId: conversation.id, deleted: false, timestamp: newest.timestamp,
-    })
-    const [part] = await this._database.select('mtproto_tl_message_part', {
-      platformSessionId,
-      conversationId: conversation.id,
-      messageId: { $in: messages.map((message) => message.id) },
-      ordinal: 0,
-    }).orderBy('tlMessageId', 'desc').limit(1).execute()
-    return part?.tlMessageId
+    return parts.reduce<number | undefined>(
+      (smallest, part) => smallest === undefined || part.tlMessageId < smallest
+        ? part.tlMessageId
+        : smallest,
+      undefined,
+    )
   }
 
   async getMedia(platformSessionId: string, mediaId: number): Promise<StoredMedia | undefined> {
@@ -1353,7 +1587,7 @@ export class MessageStore {
     return { id, platformSessionId, channelId: String(channelId), pts: account.pts, date: account.date }
   }
 
-  /** Reserve account pts for an RPC response without advancing the push-update seq. */
+  /** 为 RPC 响应预留 pts，不递增推送用的 seq。 */
   async advancePts(platformSessionId: string, ptsCount: number, date: number, channelId?: number) {
     if (!Number.isSafeInteger(ptsCount) || ptsCount <= 0) {
       throw new RangeError('pts count must be a positive integer')
@@ -1409,17 +1643,14 @@ export class MessageStore {
       const claimedAt = Math.floor(Date.now() / 1000)
       const existing = await this._updateStore.get(eventKey)
       if (existing) {
-        // A publisher may revive a reservation an earlier attempt left behind:
-        // record the new claim so readers know to wait for its payload.
+        // 复用此前未完成的预留记录时刷新认领时间，通知读取侧等待 payload 构建。
         await this._updateStore.claim(eventKey, claimedAt)
         return { ...existing, claimedAt }
       }
 
       const allocated = await this._database.withTransaction(async (database) => {
         const [current] = await database.get('mtproto_update_state', { platformSessionId })
-        // updates.getDifference only receives the client's last server date for
-        // discovering missed channel domains. Keep that cursor monotonic even
-        // when an upstream platform backfills a message with an older timestamp.
+        // updates.getDifference 依靠客户端传入的 date 发现错过的频道更新；即使回填旧消息也必须保持 date 单调递增。
         const deliveryDate = Math.max(current?.date ?? 0, date)
         const account = {
           platformSessionId,
@@ -1461,23 +1692,11 @@ export class MessageStore {
     await this._write(() => this._updateStore.setPayload(eventKey, payload))
   }
 
-  /** Release a reservation whose publisher failed before its payload was durable. */
   async discardPendingUpdateDelivery(eventKey: string): Promise<boolean> {
     return this._discardUpdateDelivery(eventKey, false)
   }
 
-  /**
-   * Release a reservation that no live publisher can complete.
-   *
-   * A payload-less delivery can never be replayed, and both difference paths stop
-   * at the first one they meet, so one abandoned reservation would pin every
-   * device at the previous pts and make it replay the same channel messages
-   * forever. Dropping it lets clients skip the lost pts value instead. A
-   * reservation claimed recently by a publisher is left alone; an unclaimed
-   * one, or one whose claim outlived the grace window, has no live builder and
-   * may be released. The read and the removal share the store's write queue so
-   * a payload committed in the meantime is never dropped.
-   */
+  /** 清理未认领或已超过认领宽限期的无 payload 预留记录，防止卡死 difference 游标。 */
   async discardAbandonedUpdateDelivery(eventKey: string): Promise<boolean> {
     return this._discardUpdateDelivery(eventKey, true)
   }
@@ -1511,12 +1730,6 @@ export class MessageStore {
       .filter((delivery) => delivery.scope.startsWith('channel:'))
   }
 
-  /**
-   * One entry per channel whose pts advanced at or after `date`.
-   *
-   * Announcing changed channels must not walk every retained delivery of every
-   * channel: the per-scope aggregate is what keeps a days-old cursor cheap.
-   */
   async getChangedChannelScopes(platformSessionId: string, date: number) {
     return this._updateStore.getChangedChannelScopes(platformSessionId, date)
   }
@@ -1571,19 +1784,12 @@ export class MessageStore {
       platformRequestId: request.id,
     })
     const previous = existing ? requestFromRow(existing) : undefined
-    // Platforms that report an unusable creation time (QQ group notifies send
-    // zero) must not date their inbox messages at the Unix epoch, which hides
-    // the conversation from every client chat list.
+    // QQ 群通知等可能上报 createdAt=0；避免将收件箱消息时间设为 1970 年导致会话在客户端列表中隐身。
     const createdAt = [previous?.createdAt, request.createdAt]
       .find((value) => requestTimestamp(value) > 0)
-    // Terminal request states are monotonic. Cold list synchronization can
-    // race a live resolve event, so a stale pending (or conflicting terminal)
-    // replay must never restore buttons or replace the first terminal result.
+    // 申请进入终态后不可逆，防止冷启动全量同步与实时处理并发时把已处理申请回退为 pending。
     const canonical: IMRequest = previous && previous.state !== 'pending'
       ? { ...previous, createdAt: createdAt ?? now.getTime() }
-      // The platform may omit creation time on every replay. Generate it once
-      // and preserve it in the canonical payload so a restarted projection keeps
-      // its original Telegram timestamp instead of drifting or falling back to 0.
       : { ...request, createdAt: createdAt ?? now.getTime() }
     const stored = canonical as unknown as JsonObject
     const changed = !existing
@@ -1719,10 +1925,7 @@ export class MessageStore {
     unreadCount: number | undefined,
     now: Date,
   ): Promise<IMConversationRow> {
-    // A direct conversation is also the peer identity used by Telegram. The
-    // first durable event may be outgoing (so its sender is self), therefore
-    // message-sender ingestion alone cannot guarantee that the peer exists
-    // when the freshly committed message is projected.
+    // 私聊的第一条消息可能是自己发出的（sender 为自身），需在此确保对端用户记录已存在以便后续投影。
     if (conversation.kind === 'direct') {
       await this._upsertUser(database, session.platformId, {
         id: conversation.id,
@@ -1823,11 +2026,7 @@ export class MessageStore {
       }
       existing = existing.slice(0, count)
     }
-    // A live platform event can expose an optimistic ordering key before a
-    // later status/history record supplies the final value. Telegram message
-    // IDs are already visible to clients at that point and must remain
-    // immutable: changing the projection would leave durable update payloads
-    // referring to the old ID while a later recall deletes the new one.
+    // 实时消息的排序键后续可能被回执或历史记录补全，但已下发给客户端的 tlMessageId 不可改变，仅原地更新排序字段。
     for (const part of existing) {
       const values = {
         ...(nativeSequence !== undefined && part.nativeSequence !== nativeSequence
@@ -1970,8 +2169,7 @@ export class MessageStore {
     }
 
     await collect(bounds)
-    // Immutable legacy IDs can leave no integer between adjacent native sequences.
-    // Preserve ingestion progress by relaxing ordering while retaining scope uniqueness.
+    // 相邻原生序号对应的旧 tlMessageId 之间可能已无空余整数，此时放宽顺序约束以保证消息能完成入库。
     if (ids.length < count && (bounds.lowerExclusive !== undefined || bounds.upperExclusive !== undefined)) {
       await collect({})
     }
@@ -2063,18 +2261,36 @@ export class MessageStore {
   private async _hydrateDialogs(conversations: readonly IMConversationRow[]): Promise<IMDialog[]> {
     const latestRows = await this._latestMessagesForConversations(conversations.map((conversation) => conversation.id))
     const rows = latestRows.flatMap((row) => row ? [row] : [])
-    const hydrated = await this._hydrateMessages(rows, new Map(conversations.map((conversation) => [
+    const conversationIds = new Map(conversations.map((conversation) => [
       conversation.id, conversation.platformConversationId,
-    ])))
+    ]))
+    const hydrated = await this._hydrateMessages(rows, conversationIds)
     const hydratedById = new Map(rows.map((row, index) => [row.id, hydrated[index]]))
+    // 已读边界消息通常不是最新消息，需单独取回；行已不存在时退回 undefined，由上层按未读计数决定。
+    const boundaryRows = await this._messagesByIds(conversations
+      .map((conversation) => conversation.readInboxMaxMessageId)
+      .filter((id): id is number => typeof id === 'number' && id > 0)
+      .filter((id) => !hydratedById.has(id)))
+    const boundaries = await this._hydrateMessages(boundaryRows, conversationIds)
+    const boundaryById = new Map(boundaryRows.map((row, index) => [row.id, boundaries[index]]))
     return conversations.map((conversation, index) => {
       const latest = latestRows[index]
+      const boundaryId = conversation.readInboxMaxMessageId ?? undefined
+      const readInboxMaxMessage = boundaryId === undefined
+        ? undefined
+        : hydratedById.get(boundaryId) ?? boundaryById.get(boundaryId)
       return {
         conversation: toConversation(conversation),
         unreadCount: conversation.unreadCount,
         lastMessage: latest ? hydratedById.get(latest.id) : undefined,
+        ...(readInboxMaxMessage ? { readInboxMaxMessage } : {}),
       }
     })
+  }
+
+  private async _messagesByIds(ids: readonly number[]): Promise<IMMessageRow[]> {
+    const unique = [...new Set(ids)]
+    return unique.length ? this._database.get('mtproto_im_message', { id: { $in: unique } }) : []
   }
 
   private async _latestMessagesForConversations(
@@ -2149,20 +2365,12 @@ export class MessageStore {
     const summaries = new Map(context.reactions
       .filter((reaction) => reaction.count > 0 || reaction.selected || reaction.recentActors?.length)
       .map((reaction) => [reaction.key, reaction]))
-    // The account-level catalog is shared by every message. Persisting every
-    // available definition per message creates O(messages × catalog) rows and
-    // turns high-volume group traffic into a SQLite write storm. A message only
-    // needs definitions for reactions that actually occur on that message.
+    // 仅持久化当前消息上实际出现的回应定义，避免将账号级完整回应表复制到每条消息造成写入风暴。
     const existing = await database.get('mtproto_im_message_reaction', { messageId })
     const definitions = new Map(context.available
       .filter((definition) => summaries.has(definition.key))
       .map((definition) => [definition.key, definition]))
-    // Reaction events from QQNT contain only the native state.  During
-    // startup/reconnect the account-level catalog may still be warming and
-    // the event therefore arrives with `available: []` (or without a newly
-    // observed key).  Do not turn that transiently incomplete catalog into a
-    // durable clear: retain definitions already persisted for the same
-    // native key so Telegram can continue rendering the count/selection.
+    // QQNT 启动或重连期间全局回应表可能尚未加载完（available 为空）；保留库中已有的同 key 定义，防止回应被清空。
     for (const row of existing) {
       if (!definitions.has(row.nativeReactionKey) && summaries.has(row.nativeReactionKey)
         && row.definition && typeof row.definition === 'object' && !Array.isArray(row.definition)) {

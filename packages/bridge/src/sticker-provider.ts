@@ -11,7 +11,7 @@ export interface IMStickerRef {
 }
 
 export interface IMSticker extends IMStickerRef {
-  /** Undefined for platform/user saved stickers that do not belong to a set. */
+  /** 独立收藏表情不属于任何贴纸包时为 `undefined`。 */
   packId?: string
   title?: string
   emoji?: string[]
@@ -22,9 +22,8 @@ export interface IMSticker extends IMStickerRef {
   height?: number
   size?: number
   version?: number
-  /** Optional static frame shown while an animated/video sticker is loading. */
   thumbnail?: IMStickerThumbnail
-  /** Telegram compact SVG path painted with a moving gradient while loading. */
+  /** Telegram 紧凑 SVG 路径，用于加载时的微光占位轮廓。 */
   outline?: Uint8Array
   locator?: JsonValue
 }
@@ -34,7 +33,6 @@ export interface IMStickerThumbnail {
   size: number
   width: number
   height: number
-  /** Provider-owned reference used by openThumbnail(). */
   locator?: JsonValue
 }
 
@@ -46,7 +44,6 @@ export interface IMStickerPackSummary {
   count?: number
   cover?: IMStickerRef
   version?: number
-  /** Bridge-owned assignment policy; providers only describe pack ownership. */
   automaticAssociation?: 'provider-account'
 }
 
@@ -106,12 +103,12 @@ export type IMStickerSendPlan =
 
 export interface StickerProviderCapabilities {
   platformKinds?: string[]
-  /** Platform entry that owns this provider's native account-scoped data. */
+  /** 拥有该 provider 账号级原生数据的平台 ID。 */
   ownerPlatformId?: string
   sessionScoped?: boolean
   conversationScoped?: boolean
   search?: boolean
-  /** Require sticker documents to be resolved through getSticker() before opening assets. */
+  /** 打开资源前必须先通过 `getSticker()` 解析贴纸。 */
   canonicalLookup?: boolean
 }
 
@@ -127,24 +124,21 @@ export interface IMStickerProvider {
     cursor?: string
     limit?: number
   }): Promise<IMStickerPage>
-  /** Platform-native saved/favorite stickers, including stickers with no set. */
   listSavedStickers?(
     context: StickerProviderContext,
     query?: StickerPageQuery,
   ): Promise<IMStickerPage>
   openAsset(context: StickerProviderContext, sticker: IMSticker): Promise<IMStickerAsset>
-  /** Resolve an original provider URL so patched clients can bypass relay bytes. */
+  /** 解析原始直连 URL，供打补丁客户端绕过服务端中转直接下载。 */
   resolveAssetUrl?(
     context: StickerProviderContext,
     sticker: IMSticker,
   ): Promise<IMDirectDownload | undefined>
-  /** Open the static thumbnail advertised by IMSticker.thumbnail. */
   openThumbnail?(context: StickerProviderContext, sticker: IMSticker): Promise<IMStickerAsset | null>
   prepareSend?(
     context: StickerProviderContext,
     sticker: IMSticker,
   ): Promise<IMStickerSendPlan | null>
-  /** Mirror Telegram's favorite toggle into the platform-native saved collection. */
   setSavedSticker?(
     context: StickerProviderContext,
     sticker: IMSticker,
@@ -169,7 +163,6 @@ export class StickerProviderRegistry {
     }
   }
 
-  /** Mark provider-owned catalog data as changed, optionally for one platform session. */
   touch(id: string, platformSessionId?: string): void {
     if (!this._providers.has(id)) throw new Error(`sticker provider is not registered: ${id}`)
     if (!platformSessionId) {

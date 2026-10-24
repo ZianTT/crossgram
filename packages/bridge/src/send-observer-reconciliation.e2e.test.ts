@@ -8,7 +8,8 @@ import { TlBinaryReader, TlBinaryWriter } from '@mtcute/tl-runtime'
 import Long from 'long'
 import type { RpcResult, ServerConnection, ServerRpcContext } from '@mtproto-relay/mtproto'
 import { getServerReaderMap } from '../../mtproto/src/rpc/server-reader-map.js'
-import { DialogRpc, stableId } from './dialogs.js'
+import { SendEchoes } from './send-echoes.js'
+import { DialogRpc, peerTlSeed, stableId } from './dialogs.js'
 import { MessageStore } from './message-store.js'
 import { defineModels } from './models.js'
 import { PlatformRegistry } from './platform-manager.js'
@@ -167,5 +168,162 @@ describe('sent-message observer reconciliation e2e', () => {
     })
     expect((observerPushes[0].payload.updates[0] as tl.RawUpdateMessageID).id)
       .toBe((response.updates[0] as tl.RawUpdateMessageID).id)
+  })
+
+  it('excludes only the sending auth key for the echoed message, not every own message', async () => {
+    const ctx = new Context()
+    const fibers = [ctx.plugin(Database), ctx.plugin(SQLiteDriver, { path: ':memory:' })]
+    await Promise.all(fibers)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    defineModels(ctx)
+    await ctx.database.prepared()
+    disposals.push(async () => {
+      for (const fiber of fibers.reverse()) await Promise.resolve((fiber as any).dispose?.())
+    })
+    for (const authKeyId of [REQUESTER_AUTH_KEY, OBSERVER_AUTH_KEY]) {
+      await ctx.database.create('mtproto_auth_binding', {
+        authKeyId, platformId: session.platformId, platformSessionId: session.platformSessionId,
+      })
+    }
+
+    const sendEchoes = new SendEchoes()
+    const store = new MessageStore(ctx.database)
+    const platform: IMPlatform = {
+      capabilities: {
+        history: true,
+        send: { text: true, images: true, files: true, mixed: true, maxTextLength: 4096, maxMedia: 9 },
+        conversations: { groups: true, channels: true, subchannels: false },
+      },
+      async subscribe() { return () => {} },
+      async getDialogs() { return { dialogs: [{ conversation, unreadCount: 0 }] } },
+      async getHistory() { return { messages: [] } },
+      async getUser(_session, id) { return { id, firstName: id === session.userId ? 'Current' : id } },
+      async sendMessage(): Promise<IMMessage> { throw new Error('not used') },
+    }
+    const pushes: Array<{ authKeyId: string, payload: tl.RawUpdates }> = []
+    const manager = new UpdateManager(
+      ctx.database, new PlatformRegistry([[session.platformId, platform]]), store,
+      (authKeyId, update) => {
+        pushes.push({
+          authKeyId: Buffer.from(authKeyId).toString('hex'),
+          payload: update as tl.RawUpdates,
+        })
+        return 1
+      },
+      1, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      sendEchoes,
+    )
+    const echo = async (id: string, text: string) => {
+      const message: IMMessage = {
+        id, conversationId: conversation.id, senderId: session.userId, outgoing: true,
+        timestamp: 1_800_000_000, content: { parts: [{ type: 'text', text }] },
+      }
+      const result = await store.ingest(session, conversation, message)
+      await manager.publish(session, { event: { type: 'message', conversation, message }, result }, {})
+    }
+
+    // 发送 RPC 拿到平台结果后登记这条消息：它的回显只推给其他设备。
+    sendEchoes.bind(session.platformSessionId, ['qq-sent-text'], REQUESTER_AUTH_KEY)
+    await echo('qq-sent-text', 'one bubble for the sender')
+    expect(pushes.map((push) => push.authKeyId)).toEqual([OBSERVER_AUTH_KEY])
+    expect(pushes[0]!.payload.updates).toMatchObject([
+      { _: 'updateNewChannelMessage', message: { message: 'one bubble for the sender' } },
+    ])
+
+    // 同一时间段里从 QQ 手机端发出的另一条自己消息，不能被顺带屏蔽掉。
+    await echo('qq-phone-app-text', 'sent from another client')
+    expect(pushes.map((push) => push.authKeyId)).toEqual([
+      OBSERVER_AUTH_KEY, REQUESTER_AUTH_KEY, OBSERVER_AUTH_KEY,
+    ])
+
+    // 本方投递完成后解绑，之后到达的消息照常推给所有设备。
+    sendEchoes.release(session.platformSessionId, ['qq-sent-text'])
+    await echo('qq-later-text', 'delivered to every device')
+    expect(pushes.map((push) => push.authKeyId)).toEqual([
+      OBSERVER_AUTH_KEY, REQUESTER_AUTH_KEY, OBSERVER_AUTH_KEY,
+      REQUESTER_AUTH_KEY, OBSERVER_AUTH_KEY,
+    ])
+  })
+
+  it('binds the sent platform message for the whole local publish', async () => {
+    const ctx = new Context()
+    const fibers = [ctx.plugin(Database), ctx.plugin(SQLiteDriver, { path: ':memory:' })]
+    await Promise.all(fibers)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    defineModels(ctx)
+    await ctx.database.prepared()
+    disposals.push(async () => {
+      for (const fiber of fibers.reverse()) await Promise.resolve((fiber as any).dispose?.())
+    })
+    for (const authKeyId of [REQUESTER_AUTH_KEY, OBSERVER_AUTH_KEY]) {
+      await ctx.database.create('mtproto_auth_binding', {
+        authKeyId, platformId: session.platformId, platformSessionId: session.platformSessionId,
+      })
+    }
+
+    const sendEchoes = new SendEchoes()
+    const store = new MessageStore(ctx.database)
+    const platform: IMPlatform = {
+      capabilities: {
+        history: true,
+        send: { text: true, images: true, files: true, mixed: true, maxTextLength: 4096, maxMedia: 9 },
+        conversations: { groups: true, channels: true, subchannels: false },
+      },
+      async subscribe() { return () => {} },
+      async getDialogs() { return { dialogs: [{ conversation, unreadCount: 0 }] } },
+      async getHistory() { return { messages: [] } },
+      async getUser(_session, id) { return { id, firstName: id === session.userId ? 'Current' : id } },
+      async sendMessage(_session, target, input): Promise<IMMessage> {
+        const text = input.parts.find((part) => part.type === 'text')
+        if (!text || text.type !== 'text') throw new Error('expected sent text')
+        return {
+          id: 'qq-wired-text', conversationId: target.id, senderId: session.userId,
+          outgoing: true, timestamp: 1_800_000_000,
+          content: { parts: [{ type: 'text', text: text.text }] },
+        }
+      },
+    }
+    const boundDuringPublish: Array<string | undefined> = []
+    const manager = new UpdateManager(
+      ctx.database, new PlatformRegistry([[session.platformId, platform]]), store,
+      () => 1,
+      1, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      sendEchoes,
+    )
+    const dialogs = new DialogRpc(
+      platform, session, store,
+      undefined, undefined, 1, undefined, undefined, undefined,
+      async (localSession, event, options) => {
+        if (event.type !== 'message') return
+        boundDuringPublish.push(sendEchoes.excludeFor(localSession, event.message))
+        const result = await store.ingest(localSession, event.conversation, event.message)
+        return manager.publish(localSession, { event, result }, options)
+      },
+      REQUESTER_AUTH_KEY,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      sendEchoes,
+    )
+    await (dialogs as any)._hydratePeers()
+    const rpc = createCordisRpcTestHarness()
+    rpc.register('messages.sendMessage', async (context, request) =>
+      dialogs.sendMessage(request as tl.messages.RawSendMessageRequest, context.connection))
+    const targetPeer = {
+      _: 'inputPeerChannel' as const,
+      channelId: stableId(peerTlSeed(session.platformSessionId, conversation.id)), accessHash: Long.ZERO,
+    }
+    await roundTripRpc(rpc, {
+      _: 'messages.sendMessage',
+      peer: targetPeer,
+      message: 'bind while publishing',
+      randomId: Long.fromNumber(80_003),
+    })
+
+    // 投递本地副本的那一刻，这条平台消息已经归属发送它的 auth key。
+    expect(boundDuringPublish).toEqual([REQUESTER_AUTH_KEY])
+    // 投递完成后解绑：此后同一条消息的回显由事件去重处理。
+    expect(sendEchoes.excludeFor(session, {
+      id: 'qq-wired-text', conversationId: conversation.id, senderId: session.userId,
+      outgoing: true, timestamp: 1_800_000_000, content: { parts: [{ type: 'text', text: 'x' }] },
+    })).toBeUndefined()
   })
 })

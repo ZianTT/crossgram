@@ -1,4 +1,4 @@
-/** Browser-safe dashboard wire contracts; this module has no server imports. */
+/** 供浏览器端直接引用的管理面板数据类型（无服务端依赖）。 */
 export type PlatformAccountStatus = 'ready' | 'loading' | 'error' | 'unsupported'
 
 export interface PlatformAccountView {
@@ -15,7 +15,6 @@ export interface PlatformAccountView {
   loginCode?: string
   validUntil?: number
   remainingSeconds?: number
-  /** Whether an optional two-step verification password is configured. */
   hasPassword?: boolean
   error?: string
 }
@@ -41,7 +40,6 @@ export interface PlatformAccountDashboardData {
   loginTokenApprovalUrl: string
   updatedAt: number
   refresh(): Promise<void>
-  /** Set, replace, or clear (null/empty) the two-step verification password. */
   setLoginPassword(platformId: string, password: string | null): Promise<void>
 }
 
@@ -84,15 +82,11 @@ export interface StickerPackDashboardData {
   ): Promise<void>
 }
 
-/** A bridge-owned bot that can be opened through a Telegram `t.me` link. */
 export interface SystemBot {
-  /** The conversation ID that the provider resolves for this bot. */
   conversationId: string
-  /** Display name exposed to the WebUI and Telegram clients. */
   title: string
-  /** Globally unique Telegram-style username, without `@`. */
+  /** 不带 `@` 的 Telegram 用户名。 */
   username: string
-  /** Cordis package which registered the bot. */
   sourcePlugin: string
 }
 

@@ -9,7 +9,6 @@ export interface StoredDraft {
   draft: tl.RawDraftMessage
 }
 
-/** Durable, platform-independent storage for Telegram client drafts. */
 export class DraftStore {
   constructor(private readonly _database: Database) {}
 
@@ -30,6 +29,26 @@ export class DraftStore {
     const rows = await this._database.select('mtproto_draft', { platformSessionId })
       .orderBy('date', 'desc').execute()
     return rows.map(decodeRow)
+  }
+
+  /** 返回各会话草稿中仍在引用的富文本媒体 ID，供上传清理任务豁免。 */
+  async pinnedUploadIds(): Promise<Map<string, Set<string>>> {
+    const rows = await this._database.select('mtproto_draft').execute()
+    const pinned = new Map<string, Set<string>>()
+    for (const row of rows) {
+      const draft = decodeRow(row).draft
+      const rich = draft._ === 'draftMessage' ? draft.richMessage : undefined
+      if (!rich) continue
+      const ids = [
+        ...rich.photos.map((photo) => photo.id.toString()),
+        ...rich.documents.map((document) => document.id.toString()),
+      ]
+      if (!ids.length) continue
+      const existing = pinned.get(row.platformSessionId) ?? new Set<string>()
+      for (const id of ids) existing.add(id)
+      pinned.set(row.platformSessionId, existing)
+    }
+    return pinned
   }
 
   async save(

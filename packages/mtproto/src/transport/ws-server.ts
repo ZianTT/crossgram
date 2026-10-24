@@ -4,10 +4,8 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import type { ServerTransportSocket } from './server-socket.js'
 
 /**
- * Bridges one WebSocket connection into the `Duplex` byte stream the MTProto
- * transport stack expects. Binary frames carry the same obfuscated/abridged
- * byte stream a TCP socket would; frame boundaries are meaningless, the
- * receive buffer reassembles MTProto packets across them.
+ * 将 WebSocket 连接桥接为 MTProto 传输层所需的 `Duplex` 字节流。
+ * 二进制帧承载与 TCP 相同的混淆/分帧字节流，MTProto 报文边界由接收缓冲区重组。
  */
 export class WebSocketBridge extends Duplex implements ServerTransportSocket {
   readonly remoteAddress: string | undefined
@@ -23,7 +21,7 @@ export class WebSocketBridge extends Duplex implements ServerTransportSocket {
     this.remotePort = request.socket.remotePort
     this._ws.on('message', (data: Buffer, isBinary: boolean) => {
       if (this._ended || !isBinary) return
-      // ws reuses the buffer after the listener returns; copy for async decode.
+      // ws 会在回调返回后复用底层 buffer，异步解码前需拷贝一份
       if (!this.push(new Uint8Array(data))) this._ws.pause()
     })
     this._ws.on('close', () => this._endStream())
@@ -59,25 +57,17 @@ export class WebSocketBridge extends Duplex implements ServerTransportSocket {
     this._ws.resume()
   }
 
-  // TCP-only tunables; WebSocket framing has no equivalent.
   setNoDelay(): void {}
   setKeepAlive(): void {}
-  // ponytail: no idle-timeout over WS, add a bridge-side timer if WS leaks
-  // idle connections in production.
   setTimeout(): void {}
 }
 
 export interface WebSocketServerHandle {
-  /** The actually bound port (useful when configured with port 0). */
   port: number
   close(): Promise<void>
 }
 
-/**
- * Listen for MTProto-over-WebSocket connections. Any request path is accepted
- * (clients differ: mtcute uses `/`, Telegram Web uses `/apiws`); non-WebSocket
- * HTTP requests get a bare 426.
- */
+/** 监听 MTProto over WebSocket 连接（接受任意路径以兼容 mtcute `/` 与 Telegram Web `/apiws`） */
 export async function listenWebSocketServer(
   options: { host: string, port: number },
   onConnection: (socket: ServerTransportSocket) => void,

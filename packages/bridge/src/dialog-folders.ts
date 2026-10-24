@@ -97,32 +97,95 @@ export class DialogFolderStore {
   ): Promise<Set<string>> {
     const unique = new Map(peers.map((peer) => [peer.peerId, peer.folderId]))
     const peerIds = [...unique.keys()]
-    const existing = peerIds.length
+    const existing = new Map((peerIds.length
       ? await this._database.get('mtproto_dialog_folder_peer', {
           platformSessionId, platformConversationId: { $in: peerIds },
         })
-      : []
-    const archived = new Set(existing.filter((row) => row.folderId === 1)
-      .map((row) => row.platformConversationId))
+      : []).map((row) => [row.platformConversationId, row]))
     const changed = new Set<string>()
     await this._database.withTransaction(async (database) => {
       for (const [peerId, folderId] of unique) {
-        if ((archived.has(peerId) ? 1 : 0) === folderId) continue
+        if ((existing.get(peerId)?.folderId === 1 ? 1 : 0) === folderId) continue
         changed.add(peerId)
-        if (folderId === 0) {
-          await database.remove('mtproto_dialog_folder_peer', {
-            platformSessionId, platformConversationId: peerId,
-          })
-        } else {
-          await database.upsert('mtproto_dialog_folder_peer', [{
-            id: peerKey(platformSessionId, peerId), platformSessionId,
-            platformConversationId: peerId, folderId, updatedAt: new Date(),
-          }])
-        }
+        // Telegram 的置顶按文件夹区分，移动会话即取消其置顶
+        await writePeerRow(database, platformSessionId, peerId, folderId, null)
       }
     })
     return changed
   }
+
+  /** 所有文件夹的置顶会话，按置顶顺序排列 */
+  async pinnedPeerIds(platformSessionId: string): Promise<string[]> {
+    const rows = (await this._database.get('mtproto_dialog_folder_peer', { platformSessionId }))
+      .filter((row) => row.pinnedOrder != null)
+    return rows.sort((left, right) => left.pinnedOrder! - right.pinnedOrder!
+      || left.platformConversationId.localeCompare(right.platformConversationId))
+      .map((row) => row.platformConversationId)
+  }
+
+  /** 将会话置顶到所有置顶会话之上，或取消置顶；返回是否有变化 */
+  async setPeerPinned(platformSessionId: string, peerId: string, pinned: boolean): Promise<boolean> {
+    return this._database.withTransaction(async (database) => {
+      const rows = await database.get('mtproto_dialog_folder_peer', { platformSessionId })
+      const existing = rows.find((row) => row.platformConversationId === peerId)
+      if ((existing?.pinnedOrder != null) === pinned) return false
+      const orders = rows.flatMap((row) => row.pinnedOrder == null ? [] : [row.pinnedOrder])
+      const pinnedOrder = pinned ? (orders.length ? Math.min(...orders) - 1 : 0) : null
+      await writePeerRow(database, platformSessionId, peerId, existing?.folderId ?? 0, pinnedOrder)
+      return true
+    })
+  }
+
+  /**
+   * 替换某个文件夹的置顶顺序。`previous` 为该文件夹当前的置顶列表；
+   * `force` 时未出现在 `order` 中的会话被取消置顶，否则保持相对顺序排在其后
+   */
+  async reorderPinnedPeers(
+    platformSessionId: string,
+    order: readonly string[],
+    previous: readonly string[],
+    force: boolean,
+  ): Promise<string[]> {
+    const requested = [...new Set(order)]
+    const kept = force ? [] : previous.filter((peerId) => !requested.includes(peerId))
+    const next = [...requested, ...kept]
+    const removed = previous.filter((peerId) => !next.includes(peerId))
+    await this._database.withTransaction(async (database) => {
+      const touched = [...next, ...removed]
+      const existing = new Map((touched.length
+        ? await database.get('mtproto_dialog_folder_peer', {
+            platformSessionId, platformConversationId: { $in: touched },
+          })
+        : []).map((row) => [row.platformConversationId, row]))
+      for (const [pinnedOrder, peerId] of next.entries()) {
+        await writePeerRow(database, platformSessionId, peerId, existing.get(peerId)?.folderId ?? 0, pinnedOrder)
+      }
+      for (const peerId of removed) {
+        await writePeerRow(database, platformSessionId, peerId, existing.get(peerId)?.folderId ?? 0, null)
+      }
+    })
+    return next
+  }
+}
+
+/** 仅在有状态（已归档或已置顶）时保留该行 */
+async function writePeerRow(
+  database: Database,
+  platformSessionId: string,
+  peerId: string,
+  folderId: 0 | 1 | number,
+  pinnedOrder: number | null,
+): Promise<void> {
+  if (folderId === 0 && pinnedOrder === null) {
+    await database.remove('mtproto_dialog_folder_peer', {
+      platformSessionId, platformConversationId: peerId,
+    })
+    return
+  }
+  await database.upsert('mtproto_dialog_folder_peer', [{
+    id: peerKey(platformSessionId, peerId), platformSessionId,
+    platformConversationId: peerId, folderId, pinnedOrder, updatedAt: new Date(),
+  }])
 }
 
 export function encodeDialogFilterTitle(title: tl.TypeTextWithEntities): JsonValue {

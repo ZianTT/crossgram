@@ -26,13 +26,10 @@ export interface DiscordMediaLocator extends JsonObject {
 }
 
 export interface Config {
-  /** Normal Discord user-account token. This is not a Bot token. */
+  /** Discord 普通用户账号 token（非 Bot token）。 */
   token?: string
-  /** Include messages authored by bot accounts. */
   includeBots?: boolean
-  /** HTTP(S) proxy shared by Discord REST, Gateway, and CDN requests. */
   proxy?: string
-  /** Maximum chunk size yielded by CDN downloads. */
   downloadChunkSize?: number
 }
 
@@ -999,8 +996,7 @@ function normalizeHttpProxy(input?: string): string | undefined {
 
 function createWebSocketProxyAgent(proxy: string) {
   const agent = new HttpsProxyAgent(proxy)
-  // discord.js-selfbot-v13 validates these compatibility fields before
-  // forwarding the object itself to ws as a standard Node Agent.
+  // `discord.js-selfbot-v13` 在把对象作为 Node Agent 传给 `ws` 前会校验这两个兼容字段。
   return Object.assign(agent, { httpAgent: agent, httpsAgent: agent })
 }
 
@@ -1021,7 +1017,7 @@ function isUsableMessage(value: unknown): value is Message {
 
 const DISCORD_EPOCH_MS = 1_420_070_400_000n
 
-/** Recover timestamps from snowflakes when discord.js exposes an incomplete cached message. */
+/** 当 `discord.js` 缓存消息缺少时间戳时，从 snowflake 恢复秒级时间戳。 */
 function discordTimestamp(id: string, timestampMs: number): number {
   const timestamp = Math.trunc(timestampMs / 1_000)
   if (Number.isSafeInteger(timestamp)) return timestamp
@@ -1317,8 +1313,7 @@ function customEmojiDefinition(emoji: Pick<GuildEmoji, 'id' | 'name' | 'animated
     presentation: {
       type: 'custom', alt: emoji.name ?? 'emoji',
       resource: {
-        // The bridge contract accepts PNG/WebP or WebM. Requesting PNG also
-        // gives animated Discord emoji a stable first-frame representation.
+        // 请求 PNG 同时也为动态 Discord 表情提供稳定的首帧静态资源。
         version: 1, format: 'static', mimeType: 'image/png',
         width: 128, height: 128,
         locator: { url: `https://cdn.discordapp.com/emojis/${emoji.id}.png?size=128&quality=lossless` },

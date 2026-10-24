@@ -13,13 +13,7 @@ export interface TelegramResourceFile {
   mimeType: string
 }
 
-/**
- * Telegram 客户端自身依赖的系统资源。
- *
- * 资源实现通过 `ctx.telegramResource.register()` 注册，bridge 不再依赖某个
- * 具体资源包。多个 provider 可以共存；查询时按注册顺序使用第一个能处理
- * 对应请求的 provider。
- */
+/** Telegram 客户端系统资源（默认表情、动画、特效等），按注册顺序由首个非空返回值的 provider 处理。 */
 export interface TelegramResourceProvider {
   getAvailableReactions?():
     | tl.messages.RawAvailableReactions

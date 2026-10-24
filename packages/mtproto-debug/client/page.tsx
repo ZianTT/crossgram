@@ -1,61 +1,108 @@
-/** @jsxImportSource solid-js */
-import { createEffect, createMemo, createSignal, For, Show } from 'solid-js'
-import type {
-  CapturedMtprotoEvent,
-  MtprotoDebugData,
-} from '../src/types.js'
 import {
-  getRpcResultMetrics,
-  groupRpcEvents,
-  type EventGroup,
-} from '../src/event-groups.js'
-import { useRpc, type PageProps } from 'cordis-webui-solidjs/client'
-import { Icon } from 'cordis-webui-solidjs/icons'
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from 'react'
+import type { CapturedMtprotoEvent, MtprotoDebugData } from '../src/types.js'
+import { getRpcResultMetrics, groupRpcEvents } from '../src/event-groups.js'
+import { useRpc, type PageProps } from 'cordis-webui-react/client'
+import { Icon } from 'cordis-webui-react/icons'
 import {
   ActionError,
   ConfirmAction,
   LiveContent,
-  PageHeader,
+  Modal,
+  Notice,
+  formatBytes,
   useAction,
-} from 'cordis-webui-solidjs/components'
+} from 'cordis-webui-react/components'
 import { useCapturePages, type CaptureFilters } from './capture.js'
-import { copyText, sameOriginPath } from 'cordis-webui-solidjs/utils'
-import { formatMs } from 'cordis-webui-solidjs/utils'
+import {
+  currentLogDownloadUrl,
+  deleteRecording,
+  listRecordings,
+  recordingDownloadUrl,
+  saveRecording,
+  type SavedLogs,
+} from './recordings.js'
+import { copyText, formatMs, sameOriginPath } from 'cordis-webui-react/utils'
+
+/** Distance from the bottom that still counts as "tailing the newest event". */
+const TAIL_BOTTOM_SLACK_PX = 24
+/** Distance from the top that starts loading the previous page of events. */
+const OLDER_TRIGGER_PX = 80
+
+type SaveMenu = { id: number, x: number, y: number }
+
 export default function CapturePage(props: PageProps) {
-  const rpc = useRpc<MtprotoDebugData>(props.entryId),
-    action = useAction()
-  const [filters, setFilters] = createSignal<CaptureFilters>({}),
-    [expanded, setExpanded] = createSignal<number>()
+  const rpc = useRpc<MtprotoDebugData>(props.entryId)
+  const action = useAction()
+  const save = useAction()
+  const logs = useAction()
+  const [filters, setFilters] = useState<CaptureFilters>({})
+  const [expanded, setExpanded] = useState<number | undefined>(undefined)
+  const [pane, setPane] = useState<'event' | 'result'>('event')
+  const [showFilters, setShowFilters] = useState(false)
+  const [flash, setFlash] = useState('')
+  const [menu, setMenu] = useState<SaveMenu>()
+  const [moreOpen, setMoreOpen] = useState(false)
+  const [clearOpen, setClearOpen] = useState(false)
+  const [saveOpen, setSaveOpen] = useState(false)
+  const [logsOpen, setLogsOpen] = useState(false)
+  const [logName, setLogName] = useState('')
+  const [savedLogs, setSavedLogs] = useState<SavedLogs>()
+  const [follow, setFollow] = useState(true)
+  const [newCount, setNewCount] = useState(0)
+  const list = useRef<HTMLDivElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const moreRef = useRef<HTMLDivElement>(null)
   const capture = useCapturePages(
-    () => rpc.data.apiPath,
+    rpc.data.apiPath,
     filters,
-    () => rpc.ready,
+    rpc.ready,
+    rpc.data.revision,
   )
-  const groups = createMemo(
+  const groups = useMemo(
     () =>
       new Map(
-        groupRpcEvents(capture.events()).map((group) => [
-          group.event.id,
-          group,
-        ]),
+        groupRpcEvents(capture.events).map((group) => [group.event.id, group]),
       ),
+    [capture.events],
   )
-  const ids = createMemo(() => [...groups().keys()].reverse())
-  createEffect(() => {
-    if (expanded() !== undefined && !groups().has(expanded()!)) {
+  // The list tails the buffer: oldest event on top, newest at the bottom, so an
+  // arriving event never pushes what the operator is reading out of place.
+  const ids = useMemo(() => [...groups.keys()], [groups])
+  const newestId = ids.at(-1)
+  const followRef = useRef(follow)
+  const newestSeen = useRef<number | undefined>(undefined)
+  followRef.current = follow
+  useEffect(() => {
+    if (expanded !== undefined && !groups.has(expanded)) {
       setExpanded(undefined)
       capture.keepDetails([])
     }
-  })
+    // `capture` reads through refs, so only the window identity matters here.
+  }, [expanded, groups])
   const setFilter = (key: keyof CaptureFilters, value: string) =>
     setFilters((previous) => ({ ...previous, [key]: value }))
-  const toggle = (id: number) => {
-    if (expanded() === id) {
+  const filterType = (mode: 'include' | 'exclude', name: string) =>
+    setFilters((value) => ({
+      ...value,
+      typeName: mode === 'include' ? name : '',
+      excludeName: mode === 'exclude' ? name : '',
+    }))
+  const select = (id: number | undefined) => {
+    setPane('event')
+    if (id === undefined) {
       setExpanded(undefined)
       capture.keepDetails([])
       return
     }
-    const group = groups().get(id)!
+    const group = groups.get(id)
+    if (!group) return
     setExpanded(id)
     capture.keepDetails([id, ...(group.result ? [group.result.id] : [])])
     void capture.loadDetails(group.event)
@@ -67,497 +114,1423 @@ export default function CapturePage(props: PageProps) {
     url.searchParams.set('limit', '1')
     return url.href
   }
+  const filtersKey = JSON.stringify(filters)
+  useEffect(() => {
+    // A new filter starts a new window at the newest event.
+    setExpanded(undefined)
+    capture.keepDetails([])
+    setFollow(true)
+    setNewCount(0)
+    requestAnimationFrame(() => {
+      if (list.current) list.current.scrollTop = list.current.scrollHeight
+    })
+    // `capture` is a stable imperative handle; only the filter identity matters.
+  }, [filtersKey])
+  const tailToLatest = useCallback(() => {
+    setFollow(true)
+    setNewCount(0)
+    requestAnimationFrame(() => {
+      const element = list.current
+      if (element) element.scrollTop = element.scrollHeight
+    })
+  }, [])
+  const onScroll = () => {
+    const element = list.current
+    if (!element) return
+    const atBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight <=
+      TAIL_BOTTOM_SLACK_PX
+    if (atBottom !== followRef.current) {
+      followRef.current = atBottom
+      setFollow(atBottom)
+      if (atBottom) {
+        setNewCount(0)
+        newestSeen.current = newestId
+      } else newestSeen.current ??= newestId
+    }
+    if (element.scrollTop <= OLDER_TRIGGER_PX)
+      if (capture.snapshot?.hasOlder && !capture.loading) void capture.load('older')
+  }
+  useEffect(() => {
+    const element = list.current
+    if (!element || newestId === undefined) return
+    if (followRef.current) {
+      element.scrollTop = element.scrollHeight
+      newestSeen.current = newestId
+    } else if (newestSeen.current !== undefined) {
+      setNewCount(ids.filter((id) => id > newestSeen.current!).length)
+    }
+    // `ids` changes identity on every page, so scroll only when the tail moved.
+  }, [newestId])
+  useEffect(() => {
+    // A filtered window can be shorter than the viewport; keep paging so the
+    // scroll handler has somewhere to go.
+    const element = list.current
+    if (!element || capture.loading || !capture.snapshot?.hasOlder) return
+    if (element.scrollHeight <= element.clientHeight + 1) void capture.load('older')
+  }, [capture.events.length, capture.loading, capture.snapshot?.hasOlder])
+  useEffect(() => {
+    if (!flash) return
+    const timer = setTimeout(() => setFlash(''), 2200)
+    return () => clearTimeout(timer)
+  }, [flash])
+  useEffect(() => {
+    if (!menu) return
+    const close = () => setMenu(undefined)
+    const outside = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) close()
+    }
+    const key = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close()
+    }
+    // Opening the menu selects the event, which can resize the list and emit a
+    // scroll as the browser keeps the selected row in view. Ignore scrolls from
+    // that first layout, and only react to the list itself: scrolling inside the
+    // menu (a keyboard focus or a long menu) must not dismiss it.
+    const opened = performance.now()
+    const scrolled = () => {
+      if (performance.now() - opened > 150) close()
+    }
+    const target = list.current
+    window.addEventListener('pointerdown', outside)
+    window.addEventListener('keydown', key)
+    window.addEventListener('resize', close)
+    target?.addEventListener('scroll', scrolled)
+    requestAnimationFrame(() =>
+      menuRef.current
+        ?.querySelector<HTMLButtonElement>(
+          '.capture-menu-item:not(:disabled)',
+        )
+        ?.focus(),
+    )
+    return () => {
+      window.removeEventListener('pointerdown', outside)
+      window.removeEventListener('keydown', key)
+      window.removeEventListener('resize', close)
+      target?.removeEventListener('scroll', scrolled)
+    }
+  }, [menu])
+  useEffect(() => {
+    if (!moreOpen) return
+    const outside = (event: PointerEvent) => {
+      if (!moreRef.current?.contains(event.target as Node)) setMoreOpen(false)
+    }
+    const key = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMoreOpen(false)
+    }
+    window.addEventListener('pointerdown', outside)
+    window.addEventListener('keydown', key)
+    return () => {
+      window.removeEventListener('pointerdown', outside)
+      window.removeEventListener('keydown', key)
+    }
+  }, [moreOpen])
+  const copy = async (label: string, value: string) => {
+    try {
+      await copyText(value)
+      setFlash('Copied ' + label)
+    } catch {
+      setFlash('Copy failed')
+    }
+    setMenu(undefined)
+  }
+  const refreshLogs = async () => {
+    const loaded = await logs.run(() =>
+      listRecordings(rpc.data.recordingsApiPath),
+    )
+    if (loaded) setSavedLogs(loaded)
+  }
+  useEffect(() => {
+    if (!rpc.ready) return
+    void refreshLogs()
+    // Load the saved-log index once per page, mostly for the header count.
+  }, [rpc.ready])
+  const openSave = (name?: string) => {
+    save.clear()
+    setLogName(name ?? '')
+    setSaveOpen(true)
+    if (!savedLogs) void refreshLogs()
+  }
+  const openMenuFor = (id: number, x: number, y: number) => {
+    if (expanded !== id) select(id)
+    setMoreOpen(false)
+    setMenu({ id, x, y })
+  }
+  const submitLog = () =>
+    void save.run(async () => {
+      const recording = await saveRecording(
+        rpc.data.recordingsApiPath,
+        logName,
+      )
+      setSaveOpen(false)
+      setLogName('')
+      setFlash('Saved log ' + (recording.label ?? recording.fileName))
+      setLogsOpen(true)
+      await refreshLogs()
+    })
+  const openLogs = () => {
+    logs.clear()
+    setLogsOpen(true)
+    void refreshLogs()
+  }
+  const total = capture.snapshot?.total ?? 0
+  const shown = capture.events.length
+  const maxEvents = rpc.data.maxEvents ?? 0
+  const dropped = rpc.data.dropped ?? 0
+  const recordingCount = savedLogs?.recordings.length ?? 0
+  const chips: { key: keyof CaptureFilters, label: string }[] = []
+  if (filters.typeName)
+    chips.push({ key: 'typeName', label: 'Only: ' + filters.typeName })
+  if (filters.excludeName)
+    chips.push({ key: 'excludeName', label: 'Exclude: ' + filters.excludeName })
+  if (filters.connectionId)
+    chips.push({ key: 'connectionId', label: 'Connection: ' + filters.connectionId })
+  if (filters.since)
+    chips.push({ key: 'since', label: 'Since: ' + filters.since })
+  if (filters.field)
+    chips.push({ key: 'field', label: 'Field: ' + filters.field })
+  const onListKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Escape') {
+      if (expanded !== undefined) {
+        event.preventDefault()
+        select(undefined)
+      }
+      return
+    }
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+    if (!ids.length) return
+    event.preventDefault()
+    const current = expanded === undefined ? -1 : ids.indexOf(expanded)
+    const next =
+      event.key === 'ArrowDown'
+        ? Math.min(ids.length - 1, current + 1)
+        : Math.max(0, current - 1)
+    if (ids[next] !== undefined && ids[next] !== expanded) {
+      select(ids[next])
+      requestAnimationFrame(() =>
+        list.current
+          ?.querySelector('tr[aria-selected="true"]')
+          ?.scrollIntoView({ block: 'nearest' }),
+      )
+    }
+  }
+  const menuGroup = menu ? groups.get(menu.id) : undefined
+  const menuEvent = menu
+    ? (capture.details.get(menu.id) ?? menuGroup?.event)
+    : undefined
+  const menuResult =
+    menuGroup?.result &&
+    (capture.details.get(menuGroup.result.id) ?? menuGroup.result)
+  const selected = expanded === undefined ? undefined : groups.get(expanded)
+  const result = selected?.result
+  const detail =
+    pane === 'result' && result
+      ? (capture.details.get(result.id) ?? result)
+      : selected
+        ? (capture.details.get(selected.event.id) ?? selected.event)
+        : undefined
+  const filtered = !!chips.length || !!filters.direction || !!filters.phase || !!filters.grep
   return (
     <>
-      <PageHeader
-        title="MTProto capture"
-        description="Follow the conversation between your clients and the relay."
-        actions={
-          <>
-            <button
-              class="button filled"
-              disabled={action.busy() || !rpc.ready}
-              onClick={() =>
-                void action.run(async () => {
-                  await (rpc.data.capturing
-                    ? rpc.data.pause()
-                    : rpc.data.start())
-                  await capture.load('latest')
-                })
-              }
-            >
-              {rpc.data.capturing ? 'Pause capture' : 'Start capture'}
-            </button>
-            <ConfirmAction
-              label="Clear capture"
-              title="Clear all captured events?"
-              description="The in-memory capture buffer will be cleared. This does not disconnect clients."
-              action={async () => {
-                await rpc.data.clear()
-                setExpanded(undefined)
-                capture.keepDetails([])
-                await capture.load('latest')
-              }}
-            />
-          </>
-        }
-      />
-      <ActionError error={action.error() || capture.error()} />
+      <ActionError error={action.error} />
       <LiveContent ready={rpc.ready}>
-        <section class="panel stack capture-controls">
-          <div class="toolbar">
-            <label class="field grow">
-              <span>Search captured events</span>
+        <div className="workbench capture-workbench">
+          <header className="workbench-header capture-header">
+            <div className="capture-heading">
+              <h1>MTProto capture</h1>
+              <span
+                className={
+                  'capture-state ' + (rpc.data.capturing ? 'live' : 'paused')
+                }
+              >
+                <span className="capture-state-dot" aria-hidden="true" />
+                {rpc.data.capturing ? 'Capturing' : 'Capture paused'}
+              </span>
+            </div>
+            <span className="workbench-sub capture-metrics">
+              {total.toLocaleString()} retained
+              <span className="capture-dot" aria-hidden="true">·</span>
+              {maxEvents.toLocaleString()} max
+              <span className="capture-dot" aria-hidden="true">·</span>
+              {dropped.toLocaleString()} dropped
+            </span>
+            <div className="workbench-actions capture-actions">
+              <button
+                className="button filled"
+                disabled={action.busy || !rpc.ready}
+                aria-label={
+                  rpc.data.capturing ? 'Pause capture' : 'Resume capture'
+                }
+                title={
+                  rpc.data.capturing
+                    ? 'Stop recording new events into the buffer'
+                    : 'Start recording events into the buffer'
+                }
+                onClick={() =>
+                  void action.run(async () => {
+                    await (rpc.data.capturing
+                      ? rpc.data.pause()
+                      : rpc.data.start())
+                    await capture.load('latest')
+                    tailToLatest()
+                  })
+                }
+              >
+                <Icon
+                name={rpc.data.capturing ? 'pause' : 'play'}
+                size={12}
+              />
+                <span className="capture-label">
+                  {rpc.data.capturing ? 'Pause capture' : 'Resume capture'}
+                </span>
+              </button>
+              <button
+                className="button tonal"
+                disabled={!rpc.ready || !total}
+                aria-label="Save log"
+                title={
+                  total
+                    ? 'Save the buffered events as a log on the server'
+                    : 'Nothing to save yet'
+                }
+                onClick={() => openSave()}
+              >
+                <Icon name="save" size={13} />
+                <span className="capture-label">Save log</span>
+              </button>
+              <button
+                className="button outlined"
+                disabled={!rpc.ready}
+                aria-label="Saved logs"
+                title="Browse logs saved on the server"
+                onClick={openLogs}
+              >
+                <Icon name="logs" size={13} />
+                <span className="capture-label">Saved logs</span>
+                {recordingCount ? (
+                  <span className="capture-count" aria-hidden="true">
+                    {recordingCount}
+                  </span>
+                ) : null}
+              </button>
+              <div className="capture-more" ref={moreRef}>
+                <button
+                  className="icon-button"
+                  aria-label="More capture actions"
+                  aria-haspopup="menu"
+                  aria-expanded={moreOpen}
+                  onClick={() => setMoreOpen(!moreOpen)}
+                >
+                  <Icon name="ellipsis" size={15} />
+                </button>
+                {moreOpen ? (
+                  <div className="capture-menu capture-menu-right" role="menu">
+                    <button
+                      className="capture-menu-item"
+                      role="menuitem"
+                      disabled={!total}
+                      onClick={() => {
+                        setMoreOpen(false)
+                        setClearOpen(true)
+                      }}
+                    >
+                      Clear capture buffer…
+                    </button>
+                    <button
+                      className="capture-menu-item"
+                      role="menuitem"
+                      onClick={() => {
+                        setMoreOpen(false)
+                        void capture.load('latest')
+                      }}
+                    >
+                      Reload newest events
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </header>
+          <div className="workbench-toolbar capture-toolbar">
+            <label className="field capture-search">
+              <Icon name="search" size={13} className="capture-search-icon" />
               <input
                 type="search"
-                value={filters().grep ?? ''}
-                placeholder="Method, payload text, connection…"
-                onInput={(event) =>
+                aria-label="Filter captured events"
+                value={filters.grep ?? ''}
+                placeholder="Filter by method, payload, connection…"
+                onChange={(event) =>
                   setFilter('grep', event.currentTarget.value)
                 }
               />
             </label>
-            <button
-              class="button tonal"
-              aria-pressed={capture.live()}
-              onClick={() => capture.setLive(!capture.live())}
+            <select
+              className="capture-select"
+              aria-label="Direction"
+              value={filters.direction ?? ''}
+              onChange={(event) =>
+                setFilter('direction', event.currentTarget.value)
+              }
             >
-              {capture.live() ? 'Pause live view' : 'Follow latest'}
+              <option value="">All directions</option>
+              <option value="client->server">Client → server</option>
+              <option value="server->client">Server → client</option>
+            </select>
+            <select
+              className="capture-select"
+              aria-label="Phase"
+              value={filters.phase ?? ''}
+              onChange={(event) => setFilter('phase', event.currentTarget.value)}
+            >
+              <option value="">All phases</option>
+              <option value="handshake">Handshake</option>
+              <option value="message">Message</option>
+              <option value="connection">Connection</option>
+            </select>
+            <button
+              className={'button ' + (showFilters ? 'tonal' : 'outlined')}
+              aria-expanded={showFilters}
+              aria-label="Filters"
+              onClick={() => setShowFilters(!showFilters)}
+            >
+              <Icon name="filter" size={13} />
+              <span className="capture-label">
+                Filters{chips.length ? ' · ' + chips.length : ''}
+              </span>
             </button>
           </div>
-          <details>
-            <summary>Advanced filters</summary>
-            <div class="capture-filter-grid">
-              <label class="field">
-                <span>Direction</span>
-                <select
-                  aria-label="Direction"
-                  value={filters().direction ?? ''}
-                  onChange={(event) =>
-                    setFilter('direction', event.currentTarget.value)
-                  }
-                >
-                  <option value="">Both directions</option>
-                  <option value="client->server">Client to server</option>
-                  <option value="server->client">Server to client</option>
-                </select>
-              </label>
-              <label class="field">
-                <span>Phase</span>
-                <select
-                  aria-label="Phase"
-                  value={filters().phase ?? ''}
-                  onChange={(event) =>
-                    setFilter('phase', event.currentTarget.value)
-                  }
-                >
-                  <option value="">All phases</option>
-                  <option>handshake</option>
-                  <option>message</option>
-                  <option>connection</option>
-                </select>
-              </label>
-              <label class="field">
-                <span>Connection ID</span>
+          {showFilters ? (
+            <div className="workbench-toolbar capture-filter-panel">
+              <label className="field">
                 <input
-                  value={filters().connectionId ?? ''}
-                  onInput={(event) =>
+                  aria-label="Connection ID"
+                  placeholder="Connection ID"
+                  value={filters.connectionId ?? ''}
+                  onChange={(event) =>
                     setFilter('connectionId', event.currentTarget.value)
                   }
                 />
               </label>
-              <label class="field">
-                <span>Since</span>
+              <label className="field">
                 <input
-                  placeholder="5m, 1h, or a timestamp"
-                  value={filters().since ?? ''}
-                  onInput={(event) =>
+                  aria-label="Since"
+                  placeholder="Since (5m, 1h, timestamp)"
+                  value={filters.since ?? ''}
+                  onChange={(event) =>
                     setFilter('since', event.currentTarget.value)
                   }
                 />
               </label>
-              <label class="field">
-                <span>Exact payload field</span>
+              <label className="field">
                 <input
-                  placeholder="payload.userId=123"
-                  value={filters().field ?? ''}
-                  onInput={(event) =>
+                  aria-label="Payload field"
+                  placeholder="Field (payload.userId=123)"
+                  value={filters.field ?? ''}
+                  onChange={(event) =>
                     setFilter('field', event.currentTarget.value)
                   }
                 />
               </label>
+              <span className="muted capture-filter-hint">
+                Filters apply live. Right-click an event to filter by its
+                method or connection.
+              </span>
             </div>
-          </details>
-          <Show when={filters().typeName || filters().excludeName}>
+          ) : null}
+          {chips.length ? (
+            <div className="workbench-toolbar capture-chip-row">
+              {chips.map((chip) => (
+                <button
+                  key={chip.key}
+                  className="chip filter-chip"
+                  title={'Remove filter: ' + chip.label}
+                  aria-label={'Remove filter: ' + chip.label}
+                  onClick={() => setFilter(chip.key, '')}
+                >
+                  {chip.label}
+                  <Icon name="close" size={11} />
+                </button>
+              ))}
+              <button
+                className="button outlined capture-chip-clear"
+                onClick={() => setFilters({})}
+              >
+                Clear filters
+              </button>
+            </div>
+          ) : null}
+          <div className="workbench-body capture-body">
+            <div
+              ref={list}
+              className="workbench-scroll capture-list"
+              role="list"
+              aria-label="Captured MTProto events"
+              tabIndex={0}
+              onScroll={onScroll}
+              onKeyDown={onListKeyDown}
+            >
+              <table className="workbench-table capture-table">
+                <thead>
+                  <tr>
+                    <th className="capture-col-time">Time</th>
+                    <th>Method</th>
+                    <th className="capture-col-conn">Connection</th>
+                    <th className="cell-right capture-col-duration">
+                      Duration
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ids.map((id) => {
+                    const group = groups.get(id)!
+                    const event = capture.details.get(id) ?? group.event
+                    const groupResult = group.result
+                      ? (capture.details.get(group.result.id) ?? group.result)
+                      : undefined
+                    const metrics = getRpcResultMetrics(event, groupResult)
+                    return (
+                      <tr
+                        key={id}
+                        className={
+                          'capture-row' +
+                          (metrics?.state === 'error' ? ' rpc-error' : '')
+                        }
+                        aria-selected={expanded === id}
+                        onClick={(click) => {
+                          if ((click.target as HTMLElement).closest('button'))
+                            return
+                          select(expanded === id ? undefined : id)
+                        }}
+                        onContextMenu={(event) => {
+                          event.preventDefault()
+                          openMenuFor(id, event.clientX, event.clientY)
+                        }}
+                      >
+                        <td className="capture-time">
+                          <time
+                            dateTime={new Date(event.timestamp).toISOString()}
+                          >
+                            {formatClock(event.timestamp)}
+                          </time>
+                        </td>
+                        <td className="cell-grow capture-name">
+                          <button
+                            className="capture-row-header"
+                            aria-expanded={expanded === id}
+                            onClick={() =>
+                              select(expanded === id ? undefined : id)
+                            }
+                          >
+                            <span
+                              className={
+                                'capture-direction ' +
+                                (event.direction === 'client->server'
+                                  ? 'outgoing'
+                                  : 'incoming')
+                              }
+                              aria-hidden="true"
+                              title={
+                                event.direction === 'client->server'
+                                  ? 'Client → server'
+                                  : 'Server → client'
+                              }
+                            >
+                              <Icon
+                                name={
+                                  event.direction === 'client->server'
+                                    ? 'arrowUpRight'
+                                    : 'arrowDownLeft'
+                                }
+                                size={12}
+                              />
+                            </span>
+                            <strong>{event.name}</strong>
+                            {event.phase === 'message' ? null : (
+                              <span className="chip capture-phase">
+                                {event.phase}
+                              </span>
+                            )}
+                            {metrics?.state === 'error' ? (
+                              <span className="chip capture-badge-error">
+                                error
+                              </span>
+                            ) : null}
+                            {metrics?.state === 'slow' ? (
+                              <span className="chip capture-badge-slow">
+                                slow
+                              </span>
+                            ) : null}
+                          </button>
+                        </td>
+                        <td className="capture-col-conn capture-conn">
+                          {event.connectionId}
+                        </td>
+                        <td className="cell-right capture-duration">
+                          {metrics ? (
+                            <span
+                              className={
+                                metrics.state === 'error'
+                                  ? 'capture-error'
+                                  : metrics.state === 'slow'
+                                    ? 'capture-slow'
+                                    : undefined
+                              }
+                            >
+                              {formatMs(metrics.durationMs)}
+                            </span>
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+              {!ids.length && !capture.loading ? (
+                <div className="capture-empty">
+                  <Icon
+                    name={total ? 'search' : 'terminal'}
+                    size={20}
+                    className="capture-empty-icon"
+                  />
+                  <h3>{total ? 'No events match' : 'Nothing captured yet'}</h3>
+                  <p className="muted">
+                    {total
+                      ? 'No event in the retained buffer matches the current filters.'
+                      : rpc.data.capturing
+                        ? 'Events show up here as soon as a client talks to the relay.'
+                        : 'Capture is paused, so nothing new is being recorded.'}
+                  </p>
+                  {total && filtered ? (
+                    <button
+                      className="button outlined"
+                      onClick={() => setFilters({})}
+                    >
+                      Clear filters
+                    </button>
+                  ) : null}
+                  {!total && !rpc.data.capturing ? (
+                    <button
+                      className="button filled"
+                      onClick={() =>
+                        void action.run(async () => {
+                          await rpc.data.start()
+                          await capture.load('latest')
+                        })
+                      }
+                    >
+                      Resume capture
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+              {capture.loading && ids.length ? (
+                <p className="capture-list-note muted" role="status">
+                  Loading events…
+                </p>
+              ) : null}
+              {!capture.snapshot?.hasOlder && ids.length ? (
+                <p className="capture-list-note muted">
+                  Start of retained capture
+                </p>
+              ) : null}
+              {!follow ? (
+                <button
+                  className="capture-jump"
+                  onClick={tailToLatest}
+                  aria-label={
+                    newCount
+                      ? newCount + ' new events, jump to latest'
+                      : 'Jump to latest events'
+                  }
+                >
+                  <Icon name="arrowDownLeft" size={13} />
+                  {newCount
+                    ? newCount + (newCount === 1 ? ' new event' : ' new events')
+                    : 'Jump to latest'}
+                </button>
+              ) : null}
+            </div>
+            {selected && detail ? (
+              <section
+                className="capture-inspector"
+                aria-label="Captured event details"
+              >
+                <header className="capture-inspector-header">
+                  <a
+                    className="capture-inspector-name"
+                    href={rawLink(detail.id)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="Open the raw event JSON"
+                  >
+                    {detail.name}
+                    <Icon name="external" size={11} />
+                  </a>
+                  <div className="capture-inspector-meta">
+                    <span>#{detail.id}</span>
+                    <span>{formatClock(detail.timestamp)}</span>
+                    <span className="capture-conn">
+                      {detail.connectionId || 'no connection'}
+                    </span>
+                    {getRpcResultMetrics(
+                      selected.event,
+                      selected.result,
+                    ) ? (
+                      <span>
+                        {formatMs(
+                          getRpcResultMetrics(
+                            selected.event,
+                            selected.result,
+                          )!.durationMs,
+                        )}
+                      </span>
+                    ) : null}
+                  </div>
+                  {selected.result ? (
+                    <div
+                      className="segmented capture-panes"
+                      role="tablist"
+                      aria-label="Captured event sections"
+                    >
+                      <button
+                        role="tab"
+                        aria-selected={pane === 'event'}
+                        className={pane === 'event' ? 'selected' : undefined}
+                        onClick={() => setPane('event')}
+                      >
+                        Request
+                      </button>
+                      <button
+                        role="tab"
+                        aria-selected={pane === 'result'}
+                        className={pane === 'result' ? 'selected' : undefined}
+                        onClick={() => {
+                          setPane('result')
+                          if (selected.result)
+                            void capture.loadDetails(selected.result)
+                        }}
+                      >
+                        Result
+                      </button>
+                    </div>
+                  ) : null}
+                  <button
+                    className="icon-button"
+                    aria-label="Close details"
+                    onClick={() => select(undefined)}
+                  >
+                    <Icon name="close" size={14} />
+                  </button>
+                </header>
+                <div className="capture-inspector-body">
+                  <EventDetail
+                    event={detail}
+                    onCopy={(label, value) => void copy(label, value)}
+                    onMenu={(rect) =>
+                      openMenuFor(detail.id, rect.left, rect.bottom)
+                    }
+                    rawLink={rawLink}
+                  />
+                </div>
+              </section>
+            ) : null}
+          </div>
+          <div className="workbench-footer capture-footer">
+            <span className="capture-footer-left">
+              {shown.toLocaleString()} of {total.toLocaleString()} events
+              {filtered ? ' (filtered)' : ''}
+            </span>
+            <span className="capture-footer-tail">
+              {capture.loading
+                ? 'Loading…'
+                : follow
+                  ? 'Tailing newest events'
+                  : 'Scrolled back · new events are kept'}
+            </span>
+          </div>
+          {saveOpen ? (
+            <Modal
+              title="Save log"
+              onClose={() => {
+                if (!save.busy) setSaveOpen(false)
+              }}
+            >
+              <p className="muted">
+                Writes all {total.toLocaleString()} buffered events to a JSON
+                log on the server. Capture keeps running while the log is
+                written.
+              </p>
+              <label className="field">
+                <span>Log name (optional)</span>
+                <input
+                  aria-label="Log name"
+                  value={logName}
+                  maxLength={120}
+                  placeholder="dialogs-bug"
+                  disabled={save.busy}
+                  onChange={(event) => setLogName(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') submitLog()
+                  }}
+                />
+                <small className="field-hint">
+                  Used in the file name; a timestamp keeps names unique.
+                </small>
+              </label>
+              <dl className="capture-facts">
+                <div>
+                  <dt>Events</dt>
+                  <dd>{total.toLocaleString()}</dd>
+                </div>
+                <div>
+                  <dt>Server folder</dt>
+                  <dd>
+                    <code>{savedLogs?.directory ?? 'Loading…'}</code>
+                  </dd>
+                </div>
+              </dl>
+              <ActionError error={save.error} />
+              <div className="toolbar">
+                <button
+                  className="button filled"
+                  disabled={save.busy || !total}
+                  onClick={submitLog}
+                >
+                  {save.busy ? 'Saving…' : 'Save on server'}
+                </button>
+                <a
+                  className="button tonal"
+                  href={currentLogDownloadUrl(
+                    rpc.data.recordingsApiPath,
+                    logName,
+                  )}
+                >
+                  <Icon name="download" size={13} />
+                  Download
+                </a>
+                <button
+                  className="button outlined"
+                  disabled={save.busy}
+                  onClick={() => setSaveOpen(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </Modal>
+          ) : null}
+          {logsOpen ? (
+            <Modal
+              title="Saved logs"
+              onClose={() => setLogsOpen(false)}
+              className="capture-logs-modal"
+            >
+              <p className="muted capture-logs-note">
+                {savedLogs?.directory
+                  ? 'Stored on the server in '
+                  : 'Saved capture logs live on the server'}
+                {savedLogs?.directory ? (
+                  <code>{savedLogs.directory}</code>
+                ) : null}
+              </p>
+              <ActionError error={logs.error} />
+              {logs.busy && !savedLogs ? (
+                <p className="muted">Loading saved logs…</p>
+              ) : savedLogs?.recordings.length ? (
+                <div className="recording-list">
+                  {savedLogs.recordings.map((recording) => {
+                    const name = recording.label ?? recording.fileName
+                    return (
+                      <div className="recording-row" key={recording.id}>
+                        <div className="recording-info">
+                          <strong className="recording-label" title={recording.id}>
+                            {name}
+                          </strong>
+                          <span className="recording-meta">
+                            {recording.label ? (
+                              <>
+                                <code>{recording.fileName}</code>
+                                <span aria-hidden="true"> · </span>
+                              </>
+                            ) : null}
+                            {recording.eventCount.toLocaleString()} events
+                            <span aria-hidden="true"> · </span>
+                            {formatBytes(recording.bytes)}
+                            <span aria-hidden="true"> · </span>
+                            <time
+                              dateTime={new Date(
+                                recording.createdAt,
+                              ).toISOString()}
+                            >
+                              {formatLogTime(recording.createdAt)}
+                            </time>
+                          </span>
+                        </div>
+                        <div className="recording-actions">
+                          <button
+                            className="icon-button"
+                            aria-label={'Copy file path for ' + name}
+                            title="Copy file path"
+                            onClick={() =>
+                              void copy(
+                                'file path',
+                                joinPath(
+                                  savedLogs.directory,
+                                  recording.fileName,
+                                ),
+                              )
+                            }
+                          >
+                            <Icon name="copy" size={13} />
+                          </button>
+                          <a
+                            className="button outlined recording-download"
+                            href={recordingDownloadUrl(
+                              rpc.data.recordingsApiPath,
+                              recording.id,
+                            )}
+                            download={recording.fileName}
+                            aria-label={'Download ' + name}
+                          >
+                            Download
+                          </a>
+                          <ConfirmAction
+                            label="Delete"
+                            title="Delete this log?"
+                            description={
+                              'This removes ' +
+                              recording.fileName +
+                              ' from the server. Saved logs cannot be recovered.'
+                            }
+                            action={async () => {
+                              await deleteRecording(
+                                rpc.data.recordingsApiPath,
+                                recording.id,
+                              )
+                              await refreshLogs()
+                            }}
+                          />
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="capture-empty capture-empty-inline">
+                  <Icon name="save" size={18} className="capture-empty-icon" />
+                  <h3>No saved logs yet</h3>
+                  <p className="muted">
+                    Save the capture buffer to keep it after the in-memory
+                    window is cleared or the relay restarts.
+                  </p>
+                </div>
+              )}
+              <div className="toolbar">
+                <button
+                  className="button outlined"
+                  disabled={logs.busy}
+                  onClick={() => void refreshLogs()}
+                >
+                  <Icon name="refresh" size={13} />
+                  Refresh
+                </button>
+                <button
+                  className="button filled"
+                  disabled={!total}
+                  onClick={() => {
+                    setLogsOpen(false)
+                    openSave()
+                  }}
+                >
+                  Save current buffer
+                </button>
+              </div>
+            </Modal>
+          ) : null}
+          {clearOpen ? (
+            <Modal
+              title="Clear capture buffer?"
+              onClose={() => setClearOpen(false)}
+            >
+              <p>
+                Drops the {total.toLocaleString()} buffered events. Connected
+                clients stay connected and capture keeps running.
+              </p>
+              <div className="toolbar">
+                <button
+                  className="button danger"
+                  disabled={action.busy}
+                  onClick={() =>
+                    void action.run(async () => {
+                      await rpc.data.clear()
+                      select(undefined)
+                      setClearOpen(false)
+                      setNewCount(0)
+                      await capture.load('latest')
+                    })
+                  }
+                >
+                  {action.busy ? 'Clearing…' : 'Clear capture'}
+                </button>
+                <button
+                  className="button outlined"
+                  disabled={action.busy}
+                  onClick={() => setClearOpen(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </Modal>
+          ) : null}
+        </div>
+        {capture.error ? (
+          <div className="capture-error-toast">
+            <Notice tone="error">{capture.error}</Notice>
+          </div>
+        ) : null}
+        {menuGroup && menuEvent ? (
+          <div
+            ref={menuRef}
+            className="capture-menu"
+            role="menu"
+            aria-label="Event actions"
+            style={{
+              left: Math.min(menu!.x, globalThis.innerWidth - 248),
+              top: Math.min(menu!.y, globalThis.innerHeight - 340),
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+              const items = [
+                ...(menuRef.current?.querySelectorAll<HTMLButtonElement>(
+                  '.capture-menu-item:not(:disabled)',
+                ) ?? []),
+              ]
+              if (!items.length) return
+              event.preventDefault()
+              const index = items.indexOf(
+                document.activeElement as HTMLButtonElement,
+              )
+              const next =
+                event.key === 'ArrowDown'
+                  ? (index + 1) % items.length
+                  : (index - 1 + items.length) % items.length
+              items[next]?.focus()
+            }}
+          >
             <button
-              class="button outlined type-filter"
+              className="capture-menu-item"
+              role="menuitem"
+              onClick={() => void copy('method name', menuEvent.name)}
+            >
+              Copy method name
+            </button>
+            <button
+              className="capture-menu-item"
+              role="menuitem"
+              disabled={!menuEvent.connectionId}
+              onClick={() => void copy('connection ID', menuEvent.connectionId)}
+            >
+              Copy connection ID
+            </button>
+            <button
+              className="capture-menu-item"
+              role="menuitem"
+              disabled={menuEvent.payloadOmitted}
               onClick={() =>
-                setFilters((value) => ({
-                  ...value,
-                  typeName: '',
-                  excludeName: '',
-                }))
+                void copy(
+                  'payload',
+                  JSON.stringify(menuEvent.payload ?? null, null, 2),
+                )
               }
             >
-              {filters().typeName
-                ? 'Only: ' + filters().typeName
-                : 'Exclude: ' + filters().excludeName}{' '}
-              · clear
+              Copy payload
             </button>
-          </Show>
-          <div class="toolbar">
-            <span class="chip">
-              {rpc.data.capturing ? 'Capturing' : 'Capture paused'}
-            </span>
-            <span class="muted">
-              {capture.events().length} shown / {capture.snapshot()?.total ?? 0}{' '}
-              retained · {capture.snapshot()?.dropped ?? 0} dropped
-            </span>
-            <Show when={capture.loading()}>
-              <span class="muted" role="status">
-                Updating…
-              </span>
-            </Show>
+            <button
+              className="capture-menu-item"
+              role="menuitem"
+              onClick={() =>
+                void copy('event JSON', JSON.stringify(menuEvent, null, 2))
+              }
+            >
+              Copy event JSON
+            </button>
+            {menuResult ? (
+              <button
+                className="capture-menu-item"
+                role="menuitem"
+                onClick={() =>
+                  void copy(
+                    'result JSON',
+                    JSON.stringify(menuResult.payload ?? null, null, 2),
+                  )
+                }
+              >
+                Copy result JSON
+              </button>
+            ) : null}
+            <div className="capture-menu-sep" role="separator" />
+            <button
+              className="capture-menu-item"
+              role="menuitem"
+              onClick={() => {
+                filterType('include', menuEvent.name)
+                setMenu(undefined)
+              }}
+            >
+              Only this method
+            </button>
+            <button
+              className="capture-menu-item"
+              role="menuitem"
+              onClick={() => {
+                filterType('exclude', menuEvent.name)
+                setMenu(undefined)
+              }}
+            >
+              Exclude this method
+            </button>
+            <button
+              className="capture-menu-item"
+              role="menuitem"
+              disabled={!menuEvent.connectionId}
+              onClick={() => {
+                setFilter('connectionId', menuEvent.connectionId)
+                setMenu(undefined)
+              }}
+            >
+              Only this connection
+            </button>
+            {filtered ? (
+              <button
+                className="capture-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  setFilters({})
+                  setMenu(undefined)
+                }}
+              >
+                Clear all filters
+              </button>
+            ) : null}
+            <div className="capture-menu-sep" role="separator" />
+            <button
+              className="capture-menu-item"
+              role="menuitem"
+              onClick={() => {
+                window.open(rawLink(menu!.id), '_blank', 'noopener')
+                setMenu(undefined)
+              }}
+            >
+              Open raw event
+            </button>
           </div>
-        </section>
-        <section class="capture-list" aria-label="Captured MTProto events">
-          <For each={ids()}>
-            {(id) => {
-              const group = () => groups().get(id)!,
-                event = () => capture.details().get(id) ?? group().event,
-                result = () =>
-                  group().result
-                    ? (capture.details().get(group().result!.id) ??
-                      group().result)
-                    : undefined
-              return (
-                <CaptureRow
-                  event={event()}
-                  result={result()}
-                  expanded={expanded() === id}
-                  toggle={() => toggle(id)}
-                  filter={(mode, name) =>
-                    setFilters((value) => ({
-                      ...value,
-                      typeName: mode === 'include' ? name : '',
-                      excludeName: mode === 'exclude' ? name : '',
-                    }))
-                  }
-                  rawLink={rawLink}
-                />
-              )
-            }}
-          </For>
-          <Show when={!ids().length && !capture.loading()}>
-            <div class="panel empty-state">
-              <h2>No matching events</h2>
-              <p>
-                Start capture or adjust your filters. Payloads are fetched only
-                when you expand an event.
-              </p>
-            </div>
-          </Show>
-        </section>
-        <div class="panel pagination capture-pagination">
-          <button
-            class="button outlined"
-            disabled={
-              !rpc.ready || capture.loading() || !capture.snapshot()?.hasOlder
-            }
-            aria-label="Load older events"
-            onClick={() => void capture.load('older')}
-          >
-            Older
-          </button>
-          <button
-            class="button tonal"
-            disabled={!rpc.ready || capture.loading()}
-            aria-label="Show latest events"
-            onClick={() => void capture.load('latest')}
-          >
-            Latest
-          </button>
-          <button
-            class="button outlined"
-            disabled={
-              !rpc.ready || capture.loading() || !capture.snapshot()?.hasNewer
-            }
-            aria-label="Load newer events"
-            onClick={() => void capture.load('newer')}
-          >
-            Newer
-          </button>
-        </div>
+        ) : null}
+        {flash ? (
+          <div className="capture-flash" role="status">
+            {flash}
+          </div>
+        ) : null}
       </LiveContent>
     </>
   )
 }
-function CaptureRow(props: {
-  event: CapturedMtprotoEvent
-  result?: CapturedMtprotoEvent
-  expanded: boolean
-  toggle: () => void
-  filter: (mode: 'include' | 'exclude', name: string) => void
-  rawLink: (id: number) => string
-}) {
-  const metrics = () => getRpcResultMetrics(props.event, props.result)
+
+export function joinPath(directory: string, fileName: string): string {
+  const separator = directory.includes('\\') ? '\\' : '/'
+  return directory.replace(/[\\/]+$/, '') + separator + fileName
+}
+
+export function formatClock(timestamp: number, withMillis = true): string {
+  const date = new Date(timestamp)
+  const pad = (value: number, length = 2) =>
+    String(value).padStart(length, '0')
+  const base =
+    pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds())
+  return withMillis ? base + '.' + pad(date.getMilliseconds(), 3) : base
+}
+
+export function formatLogTime(timestamp: number): string {
+  const date = new Date(timestamp)
+  const pad = (value: number) => String(value).padStart(2, '0')
   return (
-    <article
-      class="capture-row"
-      classList={{
-        'rpc-error': metrics()?.state === 'error',
-        expanded: props.expanded,
-      }}
-    >
-      <button
-        class="capture-row-header"
-        aria-expanded={props.expanded}
-        onClick={props.toggle}
-      >
-        <span class="capture-direction" aria-hidden="true">
-          <Icon
-            name={
-              props.event.direction === 'client->server'
-                ? 'arrowUpRight'
-                : 'arrowDownLeft'
-            }
-            size={16}
-          />
-        </span>
-        <div class="capture-row-title">
-          <strong>{props.event.name}</strong>
-          <small>
-            {props.event.connectionId} ·{' '}
-            {props.event.direction === 'client->server'
-              ? 'Client → server'
-              : 'Server → client'}{' '}
-            · {props.event.phase}
-          </small>
-        </div>
-        <div class="capture-row-meta">
-          <time datetime={new Date(props.event.timestamp).toISOString()}>
-            {new Date(props.event.timestamp).toLocaleTimeString()}
-          </time>
-          <Show when={metrics()}>
-            <span
-              class={'chip ' + (metrics()?.state === 'error' ? 'error' : '')}
-            >
-              {formatMs(metrics()!.durationMs)} · {metrics()!.state}
-            </span>
-          </Show>
-        </div>
-        <Icon name={props.expanded ? 'minus' : 'plus'} size={16} />
-      </button>
-      <Show when={props.result}>
-        <p class="capture-result">
-          Result: <code>{props.result!.name}</code>
-        </p>
-      </Show>
-      <Show when={props.expanded}>
-        <div class="capture-detail">
-          <EventDetail
-            event={props.event}
-            filter={props.filter}
-            rawLink={props.rawLink}
-          />
-          <Show when={props.result}>
-            {(result) => (
-              <EventDetail
-                event={result()}
-                filter={props.filter}
-                rawLink={props.rawLink}
-              />
-            )}
-          </Show>
-        </div>
-      </Show>
-    </article>
+    date.getFullYear() +
+    '-' +
+    pad(date.getMonth() + 1) +
+    '-' +
+    pad(date.getDate()) +
+    ' ' +
+    formatClock(timestamp, false)
   )
 }
+
 function EventDetail(props: {
   event: CapturedMtprotoEvent
-  filter: (mode: 'include' | 'exclude', name: string) => void
+  onCopy: (label: string, value: string) => void
+  onMenu: (rect: { left: number, bottom: number }) => void
   rawLink: (id: number) => string
 }) {
-  const action = useAction()
+  const fields = [
+    ['Event', props.event.id],
+    ['Message', props.event.messageId],
+    ['Request', props.event.requestMessageId],
+    ['Sequence', props.event.seqNo],
+    ['Session', props.event.sessionId],
+    ['Auth key', props.event.authKeyId],
+  ].filter(([, value]) => value !== undefined && value !== null && value !== '')
   return (
-    <section class="stack event-detail">
-      <div class="toolbar">
-        <strong class="grow">{props.event.name}</strong>
+    <section className="event-detail">
+      <div className="event-detail-toolbar">
         <button
-          class="button outlined"
-          onClick={() => props.filter('include', props.event.name)}
+          className="icon-button"
+          aria-label="Copy payload"
+          title="Copy payload JSON"
+          disabled={props.event.payloadOmitted}
+          onClick={() =>
+            props.onCopy(
+              'payload',
+              JSON.stringify(props.event.payload ?? null, null, 2),
+            )
+          }
         >
-          Only this type
+          <Icon name="copy" size={13} />
         </button>
         <button
-          class="button outlined"
-          onClick={() => props.filter('exclude', props.event.name)}
+          className="icon-button"
+          aria-label="Copy event JSON"
+          title="Copy the whole event as JSON"
+          onClick={() =>
+            props.onCopy('event JSON', JSON.stringify(props.event, null, 2))
+          }
         >
-          Exclude this type
+          <Icon name="code" size={13} />
         </button>
         <a
-          class="button outlined"
+          className="icon-button"
+          aria-label="Open raw event"
+          title="Open the raw event JSON"
           href={props.rawLink(props.event.id)}
           target="_blank"
           rel="noopener noreferrer"
         >
-          Raw event
+          <Icon name="external" size={13} />
         </a>
+        <span className="capture-toolbar-sep" aria-hidden="true" />
         <button
-          class="button tonal"
-          disabled={props.event.payloadOmitted}
-          onClick={() =>
-            void action.run(() =>
-              copyText(JSON.stringify(props.event.payload, null, 2)),
-            )
+          className="icon-button"
+          aria-label="Event actions"
+          title="Filters, copy actions"
+          aria-haspopup="menu"
+          onClick={(event) => {
+            const rect = event.currentTarget.getBoundingClientRect()
+            props.onMenu({ left: rect.left, bottom: rect.bottom + 4 })
+          }}
+        >
+          <Icon name="ellipsis" size={14} />
+        </button>
+        <span
+          className={
+            'chip capture-direction-chip ' +
+            (props.event.direction === 'client->server'
+              ? 'outgoing'
+              : 'incoming')
           }
         >
-          Copy payload
-        </button>
+          {props.event.direction === 'client->server' ? 'request' : 'response'}
+        </span>
+        <span className="chip">{props.event.phase}</span>
       </div>
-      <dl class="event-metadata">
-        <For
-          each={Object.entries({
-            'Event ID': props.event.id,
-            'Message ID': props.event.messageId,
-            'Request ID': props.event.requestMessageId,
-            Sequence: props.event.seqNo,
-            'Auth key': props.event.authKeyId,
-            Session: props.event.sessionId,
-          })}
-        >
-          {([key, value]) => (
-            <div>
+      {fields.length ? (
+        <dl className="event-metadata">
+          {fields.map(([key, value]) => (
+            <div key={String(key)}>
               <dt>{key}</dt>
               <dd>
-                <code>{value ?? '—'}</code>
+                <code>{String(value)}</code>
               </dd>
             </div>
-          )}
-        </For>
-      </dl>
-      <ActionError error={action.error() || props.event.error || ''} />
-      <Show
-        when={!props.event.payloadOmitted}
-        fallback={
-          <p class="muted" role="status">
-            <Icon name="refresh" size={15} /> Loading payload…
-          </p>
-        }
-      >
-        <div class="json-tree">
-          <JsonTree value={props.event.payload} />
-        </div>
-      </Show>
+          ))}
+        </dl>
+      ) : null}
+      {props.event.error ? (
+        <ActionError error={props.event.error} />
+      ) : null}
+      {props.event.payloadOmitted ? (
+        <p className="muted event-detail-loading" role="status">
+          <Icon name="refresh" size={15} /> Loading payload…
+        </p>
+      ) : (
+        <JsonTree value={props.event.payload} />
+      )}
     </section>
   )
 }
-export function JsonTree(props: {
-  value: unknown
-  name?: string
-  depth?: number
-}) {
-  const data = createMemo(() => props.value)
-  const [expanded, setExpanded] = createSignal(!props.depth),
-    [limit, setLimit] = createSignal(30),
-    [stringLimit, setStringLimit] = createSignal(800)
-  const object = () => data() !== null && typeof data() === 'object'
-  const keys = createMemo(() => {
-    const value = data()
-    return value !== null && typeof value === 'object' && !Array.isArray(value)
-      ? Object.keys(value)
-      : []
-  })
-  const count = () => {
-    const value = data()
-    return Array.isArray(value) ? value.length : keys().length
+
+type JsonKind =
+  | 'object'
+  | 'array'
+  | 'string'
+  | 'number'
+  | 'boolean'
+  | 'null'
+  | 'other'
+
+function kindOf(value: unknown): JsonKind {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  switch (typeof value) {
+    case 'object':
+      return 'object'
+    case 'string':
+      return 'string'
+    case 'number':
+      return 'number'
+    case 'boolean':
+      return 'boolean'
+    default:
+      return 'other'
   }
-  const entries = createMemo(() => {
-    const value = data()
-    if (!object()) return []
-    if (Array.isArray(value))
-      return value
-        .slice(0, limit())
-        .map((item, index) => [String(index), item] as const)
-    return keys()
-      .slice(0, limit())
-      .map((key) => [key, (value as Record<string, unknown>)[key]] as const)
-  })
-  const rawText = createMemo(() => String(data()))
-  const text = createMemo(() =>
-    typeof data() === 'string'
-      ? JSON.stringify(rawText().slice(0, stringLimit()))
-      : rawText().slice(0, stringLimit()),
-  )
-  return (
-    <Show
-      when={object()}
-      fallback={
-        <div class="json-leaf">
-          <Show when={props.name}>
-            <strong>{props.name}: </strong>
-          </Show>
-          <span>{text()}</span>
-          <Show when={rawText().length > stringLimit()}>
-            <Show
-              when={stringLimit() < 16000}
-              fallback={
-                <span class="muted">
-                  {' '}
-                  Preview limited to 16,000 characters; use the raw event link
-                  for the full value.
-                </span>
-              }
-            >
-              <button
-                class="field-reset"
-                onClick={() =>
-                  setStringLimit(Math.min(16000, stringLimit() + 2000))
-                }
-              >
-                Show more ({rawText().length} characters total)
-              </button>
-            </Show>
-          </Show>
-        </div>
-      }
-    >
-      <div class="json-branch">
-        <button
-          class="json-toggle"
-          aria-expanded={expanded()}
-          disabled={(props.depth ?? 0) > 20}
-          onClick={() => setExpanded(!expanded())}
-        >
-          <Icon name={expanded() ? 'minus' : 'plus'} size={14} />
-          <strong>{props.name ?? 'Payload'}</strong>
-          <span class="muted">
-            {count()} {Array.isArray(data()) ? 'items' : 'keys'}
-          </span>
-        </button>
-        <Show when={expanded() && (props.depth ?? 0) <= 20}>
-          <div class="json-children">
-            <For each={entries()}>
-              {([key, value]) => (
-                <JsonTree
-                  name={key}
-                  value={value}
-                  depth={(props.depth ?? 0) + 1}
-                />
-              )}
-            </For>
-            <Show when={count() > limit()}>
-              <button
-                class="button outlined"
-                onClick={() => setLimit(limit() + 30)}
-              >
-                Show 30 more ({count() - limit()} remaining)
-              </button>
-            </Show>
-          </div>
-        </Show>
+}
+
+function previewOf(value: unknown): string {
+  const kind = kindOf(value)
+  if (kind === 'array') return 'Array(' + (value as unknown[]).length + ')'
+  if (kind === 'object') return '{…}'
+  if (kind === 'string') {
+    const text = value as string
+    return text.length > 200
+      ? JSON.stringify(text.slice(0, 200) + '…')
+      : JSON.stringify(text)
+  }
+  if (kind === 'null') return 'null'
+  if (kind === 'other') return String(value)
+  return String(value)
+}
+
+function primitiveClass(kind: JsonKind): string {
+  return 'json-value json-' + kind
+}
+
+function JsonNode(props: {
+  name?: string
+  value: unknown
+  depth: number
+  defaultExpanded?: boolean
+}) {
+  const [expanded, setExpanded] = useState(props.defaultExpanded ?? false)
+  const [showFull, setShowFull] = useState(false)
+  const [limit, setLimit] = useState(100)
+  const kind = kindOf(props.value)
+  const expandable = kind === 'object' || kind === 'array'
+  const entries = useMemo(() => {
+    if (kind === 'array')
+      return (props.value as unknown[]).map(
+        (item, index) => [String(index), item] as const,
+      )
+    if (kind === 'object')
+      return Object.entries(props.value as Record<string, unknown>)
+    return []
+  }, [kind, props.value])
+  const indent = { paddingLeft: 12 + props.depth * 14 }
+  if (!expandable) {
+    const text = props.value as string
+    const longText = kind === 'string' && text.length > 200
+    const shown =
+      longText && !showFull
+        ? JSON.stringify(text.slice(0, 200) + '…')
+        : kind === 'string'
+          ? JSON.stringify(
+              text.length > 2000 ? text.slice(0, 2000) + '…' : text,
+            )
+          : previewOf(props.value)
+    return (
+      <div className="json-row" style={indent}>
+        <span className="json-caret" />
+        {props.name !== undefined ? (
+          <>
+            <span className="json-key">{props.name}</span>
+            <span className="json-punct">:&nbsp;</span>
+          </>
+        ) : null}
+        <span className={primitiveClass(kind)}>{shown}</span>
+        {longText ? (
+          <button
+            className="json-string-toggle"
+            onClick={(event) => {
+              event.stopPropagation()
+              setShowFull(!showFull)
+            }}
+          >
+            {showFull ? 'collapse' : 'show all'}
+          </button>
+        ) : null}
       </div>
-    </Show>
+    )
+  }
+  return (
+    <>
+      <div
+        className={'json-row json-toggle' + (expandable ? ' expandable' : '')}
+        style={indent}
+        role="treeitem"
+        aria-expanded={expanded}
+        tabIndex={0}
+        onClick={() => setExpanded(!expanded)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            setExpanded(!expanded)
+          }
+        }}
+      >
+        <span className="json-caret">{expanded ? '▾' : '▸'}</span>
+        {props.name !== undefined ? (
+          <>
+            <span className="json-key">{props.name}</span>
+            <span className="json-punct">:&nbsp;</span>
+          </>
+        ) : null}
+        <span className="json-punct">
+          {expanded ? (kind === 'array' ? '[' : '{') : previewOf(props.value)}
+        </span>
+      </div>
+      {expanded ? (
+        <>
+          {entries.slice(0, limit).map(([key, value]) => (
+            <JsonNode key={key} name={key} value={value} depth={props.depth + 1} />
+          ))}
+          {entries.length > limit ? (
+            <div className="json-row" style={indent}>
+              <span className="json-caret" />
+              <button
+                className="json-string-toggle json-more"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setLimit(limit + 100)
+                }}
+              >
+                Show 100 more ({entries.length - limit} remaining)
+              </button>
+            </div>
+          ) : null}
+          <div className="json-row" style={indent}>
+            <span className="json-caret" />
+            <span className="json-punct">
+              {kind === 'array' ? ']' : '}'}
+            </span>
+          </div>
+        </>
+      ) : null}
+    </>
   )
 }
+
+export function JsonTree({ value }: { value: unknown }) {
+  return (
+    <div className="json-tree" role="tree" aria-label="Payload">
+      <JsonNode value={value} depth={0} defaultExpanded />
+    </div>
+  )
+}
+
+

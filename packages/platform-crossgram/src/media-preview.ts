@@ -11,10 +11,9 @@ import type { RemoteVideoFrame } from './video-frame.js'
 export interface QQMediaInlinePreviewRow {
   key: string
   bytes: ArrayBuffer
-  /** Display dimensions recovered from a decoded video frame. */
   width: number | null
   height: number | null
-  /** Whole-second container duration recovered alongside a video frame. */
+  /** 视频容器时长（整秒）。 */
   duration: number | null
   updatedAt: Date
 }
@@ -38,20 +37,13 @@ export function defineQQMediaPreviewModel(ctx: Context): void {
 export interface QQMediaPreviewOptions {
   enabled?: boolean
   concurrency?: number
-  /**
-   * Pixel ceiling for one decode. Defaults to `MAX_INPUT_PIXELS`; tests lower it
-   * to exercise the limit without generating a megapixel fixture.
-   */
   maxInputPixels?: number
   database?: Database
-  /** Clock used for the failed-extraction backoff; injectable for tests. */
   now?: () => number
 }
 
-/** Opens a short-lived direct URL for the original video bytes. */
 export type VideoFrameUrlResolver = (signal?: AbortSignal) => Promise<string>
 
-/** Decodes the first frame of the video behind a direct URL. */
 export type VideoFrameReader = (url: string, signal?: AbortSignal) => Promise<RemoteVideoFrame>
 
 interface InlinePreview {
@@ -62,32 +54,13 @@ interface InlinePreview {
 }
 
 const MAX_PREVIEW_SOURCE_BYTES = 64 * 1024 * 1024
-/**
- * Pixel ceiling for one decode. The preview only ever needs a 40px JPEG, but
- * libvips allocates the decoded raster before it resizes, so this is a direct
- * limit on peak native memory: the previous 64 megapixels allowed a ~256 MiB
- * RGBA allocation for a single oversized image on a host that runs nine other
- * services and swaps. Sixteen megapixels still covers 4K video frames and every
- * phone photo the platform carries, and an image above it only loses its own
- * thumbnail — `scheduleInlinePreview` logs the failure and keeps the message.
- */
+/** 单张图片解码像素上限（16MP），限制 libvips 缩放前的光栅内存峰值。 */
 export const MAX_INPUT_PIXELS = 16 * 1024 * 1024
 const MEMORY_PREVIEW_CACHE_LIMIT = 4096
 const FAILED_PREVIEW_CACHE_LIMIT = 4096
 const FAILED_FRAME_RETRY_MS = 30 * 60 * 1000
 
-/**
- * Bound libvips' own caches and worker threads for this process.
- *
- * Nothing configured them here, so the relay inherited libvips' defaults: a
- * 50 MiB pixel-operation cache, up to 20 cached file loaders, and one worker
- * thread per core. This module is imported statically, so the native addon and
- * its caches live in the relay process whether or not previews are enabled.
- * Previews are background work on a shared host, so 32 MiB, no file cache (the
- * sources are streams and buffers, never reusable paths), and a single worker
- * are the right trade. Exported so a test can assert the applied values without
- * depending on another test file's global sharp state.
- */
+/** 限制当前进程内 libvips 的缓存与工作线程数。 */
 export function applyNativeImageLimits(): void {
   sharp.cache({ memory: 32, files: 0, items: 32 })
   sharp.concurrency(1)
@@ -96,10 +69,8 @@ export function applyNativeImageLimits(): void {
 applyNativeImageLimits()
 
 /**
- * Generates Telegram's tiny photoStrippedSize payload in an isolated worker
- * path. Mapping is synchronous and memory-only; cache lookup, source download,
- * decode and persistence happen only in prepare(), which callers schedule
- * after the original history/live message has already been delivered.
+ * 异步生成 Telegram 的 `photoStrippedSize` 缩略图。
+ * `project()` 仅同步读取内存缓存；缓存查询、下载、解码与落库均在原消息投递后由 `prepare()` 异步完成。
  */
 export class QQMediaPreviewer {
   readonly enabled: boolean
@@ -119,7 +90,7 @@ export class QQMediaPreviewer {
     this.now = options.now ?? Date.now
   }
 
-  /** Attach only an already-memory-resident inline preview; never perform I/O. */
+  /** 仅附加内存已有的内联预览，不执行 I/O。 */
   project(media: IMMedia<QQMediaLocator>): IMMedia<QQMediaLocator> {
     if (!this.enabled || !isInlinePreviewMedia(media) || !media.locator || media.strippedThumbnail) return media
     const key = mediaPreviewKey(media.locator)
@@ -140,14 +111,7 @@ export class QQMediaPreviewer {
     return withPreview(media, preview)
   }
 
-  /**
-   * Builds the inline preview for a video that arrived without any native
-   * thumbnail (QQ file-transfer videos, or native videos whose thumbnail was
-   * never cached locally) by decoding its first frame straight from QQ's CDN.
-   * The decoded frame also supplies the display dimensions and duration QQ
-   * does not report for file transfers, so clients can lay the bubble out at
-   * the real aspect ratio instead of a 1x1 placeholder.
-   */
+  /** 对无原生缩略图的视频，直接从 QQ CDN 抽取首帧生成内联预览，并补全缺失的宽高与时长。 */
   async prepareVideoFrame(
     media: IMMedia<QQMediaLocator>,
     resolveUrl: VideoFrameUrlResolver,
@@ -243,7 +207,6 @@ export class QQMediaPreviewer {
   }
 }
 
-/** Images and native video thumbnails can be reduced to Telegram's inline JPEG. */
 function isInlinePreviewMedia(media: Pick<IMMedia, 'kind' | 'mimeType'>): boolean {
   return media.kind === 'image' || isVideoMedia(media)
 }
@@ -252,10 +215,7 @@ function isVideoMedia(media: Pick<IMMedia, 'mimeType'>): boolean {
   return media.mimeType?.toLowerCase().startsWith('video/') === true
 }
 
-/**
- * Attach the stripped bytes and fill only the layout facts the platform left
- * out. Values QQ reported itself always win over the decoded frame.
- */
+/** 附加缩略图字节，且仅在平台未提供宽高或时长时用抽帧结果补齐。 */
 function withPreview(media: IMMedia<QQMediaLocator>, preview: InlinePreview): IMMedia<QQMediaLocator> {
   const fillDimensions = !(media.width && media.height) && preview.width && preview.height
   return {
